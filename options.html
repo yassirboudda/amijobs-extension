@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>AmiJobs — Configuration</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #f8fafc, #eef2ff);
+      color: #1e293b;
+      min-height: 100vh;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 28px 16px 48px; }
+    .hero {
+      display: flex; align-items: center; gap: 14px; margin-bottom: 24px;
+    }
+    .hero img { width: 48px; height: 48px; border-radius: 12px; }
+    h1 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }
+    .hero p { margin: 4px 0 0; color: #64748b; font-size: 13px; }
+    .panel {
+      background: white;
+      border-radius: 14px;
+      padding: 22px;
+      margin-bottom: 16px;
+      box-shadow: 0 4px 16px rgba(79, 70, 229, 0.06);
+      border: 1px solid #e2e8f0;
+    }
+    h2 {
+      margin: 0 0 16px;
+      font-size: 15px;
+      font-weight: 800;
+      padding-bottom: 10px;
+      border-bottom: 2px solid #6366f1;
+    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    label { font-size: 11px; font-weight: 700; color: #64748b; display: block; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
+    input, textarea, select {
+      width: 100%;
+      border: 1.5px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    input:focus, textarea:focus, select:focus {
+      outline: none;
+      border-color: #6366f1;
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+    }
+    textarea { min-height: 140px; resize: vertical; }
+    .hint { font-size: 12px; color: #64748b; margin-top: 8px; line-height: 1.5; }
+    .save-row { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+    button {
+      border: 0;
+      background: linear-gradient(135deg, #4f46e5, #7c3aed);
+      color: white;
+      border-radius: 10px;
+      padding: 12px 22px;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #toast { color: #059669; font-weight: 700; font-size: 13px; }
+    .blacklist-count {
+      display: inline-flex; background: #fee2e2; color: #dc2626;
+      font-size: 11px; font-weight: 800; padding: 2px 10px; border-radius: 12px; margin-left: 8px;
+    }
+    a { color: #6366f1; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <img src="icons/icon128.png" alt="AmiJobs" />
+      <div>
+        <h1>AmiJobs</h1>
+        <p data-i18n="tagline">Candidatures automatiques multi-plateformes · <a href="https://amijobs.com" target="_blank">amijobs.com</a></p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 data-i18n="languageTitle">Langue de l'interface</h2>
+      <div class="grid">
+        <div>
+          <label data-i18n="languageTitle">Langue</label>
+          <select id="uiLanguage">
+            <option value="auto" data-i18n="languageAuto">Automatique (navigateur)</option>
+            <option value="fr" data-i18n="languageFr">Français</option>
+            <option value="en" data-i18n="languageEn">English</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 data-i18n="profileTitle">Profil du candidat</h2>
+      <div class="grid">
+        <div><label data-i18n="fullName">Nom complet</label><input id="fullName" /></div>
+        <div><label>Civilité</label><select id="civility"><option value="">Auto</option><option value="monsieur">Monsieur</option><option value="madame">Madame</option></select></div>
+        <div><label data-i18n="email">Email</label><input id="email" type="email" /></div>
+        <div><label data-i18n="phone">Téléphone</label><input id="phone" /></div>
+        <div><label data-i18n="linkedinUrl">Profil LinkedIn</label><input id="linkedin" placeholder="https://linkedin.com/in/..." /></div>
+        <div><label data-i18n="locationField">Localisation</label><input id="location" /></div>
+        <div><label data-i18n="postalCode">Code postal</label><input id="postalCode" /></div>
+        <div><label data-i18n="birthDate">Date de naissance</label><input id="birthDate" placeholder="01/01/2000" /></div>
+        <div><label data-i18n="jobTitle">Titre professionnel</label><input id="title" /></div>
+        <div><label data-i18n="experience">Expérience</label><input id="experience" /></div>
+        <div><label data-i18n="stack">Compétences</label><input id="stack" /></div>
+        <div><label data-i18n="education">Formation</label><input id="education" /></div>
+        <div><label data-i18n="languagesField">Langues</label><input id="languages" /></div>
+        <div><label data-i18n="availability">Disponibilité</label><input id="availability" /></div>
+        <div><label data-i18n="salary">Prétention salariale</label><input id="salaryExpectation" /></div>
+      </div>
+      <div style="margin-top:14px;">
+        <label data-i18n="cvText">Contenu texte du CV (Mistral)</label>
+        <textarea id="cvText" placeholder="Collez ici le texte de votre CV…"></textarea>
+      </div>
+      <div style="margin-top:16px; padding-top:14px; border-top:1px solid #e2e8f0;">
+        <h2 style="border:none; padding:0; margin-bottom:10px;">
+          <span data-i18n="blacklistTitle">Entreprises blacklistées</span>
+          <span class="blacklist-count" id="blacklistCount" style="display:none">0</span>
+        </h2>
+        <textarea id="blacklistedCompanies" rows="5" placeholder="Capgemini&#10;Accenture"></textarea>
+        <p class="hint" data-i18n="blacklistHint">Une entreprise par ligne.</p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 data-i18n="mistralTitle">Mistral AI</h2>
+      <div class="grid">
+        <div><label data-i18n="mistralKey">Clé API Mistral</label><input id="mistralApiKey" type="password" /></div>
+      </div>
+      <p class="hint" data-i18n="mistralHint">Obtenez une clé sur <a href="https://console.mistral.ai" target="_blank">console.mistral.ai</a>.</p>
+    </div>
+
+    <div class="panel">
+      <h2 data-i18n="settingsTitle">Réglages automation</h2>
+      <div class="grid">
+        <div><label>Max offres / session</label><input id="maxJobsPerSession" type="number" min="1" max="100" /></div>
+        <div><label data-i18n="maxNoApplyPages">Pages sans apply</label><input id="maxNoApplyPages" type="number" min="1" max="50" /></div>
+        <div><label data-i18n="delayJobs">MIN</label><input id="delayJobMin" type="number" /></div>
+        <div><label>MAX</label><input id="delayJobMax" type="number" /></div>
+        <div><label data-i18n="delaySteps">MIN</label><input id="delayStepMin" type="number" /></div>
+        <div><label>MAX</label><input id="delayStepMax" type="number" /></div>
+      </div>
+      <div style="margin-top:12px;" class="grid">
+        <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;color:#334155;">
+          <input type="checkbox" id="autoSubmit" style="width:auto;" /> <span data-i18n="autoSubmit">Soumission automatique</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;color:#334155;">
+          <input type="checkbox" id="onlyEasyApply" style="width:auto;" /> <span data-i18n="easyApplyOnly">LinkedIn Easy Apply uniquement</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="save-row">
+      <button id="saveBtn" data-i18n="save">Enregistrer</button>
+      <span id="toast"></span>
+    </div>
+  </div>
+
+  <script src="i18n.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
