@@ -48,5 +48,13 @@
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
+  },
+  "externally_connectable": {
+    "matches": [
+      "https://app.amijobs.com/*",
+      "https://amijobs-app-demo.vercel.app/*",
+      "http://localhost/*",
+      "http://127.0.0.1/*"
+    ]
   }
 }

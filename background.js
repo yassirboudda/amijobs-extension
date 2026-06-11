@@ -292,6 +292,72 @@ async function updatePlatformSessionFromMessage(platform, mutator) {
   return session;
 }
 
+async function openPlatformTabs(urls, platforms) {
+  const openOrder = platforms.includes("hellowork") ? ["hellowork", "linkedin"] : ["linkedin", "hellowork"];
+  let first = true;
+  for (const p of openOrder) {
+    if (!urls[p]) continue;
+    if (first) {
+      await chrome.tabs.create({ url: urls[p], active: true });
+      first = false;
+    } else {
+      await chrome.tabs.create({ url: urls[p], active: false });
+    }
+  }
+}
+
+function profileFromAppPayload(msg) {
+  const p = msg.profile || {};
+  return {
+    fullName: p.fullName || "",
+    email: p.email || "",
+    phone: p.phone || "",
+    linkedin: p.linkedin || "",
+    location: p.location || "",
+    postalCode: p.postalCode || "",
+    title: p.title || "",
+    experience: p.experience || "",
+    stack: p.stack || "",
+    languages: p.languages || "",
+    availability: p.availability || "",
+    salaryExpectation: p.salaryExpectation || p.salary || "",
+    cvText: msg.cvText || p.cvText || "",
+  };
+}
+
+async function syncFromApp(msg) {
+  const existing = await chrome.storage.local.get([
+    "profile",
+    "autoApplySettings",
+    "mistralApiKey",
+    "blacklistedCompanies",
+    "cvText",
+  ]);
+  const updates = {};
+
+  if (msg.profile || msg.cvText !== undefined) {
+    updates.profile = { ...(existing.profile || DEFAULT_PROFILE), ...profileFromAppPayload(msg) };
+  }
+  if (msg.cvText !== undefined) updates.cvText = msg.cvText;
+  if (Array.isArray(msg.blacklistedCompanies)) {
+    updates.blacklistedCompanies = msg.blacklistedCompanies;
+  }
+  if (msg.mistralApiKey) updates.mistralApiKey = msg.mistralApiKey;
+  if (msg.autoApplySettings) {
+    updates.autoApplySettings = { ...(existing.autoApplySettings || DEFAULT_SETTINGS), ...msg.autoApplySettings };
+  }
+  if (msg.maxJobsPerSession) {
+    updates.autoApplySettings = {
+      ...(updates.autoApplySettings || existing.autoApplySettings || DEFAULT_SETTINGS),
+      maxJobsPerSession: msg.maxJobsPerSession,
+    };
+  }
+
+  if (Object.keys(updates).length) await chrome.storage.local.set(updates);
+  await appendLog("Profil synchronisé depuis l'app web", "success");
+  return { ok: true, syncedAt: new Date().toISOString() };
+}
+
 async function startMultiSession(msg) {
   const platforms = (msg.platforms || []).filter((p) => p === "hellowork" || p === "linkedin");
   if (platforms.length === 0) return { ok: false, reason: "no_platform" };
@@ -341,10 +407,22 @@ async function startMultiSession(msg) {
     "success"
   );
 
+  if (msg.openTabs) await openPlatformTabs(urls, platforms);
+
   return { ok: true, urls, platforms };
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+function handleMessage(msg, sendResponse) {
+  if (msg.action === "ping") {
+    sendResponse({ ok: true, version: EXT_VERSION });
+    return false;
+  }
+
+  if (msg.action === "syncFromApp") {
+    syncFromApp(msg).then(sendResponse);
+    return true;
+  }
+
   if (msg.action === "getState") {
     getState().then(sendResponse);
     return true;
@@ -590,6 +668,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   sendResponse({ ok: false, message: "unknown_action" });
   return false;
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  return handleMessage(msg, sendResponse);
+});
+
+chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
+  return handleMessage({ ...msg, openTabs: msg.openTabs ?? true }, sendResponse);
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
