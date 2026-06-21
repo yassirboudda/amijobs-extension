@@ -1,10 +1,9 @@
-// ============================================================================
-// AmiJobs — Background Service Worker v1.0.0
-// Unified orchestration for Hellowork + LinkedIn auto-apply sessions
+// AmiJobs — Background Service Worker v1.1.0
+// Unified orchestration for Hellowork, LinkedIn, Indeed & Glassdoor
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.0.0";
+const EXT_VERSION = "1.1.0";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -43,12 +42,25 @@ const DEFAULT_SETTINGS = {
 const SESSION_KEYS = {
   hellowork: "sessionHellowork",
   linkedin: "sessionLinkedin",
+  indeed: "sessionIndeed",
+  glassdoor: "sessionGlassdoor",
 };
 
 const LAST_SESSION_KEYS = {
   hellowork: "lastSessionHellowork",
   linkedin: "lastSessionLinkedin",
+  indeed: "lastSessionIndeed",
+  glassdoor: "lastSessionGlassdoor",
 };
+
+const SUPPORTED_PLATFORMS = ["hellowork", "linkedin", "indeed", "glassdoor"];
+
+function jobKeyPrefix(platform) {
+  if (platform === "linkedin") return "li_";
+  if (platform === "indeed") return "ind_";
+  if (platform === "glassdoor") return "gd_";
+  return "hw_";
+}
 
 function emptyPlatformSession(platform, overrides = {}) {
   const base = {
@@ -77,6 +89,17 @@ function emptyPlatformSession(platform, overrides = {}) {
       ...overrides,
     };
   }
+  if (platform === "indeed" || platform === "glassdoor") {
+    return {
+      ...base,
+      keywords: "",
+      location: "",
+      searchUrl: "",
+      currentPage: 0,
+      noApplyPages: 0,
+      ...overrides,
+    };
+  }
   return {
     ...base,
     keywords: "",
@@ -102,6 +125,21 @@ function buildLinkedInSearchUrl(keywords, location) {
   params.set("f_AL", "true");
   params.set("f_TPR", "r86400");
   return `https://www.linkedin.com/jobs/search/?${params.toString()}`;
+}
+
+function buildIndeedSearchUrl(keywords, location, page = 0) {
+  const p = new URLSearchParams();
+  if (keywords) p.set("q", keywords);
+  if (location) p.set("l", location);
+  if (page > 0) p.set("start", String(page * 10));
+  return `https://fr.indeed.com/jobs?${p.toString()}`;
+}
+
+function buildGlassdoorSearchUrl(keywords, location) {
+  const p = new URLSearchParams();
+  if (keywords) p.set("sc.keyword", keywords);
+  if (location) p.set("sc.location", location);
+  return `https://www.glassdoor.fr/Job/jobs.htm?${p.toString()}`;
 }
 
 async function getMistralApiKey() {
@@ -181,15 +219,17 @@ async function setPlatformSession(platform, session) {
 }
 
 async function isAnySessionActive() {
-  const hw = await getPlatformSession("hellowork");
-  const li = await getPlatformSession("linkedin");
-  return !!(hw?.active || li?.active);
+  for (const platform of SUPPORTED_PLATFORMS) {
+    if ((await getPlatformSession(platform))?.active) return true;
+  }
+  return false;
 }
 
 async function getActivePlatforms() {
   const active = [];
-  if ((await getPlatformSession("hellowork"))?.active) active.push("hellowork");
-  if ((await getPlatformSession("linkedin"))?.active) active.push("linkedin");
+  for (const platform of SUPPORTED_PLATFORMS) {
+    if ((await getPlatformSession(platform))?.active) active.push(platform);
+  }
   return active;
 }
 
@@ -243,8 +283,12 @@ async function getState() {
     "log",
     "sessionHellowork",
     "sessionLinkedin",
+    "sessionIndeed",
+    "sessionGlassdoor",
     "lastSessionHellowork",
     "lastSessionLinkedin",
+    "lastSessionIndeed",
+    "lastSessionGlassdoor",
     "amijobsMeta",
     "profile",
     "autoApplySettings",
@@ -258,9 +302,13 @@ async function getState() {
 
   const sessionHellowork = data.sessionHellowork || null;
   const sessionLinkedin = data.sessionLinkedin || null;
+  const sessionIndeed = data.sessionIndeed || null;
+  const sessionGlassdoor = data.sessionGlassdoor || null;
   const activePlatforms = [];
   if (sessionHellowork?.active) activePlatforms.push("hellowork");
   if (sessionLinkedin?.active) activePlatforms.push("linkedin");
+  if (sessionIndeed?.active) activePlatforms.push("indeed");
+  if (sessionGlassdoor?.active) activePlatforms.push("glassdoor");
 
   return {
     enabled: data.enabled !== false,
@@ -268,8 +316,12 @@ async function getState() {
     log: data.log || [],
     sessionHellowork,
     sessionLinkedin,
+    sessionIndeed,
+    sessionGlassdoor,
     lastSessionHellowork: data.lastSessionHellowork || null,
     lastSessionLinkedin: data.lastSessionLinkedin || null,
+    lastSessionIndeed: data.lastSessionIndeed || null,
+    lastSessionGlassdoor: data.lastSessionGlassdoor || null,
     amijobsMeta: data.amijobsMeta || null,
     activePlatforms,
     sessionActive: activePlatforms.length > 0,
@@ -293,10 +345,9 @@ async function updatePlatformSessionFromMessage(platform, mutator) {
 }
 
 async function openPlatformTabs(urls, platforms) {
-  const openOrder = platforms.includes("hellowork") ? ["hellowork", "linkedin"] : ["linkedin", "hellowork"];
   let first = true;
-  for (const p of openOrder) {
-    if (!urls[p]) continue;
+  for (const p of SUPPORTED_PLATFORMS) {
+    if (!platforms.includes(p) || !urls[p]) continue;
     if (first) {
       await chrome.tabs.create({ url: urls[p], active: true });
       first = false;
@@ -359,7 +410,7 @@ async function syncFromApp(msg) {
 }
 
 async function startMultiSession(msg) {
-  const platforms = (msg.platforms || []).filter((p) => p === "hellowork" || p === "linkedin");
+  const platforms = (msg.platforms || []).filter((p) => SUPPORTED_PLATFORMS.includes(p));
   if (platforms.length === 0) return { ok: false, reason: "no_platform" };
 
   const maxJobs = msg.maxJobs || 25;
@@ -394,6 +445,28 @@ async function startMultiSession(msg) {
     const searchUrl = msg.linkedinUrl || buildLinkedInSearchUrl(keywords, location);
     urls.linkedin = searchUrl;
     updates.sessionLinkedin = emptyPlatformSession("linkedin", {
+      keywords,
+      location,
+      maxJobs,
+      searchUrl,
+    });
+  }
+
+  if (platforms.includes("indeed")) {
+    const searchUrl = msg.indeedUrl || buildIndeedSearchUrl(keywords, location);
+    urls.indeed = searchUrl;
+    updates.sessionIndeed = emptyPlatformSession("indeed", {
+      keywords,
+      location,
+      maxJobs,
+      searchUrl,
+    });
+  }
+
+  if (platforms.includes("glassdoor")) {
+    const searchUrl = msg.glassdoorUrl || buildGlassdoorSearchUrl(keywords, location);
+    urls.glassdoor = searchUrl;
+    updates.sessionGlassdoor = emptyPlatformSession("glassdoor", {
       keywords,
       location,
       maxJobs,
@@ -488,6 +561,10 @@ function handleMessage(msg, sendResponse) {
           resumed.phase === "offer" && resumed.currentOfferUrl
             ? resumed.currentOfferUrl
             : resumed.resumeSearchUrl || resumed.searchUrl;
+      } else if (platform === "indeed") {
+        targetUrl = resumed.searchUrl || buildIndeedSearchUrl(resumed.keywords, resumed.location, resumed.currentPage || 0);
+      } else if (platform === "glassdoor") {
+        targetUrl = resumed.searchUrl || buildGlassdoorSearchUrl(resumed.keywords, resumed.location);
       } else {
         targetUrl = buildLinkedInSearchUrl(resumed.keywords, resumed.location);
       }
@@ -552,7 +629,7 @@ function handleMessage(msg, sendResponse) {
       const platform = msg.platform || "hellowork";
       const { appliedJobs = {}, stats = { applied: 0, skipped: 0, errors: 0, lastRun: null } } =
         await chrome.storage.local.get(["appliedJobs", "stats"]);
-      const prefix = platform === "linkedin" ? "li_" : "hw_";
+      const prefix = jobKeyPrefix(platform);
       const key = prefix + (msg.jobId || `job_${Date.now()}`);
       appliedJobs[key] = {
         platform,
@@ -578,7 +655,7 @@ function handleMessage(msg, sendResponse) {
       const platform = msg.platform || "hellowork";
       const { skippedJobs = {}, stats = { applied: 0, skipped: 0, errors: 0, lastRun: null } } =
         await chrome.storage.local.get(["skippedJobs", "stats"]);
-      const prefix = platform === "linkedin" ? "li_" : "hw_";
+      const prefix = jobKeyPrefix(platform);
       const key = prefix + (msg.jobId || `skip_${Date.now()}`);
       skippedJobs[key] = {
         platform,
@@ -655,7 +732,7 @@ function handleMessage(msg, sendResponse) {
       for (const tab of tabs) {
         const url = tab.url || "";
         if (!tab.id) continue;
-        if (url.includes("hellowork.com") || url.includes("linkedin.com/jobs")) {
+        if (url.includes("hellowork.com") || url.includes("linkedin.com/jobs") || url.includes("indeed.com") || url.includes("indeed.fr") || url.includes("glassdoor.com") || url.includes("glassdoor.fr")) {
           chrome.tabs.sendMessage(tab.id, { action: "stopAutoApply" }).catch(() => {});
         }
       }
@@ -672,10 +749,6 @@ function handleMessage(msg, sendResponse) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return handleMessage(msg, sendResponse);
-});
-
-chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
-  return handleMessage({ ...msg, openTabs: msg.openTabs ?? true }, sendResponse);
 });
 
 chrome.runtime.onInstalled.addListener(async () => {

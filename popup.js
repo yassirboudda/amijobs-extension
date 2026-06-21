@@ -21,9 +21,29 @@ async function sendContent(msg) {
 
 function selectedPlatforms() {
   const platforms = [];
-  if ($("platformHellowork").checked) platforms.push("hellowork");
-  if ($("platformLinkedin").checked) platforms.push("linkedin");
+  if ($("platformHellowork")?.checked) platforms.push("hellowork");
+  if ($("platformLinkedin")?.checked) platforms.push("linkedin");
+  if ($("platformIndeed")?.checked) platforms.push("indeed");
+  if ($("platformGlassdoor")?.checked) platforms.push("glassdoor");
   return platforms;
+}
+
+const PLATFORM_OPEN_ORDER = ["hellowork", "linkedin", "indeed", "glassdoor"];
+const PLATFORM_LABEL = { hellowork: "HW", linkedin: "LI", indeed: "IN", glassdoor: "GD" };
+const SESSION_KEY = {
+  hellowork: "sessionHellowork",
+  linkedin: "sessionLinkedin",
+  indeed: "sessionIndeed",
+  glassdoor: "sessionGlassdoor",
+};
+
+function SUPPORTED_LAST_SESSION(state) {
+  return !!(
+    state.lastSessionHellowork ||
+    state.lastSessionLinkedin ||
+    state.lastSessionIndeed ||
+    state.lastSessionGlassdoor
+  );
 }
 
 async function applyI18n() {
@@ -51,11 +71,10 @@ async function refresh() {
   const statusEl = $("status");
   const active = state.activePlatforms || [];
   if (active.length > 0) {
-    const hw = state.sessionHellowork;
-    const li = state.sessionLinkedin;
-    const parts = [];
-    if (active.includes("hellowork") && hw) parts.push(`HW ${hw.applied || 0}/${hw.maxJobs || 25}`);
-    if (active.includes("linkedin") && li) parts.push(`LI ${li.applied || 0}/${li.maxJobs || 25}`);
+    const parts = active.map((p) => {
+      const s = state[SESSION_KEY[p]];
+      return s ? `${PLATFORM_LABEL[p]} ${s.applied || 0}/${s.maxJobs || 25}` : PLATFORM_LABEL[p];
+    });
     statusEl.textContent = `${t("statusActive", uiLang)} — ${parts.join(" · ")}`;
     statusEl.style.background = "#dcfce7";
     statusEl.style.color = "#166534";
@@ -68,7 +87,7 @@ async function refresh() {
     statusEl.style.color = "#475569";
     $("stopBtn").disabled = true;
     $("startBtn").disabled = false;
-    const hasLast = !!(state.lastSessionHellowork || state.lastSessionLinkedin);
+    const hasLast = SUPPORTED_LAST_SESSION(state);
     $("resumeBtn").disabled = !hasLast;
   }
 
@@ -79,6 +98,8 @@ async function refresh() {
   if (saved.lastPlatforms?.length) {
     $("platformHellowork").checked = saved.lastPlatforms.includes("hellowork");
     $("platformLinkedin").checked = saved.lastPlatforms.includes("linkedin");
+    if ($("platformIndeed")) $("platformIndeed").checked = saved.lastPlatforms.includes("indeed");
+    if ($("platformGlassdoor")) $("platformGlassdoor").checked = saved.lastPlatforms.includes("glassdoor");
   }
 
   const lines = state.log || [];
@@ -127,10 +148,9 @@ $("startBtn").addEventListener("click", async () => {
     return;
   }
 
-  const openOrder = platforms.includes("hellowork") ? ["hellowork", "linkedin"] : ["linkedin", "hellowork"];
   let first = true;
-  for (const p of openOrder) {
-    if (!result.urls?.[p]) continue;
+  for (const p of PLATFORM_OPEN_ORDER) {
+    if (!platforms.includes(p) || !result.urls?.[p]) continue;
     if (first) {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab?.id) await chrome.tabs.update(tab.id, { url: result.urls[p] });
@@ -151,7 +171,9 @@ $("stopBtn").addEventListener("click", async () => {
 
 $("resumeBtn").addEventListener("click", async () => {
   const saved = await chrome.storage.local.get(["lastPlatforms"]);
-  const platforms = saved.lastPlatforms?.length ? saved.lastPlatforms : ["hellowork", "linkedin"];
+  const platforms = saved.lastPlatforms?.length
+    ? saved.lastPlatforms
+    : ["hellowork", "linkedin", "indeed", "glassdoor"];
   let first = true;
   for (const platform of platforms) {
     const resumed = await sendBg({ action: "resumeLastSession", platform });

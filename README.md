@@ -1,17 +1,16 @@
 # AmiJobs Extension
 
-Multi-platform job auto-apply Chrome extension for **LinkedIn** and **Hellowork**, powered by **Mistral AI**.
+Multi-platform job auto-apply Chrome extension for **LinkedIn**, **Hellowork**, **Indeed**, and **Glassdoor**, powered by **Mistral AI**.
 
 Website: [amijobs.com](https://amijobs.com)
 
 ## Features
 
-- Apply on **Hellowork** and **LinkedIn** simultaneously (separate tabs, parallel sessions)
-- Unified **candidate profile** (used by both platforms + Mistral)
+- Apply on **Hellowork**, **LinkedIn**, **Indeed**, and **Glassdoor** simultaneously (separate tabs, parallel sessions)
+- Unified **candidate profile** (used by all platforms + Mistral)
 - **Blacklisted companies** (shared across platforms)
 - **Mistral AI** for smart form filling and screening questions
 - **French / English** UI with automatic browser language detection
-- Platform checkboxes — Indeed, Monster coming soon
 
 ## Install (developer mode)
 
@@ -23,9 +22,15 @@ Website: [amijobs.com](https://amijobs.com)
 ## Usage
 
 1. Open **Configuration** and fill in your profile + optional Mistral API key
-2. In the popup, select **Hellowork**, **LinkedIn**, or both
+2. In the popup, select one or more platforms (Hellowork, LinkedIn, Indeed, Glassdoor)
 3. Enter keywords and location, then **Start session**
-4. Two tabs open when both platforms are selected — each runs its own apply loop
+4. One tab opens per selected platform — each runs its own apply loop
+
+### Platform notes
+
+- **Indeed**: applies to jobs with **Indeed Apply** (candidature simplifiée). External redirects are skipped.
+- **Glassdoor**: applies to jobs with **Easy Apply** / quick apply when available.
+- **Hellowork / LinkedIn**: same behavior as before (full apply loop with Mistral).
 
 ## Project structure
 
@@ -37,10 +42,21 @@ amijobs/
   options.html / options.js
   i18n.js                # FR / EN translations
   content/
-    hellowork.js         # Hellowork automation (from HelloworkAutoApply)
-    linkedin.js          # LinkedIn automation (from LinkedInAutoApply)
+    hellowork.js         # Hellowork automation
+    linkedin.js          # LinkedIn automation
+    indeed.js            # Indeed automation
+    glassdoor.js         # Glassdoor automation
+    shared-autofill.js   # Shared form fill + Mistral field answers
   icons/
   scripts/patch-content.py
+```
+
+## Chrome Web Store zip
+
+```bash
+cd amijobs
+zip -r dist/amijobs-extension-v1.1.0.zip . \
+  -x "*.git*" -x "dist/*" -x "scripts/*" -x "*.md"
 ```
 
 ## Regenerate content scripts

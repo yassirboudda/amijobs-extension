@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AmiJobs",
-  "version": "1.0.0",
-  "description": "Auto-apply to LinkedIn and Hellowork simultaneously — powered by Mistral AI. amijobs.com",
+  "version": "1.1.0",
+  "description": "Auto-apply on LinkedIn, Hellowork, Indeed and Glassdoor — powered by Mistral AI. amijobs.com",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -20,6 +20,12 @@
   "host_permissions": [
     "https://www.hellowork.com/*",
     "https://www.linkedin.com/*",
+    "https://www.indeed.com/*",
+    "https://fr.indeed.com/*",
+    "https://*.indeed.com/*",
+    "https://www.glassdoor.com/*",
+    "https://www.glassdoor.fr/*",
+    "https://*.glassdoor.com/*",
     "https://api.mistral.ai/*"
   ],
   "background": {
@@ -35,6 +41,24 @@
       "matches": ["https://www.linkedin.com/jobs/*"],
       "js": ["content/linkedin.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.indeed.com/*",
+        "https://fr.indeed.com/*",
+        "https://*.indeed.com/*"
+      ],
+      "js": ["content/shared-autofill.js", "content/indeed.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.glassdoor.com/*",
+        "https://www.glassdoor.fr/*",
+        "https://*.glassdoor.com/*"
+      ],
+      "js": ["content/shared-autofill.js", "content/glassdoor.js"],
+      "run_at": "document_idle"
     }
   ],
   "action": {
@@ -48,13 +72,5 @@
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
-  },
-  "externally_connectable": {
-    "matches": [
-      "https://app.amijobs.com/*",
-      "https://amijobs-app-demo.vercel.app/*",
-      "http://localhost/*",
-      "http://127.0.0.1/*"
-    ]
   }
 }
