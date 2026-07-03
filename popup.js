@@ -110,6 +110,14 @@ async function refresh() {
     $("resumeBtn").disabled = !hasLast;
   }
 
+  const lines = state.log || [];
+  $("log").textContent = lines.slice(-80).join("\n") || t("noLog", uiLang);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+// Restore saved form inputs only ONCE on load. Doing this on every refresh
+// (every 2.5s) would re-check platform boxes the user just unchecked.
+async function restoreFormInputs() {
   const saved = await chrome.storage.local.get([
     "lastKeywords",
     "lastLocations",
@@ -121,8 +129,8 @@ async function refresh() {
   const locs = saved.lastLocations?.length ? saved.lastLocations : asArray(saved.lastLocation);
   if (locs.length && $("locations")) $("locations").value = locs.join("\n");
   if (saved.lastContracts?.length) {
+    const map = { CDI: "contractCDI", CDD: "contractCDD", Alternance: "contractAlternance", Stage: "contractStage", Freelance: "contractFreelance" };
     for (const c of saved.lastContracts) {
-      const map = { CDI: "contractCDI", CDD: "contractCDD", Alternance: "contractAlternance", Stage: "contractStage", Freelance: "contractFreelance" };
       if (map[c] && $(map[c])) $(map[c]).checked = true;
     }
   }
@@ -132,10 +140,6 @@ async function refresh() {
     if ($("platformIndeed")) $("platformIndeed").checked = saved.lastPlatforms.includes("indeed");
     if ($("platformGlassdoor")) $("platformGlassdoor").checked = saved.lastPlatforms.includes("glassdoor");
   }
-
-  const lines = state.log || [];
-  $("log").textContent = lines.slice(-80).join("\n") || t("noLog", uiLang);
-  $("log").scrollTop = $("log").scrollHeight;
 }
 
 $("startBtn").addEventListener("click", async () => {
@@ -239,5 +243,6 @@ $("resetStats").addEventListener("click", async () => {
   await refresh();
 });
 
+restoreFormInputs();
 refresh();
 setInterval(refresh, 2500);
