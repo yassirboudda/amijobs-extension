@@ -1,5 +1,8 @@
 const $ = (id) => document.getElementById(id);
 let uiLang = "fr";
+// Set as soon as the user edits any form input. Prevents the async
+// restoreFormInputs() from clobbering what the user just typed/checked.
+let formTouched = false;
 
 async function sendBg(msg) {
   try {
@@ -125,6 +128,8 @@ async function restoreFormInputs() {
     "lastContracts",
     "lastPlatforms",
   ]);
+  // The user may have started typing before this async read resolved.
+  if (formTouched) return;
   if (saved.lastKeywords) $("keywords").value = saved.lastKeywords;
   const locs = saved.lastLocations?.length ? saved.lastLocations : asArray(saved.lastLocation);
   if (locs.length && $("locations")) $("locations").value = locs.join("\n");
@@ -242,6 +247,30 @@ $("resetStats").addEventListener("click", async () => {
   await sendBg({ action: "resetStats" });
   await refresh();
 });
+
+const FORM_INPUT_IDS = [
+  "keywords",
+  "locations",
+  "maxJobs",
+  "contractCDI",
+  "contractCDD",
+  "contractAlternance",
+  "contractStage",
+  "contractFreelance",
+  "platformHellowork",
+  "platformLinkedin",
+  "platformIndeed",
+  "platformGlassdoor",
+];
+for (const id of FORM_INPUT_IDS) {
+  const el = $(id);
+  if (!el) continue;
+  const markTouched = () => {
+    formTouched = true;
+  };
+  el.addEventListener("input", markTouched);
+  el.addEventListener("change", markTouched);
+}
 
 restoreFormInputs();
 refresh();
