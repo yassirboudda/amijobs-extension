@@ -14,11 +14,15 @@ function updateBlacklistCount(count) {
 async function applyI18n() {
   const lang = await getUiLang();
   document.documentElement.lang = lang;
+  document.title = "AmiJobs — " + t("options", lang);
   document.querySelectorAll("[data-i18n]").forEach((el) => {
     const key = el.getAttribute("data-i18n");
     const text = t(key, lang);
     if (el.tagName === "OPTION") el.textContent = text;
     else if (!el.querySelector("a")) el.textContent = text;
+  });
+  document.querySelectorAll("[data-i18n-ph]").forEach((el) => {
+    el.placeholder = t(el.getAttribute("data-i18n-ph"), lang);
   });
 }
 
