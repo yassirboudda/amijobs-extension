@@ -1,4 +1,4 @@
-/** AmiJobs — UI translations (fr / en). Used in popup & options. */
+/** AmiJobs — UI translations (fr / en / es). Used in popup & options. */
 const AMIJOBS_I18N = {
   fr: {
     extName: "AmiJobs",
@@ -48,6 +48,7 @@ const AMIJOBS_I18N = {
     languageAuto: "Automatique (navigateur)",
     languageFr: "Français",
     languageEn: "English",
+    languageEs: "Español",
     save: "Enregistrer",
     saved: "Configuration enregistrée",
     blacklistTitle: "Entreprises blacklistées",
@@ -132,6 +133,7 @@ const AMIJOBS_I18N = {
     languageAuto: "Automatic (browser)",
     languageFr: "Français",
     languageEn: "English",
+    languageEs: "Español",
     save: "Save",
     saved: "Settings saved",
     blacklistTitle: "Blacklisted companies",
@@ -168,18 +170,107 @@ const AMIJOBS_I18N = {
     maxPerCompany: "Max applications / company",
     maxPerCompanyHint: "0 = unlimited. Caps how many applications are sent to the same company.",
   },
+  es: {
+    extName: "AmiJobs",
+    tagline: "Candidaturas automáticas multiplataforma",
+    website: "amijobs.com",
+    statusInactive: "Inactivo",
+    statusActive: "Sesión activa",
+    statusPartial: "Sesión parcial",
+    keywords: "Palabras clave (puesto)",
+    keywordsPh: "Ej.: Desarrollador Python, Controlador de gestión…",
+    location: "Ubicación(es)",
+    locationPh: "Ej.: Madrid, España…",
+    locationsPh: "Una ciudad por línea\nEj.: Madrid\nBarcelona\nValencia",
+    contract: "Tipos de contrato",
+    contractAny: "Todos los tipos",
+    ctCDI: "Indefinido",
+    ctCDD: "Temporal",
+    ctAlternance: "Formación dual",
+    ctStage: "Prácticas",
+    ctFreelance: "Autónomo",
+    maxJobs: "Máx. candidaturas / sesión",
+    platforms: "Plataformas",
+    platformHellowork: "Hellowork",
+    platformLinkedin: "LinkedIn",
+    platformIndeed: "Indeed",
+    platformGlassdoor: "Glassdoor",
+    startSession: "Iniciar sesión",
+    stopSession: "Detener",
+    resumeSession: "Reanudar la última sesión",
+    applyHere: "Postular aquí",
+    options: "Configuración",
+    applied: "Enviadas",
+    skipped: "Omitidas",
+    errors: "Errores",
+    downloadLog: "Descargar registro",
+    clearLog: "Borrar registro",
+    resetStats: "Reiniciar",
+    selectPlatform: "Selecciona al menos una plataforma",
+    sessionStarted: "Sesión iniciada en",
+    sessionEnded: "Sesión finalizada",
+    loading: "Cargando…",
+    noLog: "Sin registros",
+    profileTitle: "Perfil del candidato",
+    mistralTitle: "Mistral AI",
+    settingsTitle: "Ajustes de automatización",
+    languageTitle: "Idioma de la interfaz",
+    languageAuto: "Automático (navegador)",
+    languageFr: "Français",
+    languageEn: "English",
+    languageEs: "Español",
+    save: "Guardar",
+    saved: "Configuración guardada",
+    blacklistTitle: "Empresas en lista negra",
+    blacklistHint: "Una empresa por línea. Coincidencia parcial, sin distinción de mayúsculas.",
+    blacklistPh: "Capgemini\nAccenture",
+    fullName: "Nombre completo",
+    civility: "Tratamiento",
+    civilityAuto: "Auto",
+    civilityMr: "Sr.",
+    civilityMrs: "Sra.",
+    email: "Correo electrónico",
+    phone: "Teléfono",
+    linkedinUrl: "Perfil de LinkedIn",
+    locationField: "Ubicación",
+    postalCode: "Código postal",
+    birthDate: "Fecha de nacimiento",
+    jobTitle: "Título profesional",
+    experience: "Experiencia",
+    stack: "Competencias",
+    education: "Formación",
+    languagesField: "Idiomas",
+    availability: "Disponibilidad",
+    salary: "Expectativa salarial",
+    cvText: "Contenido de texto del CV (Mistral)",
+    cvTextPh: "Pega aquí el texto de tu CV…",
+    mistralKey: "Clave API de Mistral",
+    mistralHint: "Consigue una clave en console.mistral.ai. Puede haber una clave gratuita preconfigurada.",
+    autoSubmit: "Envío automático",
+    easyApplyOnly: "Solo LinkedIn Easy Apply",
+    delayJobs: "Retraso entre ofertas (ms)",
+    delaySteps: "Retraso entre pasos (ms)",
+    delayMax: "MÁX",
+    maxNoApplyPages: "Páginas sin candidatura antes de parar",
+    maxPerCompany: "Máx. candidaturas / empresa",
+    maxPerCompanyHint: "0 = ilimitado. Limita cuántas candidaturas se envían a la misma empresa.",
+  },
 };
 
 function detectBrowserLang() {
   const lang = (navigator.language || "fr").toLowerCase();
-  return lang.startsWith("en") ? "en" : "fr";
+  if (lang.startsWith("en")) return "en";
+  if (lang.startsWith("es")) return "es";
+  return "fr";
 }
+
+const SUPPORTED_LANGS = ["fr", "en", "es"];
 
 async function getUiLang() {
   const { uiSettings = {} } = await chrome.storage.local.get(["uiSettings"]);
   const pref = uiSettings.language || "auto";
   if (pref === "auto") return detectBrowserLang();
-  return pref === "en" ? "en" : "fr";
+  return SUPPORTED_LANGS.includes(pref) ? pref : "fr";
 }
 
 function t(key, lang) {
