@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AmiJobs",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Auto-apply to LinkedIn Easy Apply, HelloWork, Indeed & Glassdoor with Mistral AI. Save 20+ hours/week.",
   "icons": {
     "16": "icons/icon16.png",
@@ -12,10 +12,7 @@
     "storage",
     "tabs",
     "activeTab",
-    "scripting",
-    "downloads",
-    "alarms",
-    "notifications"
+    "downloads"
   ],
   "host_permissions": [
     "https://www.hellowork.com/*",
