@@ -40,6 +40,36 @@ const DEFAULT_SETTINGS = {
   maxApplicationsPerCompany: 0,
 };
 
+function clampInt(value, min, max, fallback) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+// Guard against corrupted storage (e.g. maxJobs = 25000000000000, giant delays
+// that froze LinkedIn with multi-million-second pauses).
+function sanitizeSettings(settings = {}) {
+  const s = { ...DEFAULT_SETTINGS, ...settings };
+  s.maxJobsPerSession = clampInt(s.maxJobsPerSession, 1, 200, 25);
+  s.maxConsecutiveNoApplyPages = clampInt(s.maxConsecutiveNoApplyPages, 1, 50, 20);
+  s.maxApplicationsPerCompany = clampInt(s.maxApplicationsPerCompany, 0, 100, 0);
+  const dj = s.delayBetweenJobs || {};
+  s.delayBetweenJobs = {
+    min: clampInt(dj.min, 1000, 120000, 6000),
+    max: clampInt(dj.max, 1000, 120000, 14000),
+  };
+  if (s.delayBetweenJobs.max < s.delayBetweenJobs.min) s.delayBetweenJobs.max = s.delayBetweenJobs.min;
+  const ds = s.delayBetweenSteps || {};
+  s.delayBetweenSteps = {
+    min: clampInt(ds.min, 200, 20000, 700),
+    max: clampInt(ds.max, 200, 20000, 1600),
+  };
+  if (s.delayBetweenSteps.max < s.delayBetweenSteps.min) s.delayBetweenSteps.max = s.delayBetweenSteps.min;
+  s.autoSubmit = s.autoSubmit !== false;
+  s.onlyEasyApply = s.onlyEasyApply !== false;
+  return s;
+}
+
 const SESSION_KEYS = {
   hellowork: "sessionHellowork",
   linkedin: "sessionLinkedin",
@@ -437,6 +467,13 @@ async function getState() {
   if (sessionIndeed?.active) activePlatforms.push("indeed");
   if (sessionGlassdoor?.active) activePlatforms.push("glassdoor");
 
+  const rawSettings = data.autoApplySettings || { ...DEFAULT_SETTINGS };
+  const autoApplySettings = sanitizeSettings(rawSettings);
+  // Persist the repaired settings once if the stored value was corrupted.
+  if (JSON.stringify(rawSettings) !== JSON.stringify(autoApplySettings)) {
+    await chrome.storage.local.set({ autoApplySettings });
+  }
+
   return {
     enabled: data.enabled !== false,
     stats: data.stats || { applied: 0, skipped: 0, errors: 0, lastRun: null },
@@ -454,7 +491,7 @@ async function getState() {
     sessionActive: activePlatforms.length > 0,
     profile: data.profile || { ...DEFAULT_PROFILE },
     cvText: data.cvText || data.profile?.cvText || "",
-    autoApplySettings: data.autoApplySettings || { ...DEFAULT_SETTINGS },
+    autoApplySettings,
     appliedJobs: data.appliedJobs || {},
     skippedJobs: data.skippedJobs || {},
     mistralApiKey: data.mistralApiKey || DEFAULT_MISTRAL_API_KEY,
@@ -522,13 +559,13 @@ async function syncFromApp(msg) {
   }
   if (msg.mistralApiKey) updates.mistralApiKey = msg.mistralApiKey;
   if (msg.autoApplySettings) {
-    updates.autoApplySettings = { ...(existing.autoApplySettings || DEFAULT_SETTINGS), ...msg.autoApplySettings };
+    updates.autoApplySettings = sanitizeSettings({ ...(existing.autoApplySettings || DEFAULT_SETTINGS), ...msg.autoApplySettings });
   }
   if (msg.maxJobsPerSession) {
-    updates.autoApplySettings = {
+    updates.autoApplySettings = sanitizeSettings({
       ...(updates.autoApplySettings || existing.autoApplySettings || DEFAULT_SETTINGS),
       maxJobsPerSession: msg.maxJobsPerSession,
-    };
+    });
   }
 
   if (Object.keys(updates).length) await chrome.storage.local.set(updates);
@@ -540,7 +577,7 @@ async function startMultiSession(msg) {
   const platforms = (msg.platforms || []).filter((p) => SUPPORTED_PLATFORMS.includes(p));
   if (platforms.length === 0) return { ok: false, reason: "no_platform" };
 
-  const maxJobs = msg.maxJobs || 25;
+  const maxJobs = clampInt(msg.maxJobs, 1, 200, 25);
   const keywords = msg.keywords || "";
   // Backward compatible: accept either a single location/contract or arrays.
   const locations = asArray(msg.locations).length ? asArray(msg.locations) : asArray(msg.location);
@@ -893,7 +930,8 @@ chrome.runtime.onInstalled.addListener(async () => {
   ]);
   const patch = {};
   if (!existing.profile) patch.profile = { ...DEFAULT_PROFILE };
-  if (!existing.autoApplySettings) patch.autoApplySettings = { ...DEFAULT_SETTINGS };
+  // Always repair settings (clears corrupted giant maxJobs / delays).
+  patch.autoApplySettings = sanitizeSettings(existing.autoApplySettings || DEFAULT_SETTINGS);
   if (!existing.mistralApiKey) patch.mistralApiKey = DEFAULT_MISTRAL_API_KEY;
   if (!existing.uiSettings) patch.uiSettings = { language: "auto" };
   if (typeof existing.enabled !== "boolean") patch.enabled = true;

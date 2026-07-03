@@ -143,7 +143,7 @@ $("startBtn").addEventListener("click", async () => {
   const keywords = $("keywords").value.trim();
   const locations = getLocationsFromInput();
   const contracts = selectedContracts();
-  const maxJobs = parseInt($("maxJobs").value, 10) || 25;
+  const maxJobs = Math.min(Math.max(parseInt($("maxJobs").value, 10) || 25, 1), 200);
 
   if (platforms.length === 0) {
     $("status").textContent = t("selectPlatform", uiLang);

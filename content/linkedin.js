@@ -1271,28 +1271,29 @@
     dismissVisibleToasts();
 
     await humanClick(easyApplyBtn);
-    await sleep(randomDelay(1500, 3000));
+    await sleep(randomDelay(2000, 3500));
 
     let modal = isModalOpen();
-    // Retry opening modal up to 3 times with increasing delays
+    // Retry opening modal up to 4 times with increasing delays. After a LinkedIn
+    // SPA navigation the right panel can still be rendering, so we re-query the
+    // button fresh each time and wait longer between attempts.
     if (!modal) {
-      for (let attempt = 1; attempt <= 3 && !modal; attempt++) {
-        log(`[RETRY] Modal non ouvert — tentative ${attempt}/3...`, "warn");
-        await sleep(1500 * attempt);
+      for (let attempt = 1; attempt <= 4 && !modal; attempt++) {
+        log(`[RETRY] Modal non ouvert — tentative ${attempt}/4...`, "warn");
+        await sleep(1800 * attempt);
         // Re-find the button (may have been re-rendered by LinkedIn SPA)
         const retryBtn = findEasyApplyButton();
         if (retryBtn) {
-          // Scroll button into view before clicking
           retryBtn.scrollIntoView({ behavior: "smooth", block: "center" });
-          await sleep(500);
+          await sleep(600);
           await humanClick(retryBtn);
-          await sleep(randomDelay(2000, 3500));
+          await sleep(randomDelay(2500, 4000));
         }
         modal = isModalOpen();
       }
     }
     if (!modal) {
-      log("Modal Easy Apply ne s'ouvre pas après 3 tentatives", "error");
+      log("Modal Easy Apply ne s'ouvre pas après 4 tentatives", "error");
       return { success: false, reason: "modal_not_opened" };
     }
 
@@ -1606,7 +1607,7 @@
       // Trigger popstate so LinkedIn's router picks up the change
       window.dispatchEvent(new PopStateEvent("popstate", { state: null }));
       log(`[DEBUG] URL updated with currentJobId=${card.jobId}`, "info");
-      await sleep(randomDelay(1500, 2500));
+      await sleep(randomDelay(2500, 4000));
 
       // Check if the right panel loaded by looking for job title change
       const rightPanel = $(".jobs-search__job-details, .scaffold-layout__detail, .job-details-module");
@@ -1703,7 +1704,7 @@
     const { sessionLinkedin: session } = await chrome.storage.local.get(["sessionLinkedin"]);
     const state = await chrome.runtime.sendMessage({ action: "getState" });
     const settings = state.autoApplySettings || {};
-    const maxJobs = session?.maxJobs || settings.maxJobsPerSession || 25;
+    const maxJobs = Math.min(Math.max(session?.maxJobs || settings.maxJobsPerSession || 25, 1), 200);
     const appliedJobs = state.appliedJobs || {};
     const totalApplied = session?.applied || 0;
 
@@ -1878,7 +1879,8 @@
         }
 
         if (!shouldStop && i < jobCards.length - 1) {
-          const delay = randomDelay(settings.delayBetweenJobs?.min || 8000, settings.delayBetweenJobs?.max || 20000);
+          const rawDelay = randomDelay(settings.delayBetweenJobs?.min || 8000, settings.delayBetweenJobs?.max || 20000);
+          const delay = Math.min(Math.max(rawDelay, 2000), 60000);
           log(`Pause ${Math.round(delay / 1000)}s...`);
           await sleep(delay);
 
