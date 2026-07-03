@@ -176,6 +176,18 @@
           continue;
         }
 
+        const skipCo = await S().shouldSkipCompany(jobInfo.company);
+        if (skipCo === "company_limit") {
+          await chrome.runtime.sendMessage({
+            action: "markSkipped",
+            platform: PLATFORM,
+            jobId: jobInfo.jobId,
+            title: jobInfo.title,
+            reason: `Limite entreprise (${jobInfo.company})`,
+          });
+          continue;
+        }
+
         const btn = await waitForApplyButton(5000);
         if (!btn) {
           await chrome.runtime.sendMessage({

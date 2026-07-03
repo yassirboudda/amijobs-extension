@@ -1644,6 +1644,29 @@
         continue;
       }
 
+      const { autoApplySettings = {} } = await chrome.storage.local.get(["autoApplySettings"]);
+      const maxPerCo = autoApplySettings.maxApplicationsPerCompany || 0;
+      if (maxPerCo > 0 && companyForCheck) {
+        const countRes = await chrome.runtime.sendMessage({ action: "companyApplyCount", company: companyForCheck });
+        if ((countRes?.count || 0) >= maxPerCo) {
+          await setSession({
+            phase: "search",
+            currentOfferUrl: "",
+            visitedOffers: { ...visitedOffers, [key]: true },
+          });
+          await chrome.runtime.sendMessage({
+            action: "markSkipped", platform: "hellowork",
+            jobId: target.jobId,
+            title: target.title || companyForCheck,
+            url: target.url,
+            reason: `Limite entreprise (${companyForCheck})`,
+          });
+          log(`Limite entreprise atteinte: ${companyForCheck}`, "warn");
+          await sleep(jitter(400, 900));
+          continue;
+        }
+      }
+
       await setSession({
         phase: "offer",
         currentOfferUrl: target.url,

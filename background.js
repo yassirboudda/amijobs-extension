@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.1.0";
+const EXT_VERSION = "1.2.0";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS = {
   autoSubmit: true,
   onlyEasyApply: true,
   maxConsecutiveNoApplyPages: 20,
+  maxApplicationsPerCompany: 0,
 };
 
 const SESSION_KEYS = {
@@ -75,6 +76,11 @@ function emptyPlatformSession(platform, overrides = {}) {
   if (platform === "hellowork") {
     return {
       ...base,
+      keywords: "",
+      location: "",
+      locations: [],
+      locationIndex: 0,
+      contracts: [],
       searchUrl: "",
       resumeSearchUrl: "",
       currentOfferUrl: "",
@@ -94,9 +100,16 @@ function emptyPlatformSession(platform, overrides = {}) {
       ...base,
       keywords: "",
       location: "",
+      locations: [],
+      locationIndex: 0,
+      contracts: [],
       searchUrl: "",
       currentPage: 0,
       noApplyPages: 0,
+      phase: "search",
+      queue: [],
+      qIndex: 0,
+      currentJk: "",
       ...overrides,
     };
   }
@@ -104,26 +117,51 @@ function emptyPlatformSession(platform, overrides = {}) {
     ...base,
     keywords: "",
     location: "",
+    locations: [],
+    locationIndex: 0,
+    contracts: [],
     currentPage: 0,
     noEasyPages: 0,
     ...overrides,
   };
 }
 
-function buildHelloworkSearchUrl(keywords, location, contract) {
-  const p = new URLSearchParams();
-  p.set("k", keywords || "");
-  if (location) p.set("l", location);
-  if (contract) p.set("c", contract);
-  return `https://www.hellowork.com/fr-fr/emploi/recherche.html?${p.toString()}`;
+function asArray(v) {
+  if (Array.isArray(v)) return v.filter(Boolean);
+  if (typeof v === "string" && v.trim()) return [v.trim()];
+  return [];
 }
 
-function buildLinkedInSearchUrl(keywords, location) {
+function buildHelloworkSearchUrl(keywords, location, contracts) {
+  const list = asArray(contracts);
+  const qs = [];
+  qs.push(`k=${encodeURIComponent(keywords || "")}`);
+  if (location) qs.push(`l=${encodeURIComponent(location)}`);
+  for (const c of list) qs.push(`c=${encodeURIComponent(c)}`);
+  return `https://www.hellowork.com/fr-fr/emploi/recherche.html?${qs.join("&")}`;
+}
+
+const LINKEDIN_JT = {
+  cdi: "F",
+  "temps plein": "F",
+  fulltime: "F",
+  cdd: "C",
+  contract: "C",
+  freelance: "C",
+  alternance: "C",
+  apprentissage: "C",
+  stage: "I",
+  internship: "I",
+};
+
+function buildLinkedInSearchUrl(keywords, location, contracts) {
   const params = new URLSearchParams();
   if (keywords) params.set("keywords", keywords);
   if (location) params.set("location", location);
   params.set("f_AL", "true");
   params.set("f_TPR", "r86400");
+  const codes = [...new Set(asArray(contracts).map((c) => LINKEDIN_JT[c.toLowerCase()]).filter(Boolean))];
+  if (codes.length) params.set("f_JT", codes.join(","));
   return `https://www.linkedin.com/jobs/search/?${params.toString()}`;
 }
 
@@ -140,6 +178,77 @@ function buildGlassdoorSearchUrl(keywords, location) {
   if (keywords) p.set("sc.keyword", keywords);
   if (location) p.set("sc.location", location);
   return `https://www.glassdoor.fr/Job/jobs.htm?${p.toString()}`;
+}
+
+function buildPlatformSearchUrl(platform, keywords, location, contracts, page = 0) {
+  if (platform === "hellowork") return buildHelloworkSearchUrl(keywords, location, contracts);
+  if (platform === "linkedin") return buildLinkedInSearchUrl(keywords, location, contracts);
+  if (platform === "indeed") return buildIndeedSearchUrl(keywords, location, page);
+  if (platform === "glassdoor") return buildGlassdoorSearchUrl(keywords, location);
+  return "";
+}
+
+const PLATFORM_URL_MATCH = {
+  hellowork: ["hellowork.com"],
+  linkedin: ["linkedin.com/jobs"],
+  indeed: ["indeed.com", "indeed.fr"],
+  glassdoor: ["glassdoor.com", "glassdoor.fr"],
+};
+
+async function navigatePlatformTab(platform, url) {
+  const patterns = PLATFORM_URL_MATCH[platform] || [];
+  const tabs = await chrome.tabs.query({});
+  const tab = tabs.find((t) => t.url && patterns.some((p) => t.url.includes(p)));
+  if (tab?.id) {
+    await chrome.tabs.update(tab.id, { url });
+  } else {
+    await chrome.tabs.create({ url, active: false });
+  }
+}
+
+function resetSessionForLocation(platform, session, nextLocation, nextIndex, nextUrl) {
+  const next = {
+    ...session,
+    location: nextLocation,
+    locationIndex: nextIndex,
+    currentPage: 0,
+    searchUrl: nextUrl,
+  };
+  if (platform === "hellowork") {
+    next.phase = "search";
+    next.resumeSearchUrl = nextUrl;
+    next.currentOfferUrl = "";
+    next.currentJobTitle = "";
+    next.currentJobCompany = "";
+    next.visitedOffers = {};
+    next.externalSiteOffers = {};
+    next.visitedSearchUrls = [];
+    next.noNewOfferPages = 0;
+  }
+  if (platform === "indeed") {
+    next.phase = "search";
+    next.queue = [];
+    next.qIndex = 0;
+    next.currentJk = "";
+    next.noApplyPages = 0;
+  }
+  if (platform === "glassdoor") {
+    next.noApplyPages = 0;
+  }
+  return next;
+}
+
+async function companyApplyCount(company) {
+  if (!company) return 0;
+  const { appliedJobs = {} } = await chrome.storage.local.get(["appliedJobs"]);
+  const target = String(company).toLowerCase().trim();
+  if (!target) return 0;
+  let count = 0;
+  for (const key of Object.keys(appliedJobs)) {
+    const c = String(appliedJobs[key]?.company || "").toLowerCase().trim();
+    if (c && (c === target || c.includes(target) || target.includes(c))) count++;
+  }
+  return count;
 }
 
 async function getMistralApiKey() {
@@ -246,11 +355,29 @@ async function finalizeMetaSession() {
   }
 }
 
+const HARD_STOP_REASON = /arr[êe]t|demand|objectif|atteint|manuel|\bstop\b|limite/i;
+
 async function endPlatformSession(platform, reason = "") {
   const key = SESSION_KEYS[platform];
   const lastKey = LAST_SESSION_KEYS[platform];
   const { [key]: session = null, stats = { applied: 0, skipped: 0, errors: 0, lastRun: null } } =
     await chrome.storage.local.get([key, "stats"]);
+
+  // Multi-location: if the current location is exhausted (not a hard stop),
+  // move on to the next geographic zone instead of ending the session.
+  if (session?.active && !HARD_STOP_REASON.test(reason || "")) {
+    const locations = Array.isArray(session.locations) ? session.locations : [];
+    const nextIndex = (session.locationIndex || 0) + 1;
+    if (nextIndex < locations.length) {
+      const nextLoc = locations[nextIndex];
+      const nextUrl = buildPlatformSearchUrl(platform, session.keywords, nextLoc, session.contracts);
+      const advanced = resetSessionForLocation(platform, session, nextLoc, nextIndex, nextUrl);
+      await chrome.storage.local.set({ [key]: advanced });
+      await appendLog(`Zone suivante: ${nextLoc}`, "info", platform);
+      await navigatePlatformTab(platform, nextUrl);
+      return;
+    }
+  }
 
   if (session?.active) {
     stats.applied = (stats.applied || 0) + (session.applied || 0);
@@ -415,39 +542,42 @@ async function startMultiSession(msg) {
 
   const maxJobs = msg.maxJobs || 25;
   const keywords = msg.keywords || "";
-  const location = msg.location || "";
-  const contract = msg.contract || "";
+  // Backward compatible: accept either a single location/contract or arrays.
+  const locations = asArray(msg.locations).length ? asArray(msg.locations) : asArray(msg.location);
+  const contracts = asArray(msg.contracts).length ? asArray(msg.contracts) : asArray(msg.contract);
+  const location = locations[0] || "";
+  const locationsOrEmpty = locations.length ? locations : [""];
 
   const amijobsMeta = {
     active: true,
     platforms,
     keywords,
     location,
-    contract,
+    locations: locationsOrEmpty,
+    contracts,
     maxJobs,
     startedAt: new Date().toISOString(),
   };
 
   const updates = { amijobsMeta, enabled: true };
   const urls = {};
+  const common = { keywords, location, locations: locationsOrEmpty, locationIndex: 0, contracts, maxJobs };
 
   if (platforms.includes("hellowork")) {
-    const searchUrl = msg.helloworkUrl || buildHelloworkSearchUrl(keywords, location, contract);
+    const searchUrl = msg.helloworkUrl || buildHelloworkSearchUrl(keywords, location, contracts);
     urls.hellowork = searchUrl;
     updates.sessionHellowork = emptyPlatformSession("hellowork", {
+      ...common,
       searchUrl,
       resumeSearchUrl: searchUrl,
-      maxJobs,
     });
   }
 
   if (platforms.includes("linkedin")) {
-    const searchUrl = msg.linkedinUrl || buildLinkedInSearchUrl(keywords, location);
+    const searchUrl = msg.linkedinUrl || buildLinkedInSearchUrl(keywords, location, contracts);
     urls.linkedin = searchUrl;
     updates.sessionLinkedin = emptyPlatformSession("linkedin", {
-      keywords,
-      location,
-      maxJobs,
+      ...common,
       searchUrl,
     });
   }
@@ -456,9 +586,7 @@ async function startMultiSession(msg) {
     const searchUrl = msg.indeedUrl || buildIndeedSearchUrl(keywords, location);
     urls.indeed = searchUrl;
     updates.sessionIndeed = emptyPlatformSession("indeed", {
-      keywords,
-      location,
-      maxJobs,
+      ...common,
       searchUrl,
     });
   }
@@ -467,16 +595,15 @@ async function startMultiSession(msg) {
     const searchUrl = msg.glassdoorUrl || buildGlassdoorSearchUrl(keywords, location);
     urls.glassdoor = searchUrl;
     updates.sessionGlassdoor = emptyPlatformSession("glassdoor", {
-      keywords,
-      location,
-      maxJobs,
+      ...common,
       searchUrl,
     });
   }
 
   await chrome.storage.local.set(updates);
   await appendLog(
-    `Session AmiJobs démarrée (${platforms.join(" + ")}): "${keywords}" @ "${location}"`,
+    `Session AmiJobs démarrée (${platforms.join(" + ")}): "${keywords}" @ "${locationsOrEmpty.join(", ")}"` +
+      (contracts.length ? ` [${contracts.join(", ")}]` : ""),
     "success"
   );
 
@@ -566,7 +693,7 @@ function handleMessage(msg, sendResponse) {
       } else if (platform === "glassdoor") {
         targetUrl = resumed.searchUrl || buildGlassdoorSearchUrl(resumed.keywords, resumed.location);
       } else {
-        targetUrl = buildLinkedInSearchUrl(resumed.keywords, resumed.location);
+        targetUrl = buildLinkedInSearchUrl(resumed.keywords, resumed.location, resumed.contracts);
       }
       await chrome.storage.local.set({
         [activeKey]: resumed,
@@ -622,6 +749,11 @@ function handleMessage(msg, sendResponse) {
   if (msg.action === "addToPipeline" || msg.action === "requestExternalApply") {
     sendResponse({ ok: false, reason: "not_available" });
     return false;
+  }
+
+  if (msg.action === "companyApplyCount") {
+    companyApplyCount(msg.company).then((count) => sendResponse({ count }));
+    return true;
   }
 
   if (msg.action === "markApplied") {

@@ -113,6 +113,38 @@
       padding: 4px 0 10px;
     }
     .footer a { color: #6366f1; text-decoration: none; font-weight: 600; }
+    textarea.locations {
+      min-height: 52px;
+      resize: vertical;
+      font-size: 12px;
+    }
+    .contracts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .chip {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 5px 8px;
+      border: 1.5px solid #e2e8f0;
+      border-radius: 8px;
+      font-size: 11px;
+      font-weight: 600;
+      background: #fafafa;
+      cursor: pointer;
+    }
+    .chip input { width: auto; accent-color: #4f46e5; margin: 0; }
+    .field-label {
+      font-size: 10px;
+      font-weight: 700;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin-bottom: 4px;
+    }
   </style>
 </head>
 <body>
@@ -124,7 +156,7 @@
         <div class="sub" data-i18n="tagline">Candidatures automatiques multi-plateformes</div>
       </div>
     </div>
-    <div class="v">v1.1.0</div>
+    <div class="v">v1.2.0</div>
   </div>
 
   <div class="block">
@@ -155,15 +187,21 @@
     </div>
     <div style="height:8px"></div>
     <div class="row">
-      <input id="location" data-i18n-ph="locationPh" placeholder="Ex: Paris" />
-      <select id="contract">
-        <option value="" data-i18n="contractAny">Tous types</option>
-        <option value="CDI">CDI</option>
-        <option value="CDD">CDD</option>
-        <option value="Alternance">Alternance</option>
-        <option value="Stage">Stage</option>
-        <option value="Freelance">Freelance</option>
-      </select>
+      <div style="flex:1">
+        <div class="field-label" data-i18n="location">Localisation(s)</div>
+        <textarea id="locations" class="locations" data-i18n-ph="locationsPh" placeholder="Paris&#10;Lyon&#10;Marseille"></textarea>
+      </div>
+    </div>
+    <div style="height:8px"></div>
+    <div>
+      <div class="field-label" data-i18n="contract">Types de contrat</div>
+      <div class="contracts">
+        <label class="chip"><input type="checkbox" id="contractCDI" value="CDI" /> CDI</label>
+        <label class="chip"><input type="checkbox" id="contractCDD" value="CDD" /> CDD</label>
+        <label class="chip"><input type="checkbox" id="contractAlternance" value="Alternance" /> Alternance</label>
+        <label class="chip"><input type="checkbox" id="contractStage" value="Stage" /> Stage</label>
+        <label class="chip"><input type="checkbox" id="contractFreelance" value="Freelance" /> Freelance</label>
+      </div>
     </div>
     <div style="height:8px"></div>
     <div class="row">

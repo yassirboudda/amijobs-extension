@@ -60,6 +60,7 @@ async function load() {
   $("mistralApiKey").value = data.mistralApiKey || "";
   $("maxJobsPerSession").value = settings.maxJobsPerSession || 25;
   $("maxNoApplyPages").value = settings.maxConsecutiveNoApplyPages || 20;
+  $("maxApplicationsPerCompany").value = settings.maxApplicationsPerCompany ?? 0;
   $("delayJobMin").value = settings.delayBetweenJobs?.min || 6000;
   $("delayJobMax").value = settings.delayBetweenJobs?.max || 14000;
   $("delayStepMin").value = settings.delayBetweenSteps?.min || 700;
@@ -111,6 +112,7 @@ async function save() {
     autoSubmit: $("autoSubmit").checked,
     onlyEasyApply: $("onlyEasyApply").checked,
     maxConsecutiveNoApplyPages: Math.min(Math.max(parseInt($("maxNoApplyPages").value, 10) || 20, 1), 50),
+    maxApplicationsPerCompany: Math.max(parseInt($("maxApplicationsPerCompany").value, 10) || 0, 0),
   };
 
   const mistralApiKey = $("mistralApiKey").value.trim();

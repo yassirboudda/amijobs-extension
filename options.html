@@ -141,11 +141,13 @@
       <div class="grid">
         <div><label>Max offres / session</label><input id="maxJobsPerSession" type="number" min="1" max="100" /></div>
         <div><label data-i18n="maxNoApplyPages">Pages sans apply</label><input id="maxNoApplyPages" type="number" min="1" max="50" /></div>
+        <div><label data-i18n="maxPerCompany">Max candidatures / entreprise</label><input id="maxApplicationsPerCompany" type="number" min="0" max="50" /></div>
         <div><label data-i18n="delayJobs">MIN</label><input id="delayJobMin" type="number" /></div>
         <div><label>MAX</label><input id="delayJobMax" type="number" /></div>
         <div><label data-i18n="delaySteps">MIN</label><input id="delayStepMin" type="number" /></div>
         <div><label>MAX</label><input id="delayStepMax" type="number" /></div>
       </div>
+      <p class="hint" data-i18n="maxPerCompanyHint">0 = illimité. Ex: 2 = maximum 2 candidatures par entreprise (toutes sessions confondues).</p>
       <div style="margin-top:12px;" class="grid">
         <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;color:#334155;">
           <input type="checkbox" id="autoSubmit" style="width:auto;" /> <span data-i18n="autoSubmit">Soumission automatique</span>

@@ -1785,6 +1785,18 @@
           continue;
         }
 
+        const maxPerCo = settings.maxApplicationsPerCompany || 0;
+        if (maxPerCo > 0 && jobInfo.company) {
+          const countRes = await chrome.runtime.sendMessage({ action: "companyApplyCount", company: jobInfo.company }).catch(() => null);
+          if ((countRes?.count || 0) >= maxPerCo) {
+            await chrome.runtime.sendMessage({
+              action: "markSkipped", platform: "linkedin", jobId: jobInfo.jobId,
+              title: jobInfo.title, reason: `Limite entreprise (${jobInfo.company})`,
+            }).catch(() => {});
+            continue;
+          }
+        }
+
         // Wait for Easy Apply button with retry (right panel may still be loading)
         let easyApplyBtn = findEasyApplyButton();
         if (!easyApplyBtn) {

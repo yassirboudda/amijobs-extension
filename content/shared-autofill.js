@@ -174,31 +174,56 @@
     await humanType(el, answer);
   }
 
+  async function shouldSkipCompany(company) {
+    if (!company) return false;
+    if (await isCompanyBlacklisted(company)) return "blacklist";
+    const { autoApplySettings = {} } = await chrome.storage.local.get(["autoApplySettings"]);
+    const max = autoApplySettings.maxApplicationsPerCompany || 0;
+    if (max > 0) {
+      const res = await chrome.runtime.sendMessage({ action: "companyApplyCount", company });
+      if ((res?.count || 0) >= max) return "company_limit";
+    }
+    return false;
+  }
+
   function collectFields(root = document) {
     const fields = [];
-    for (const el of $$("input, textarea, select", root)) {
-      if (!isVisible(el)) continue;
-      const type = (el.getAttribute("type") || el.tagName.toLowerCase()).toLowerCase();
-      if (["hidden", "submit", "button", "file", "image", "reset"].includes(type)) continue;
-      if (type === "radio") {
-        const name = el.name;
-        if (!name || fields.some((f) => f.type === "radio" && f.name === name)) continue;
-        const group = $$(`input[type="radio"][name="${CSS.escape(name)}"]`, root).filter(isVisible);
-        fields.push({
-          type: "radio",
-          name,
-          label: getFieldLabel(group[0]),
-          elements: group,
-          options: group.map((r) => getFieldLabel(r) || r.value),
-          element: group[0],
-        });
-        continue;
+    const roots = [root];
+    try {
+      for (const frame of document.querySelectorAll("iframe")) {
+        try {
+          const doc = frame.contentDocument || frame.contentWindow?.document;
+          if (doc) roots.push(doc);
+        } catch (_e) {
+          /* cross-origin iframe */
+        }
       }
-      fields.push({
-        type: type === "textarea" ? "textarea" : type,
-        label: getFieldLabel(el),
-        element: el,
-      });
+    } catch (_e) {}
+    for (const r of roots) {
+      for (const el of $$("input, textarea, select", r)) {
+        if (!isVisible(el)) continue;
+        const type = (el.getAttribute("type") || el.tagName.toLowerCase()).toLowerCase();
+        if (["hidden", "submit", "button", "file", "image", "reset"].includes(type)) continue;
+        if (type === "radio") {
+          const name = el.name;
+          if (!name || fields.some((f) => f.type === "radio" && f.name === name)) continue;
+          const group = $$(`input[type="radio"][name="${CSS.escape(name)}"]`, r).filter(isVisible);
+          fields.push({
+            type: "radio",
+            name,
+            label: getFieldLabel(group[0]),
+            elements: group,
+            options: group.map((g) => getFieldLabel(g) || g.value),
+            element: group[0],
+          });
+          continue;
+        }
+        fields.push({
+          type: type === "textarea" ? "textarea" : type,
+          label: getFieldLabel(el),
+          element: el,
+        });
+      }
     }
     return fields;
   }
@@ -237,6 +262,7 @@
     isVisible,
     getProfile,
     isCompanyBlacklisted,
+    shouldSkipCompany,
     fillVisibleFields,
     collectFields,
     findActionButton,

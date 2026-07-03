@@ -19,6 +19,25 @@ async function sendContent(msg) {
   }
 }
 
+function selectedContracts() {
+  const ids = ["contractCDI", "contractCDD", "contractAlternance", "contractStage", "contractFreelance"];
+  return ids.filter((id) => $(id)?.checked).map((id) => $(id).value);
+}
+
+function asArray(v) {
+  if (Array.isArray(v)) return v.filter(Boolean);
+  if (typeof v === "string" && v.trim()) return [v.trim()];
+  return [];
+}
+
+function getLocationsFromInput() {
+  const raw = $("locations")?.value || "";
+  return raw
+    .split(/[\n,;]+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
 function selectedPlatforms() {
   const platforms = [];
   if ($("platformHellowork")?.checked) platforms.push("hellowork");
@@ -91,10 +110,22 @@ async function refresh() {
     $("resumeBtn").disabled = !hasLast;
   }
 
-  const saved = await chrome.storage.local.get(["lastKeywords", "lastLocation", "lastContract", "lastPlatforms"]);
+  const saved = await chrome.storage.local.get([
+    "lastKeywords",
+    "lastLocations",
+    "lastLocation",
+    "lastContracts",
+    "lastPlatforms",
+  ]);
   if (saved.lastKeywords) $("keywords").value = saved.lastKeywords;
-  if (saved.lastLocation) $("location").value = saved.lastLocation;
-  if (saved.lastContract) $("contract").value = saved.lastContract;
+  const locs = saved.lastLocations?.length ? saved.lastLocations : asArray(saved.lastLocation);
+  if (locs.length && $("locations")) $("locations").value = locs.join("\n");
+  if (saved.lastContracts?.length) {
+    for (const c of saved.lastContracts) {
+      const map = { CDI: "contractCDI", CDD: "contractCDD", Alternance: "contractAlternance", Stage: "contractStage", Freelance: "contractFreelance" };
+      if (map[c] && $(map[c])) $(map[c]).checked = true;
+    }
+  }
   if (saved.lastPlatforms?.length) {
     $("platformHellowork").checked = saved.lastPlatforms.includes("hellowork");
     $("platformLinkedin").checked = saved.lastPlatforms.includes("linkedin");
@@ -110,8 +141,8 @@ async function refresh() {
 $("startBtn").addEventListener("click", async () => {
   const platforms = selectedPlatforms();
   const keywords = $("keywords").value.trim();
-  const location = $("location").value.trim();
-  const contract = $("contract").value.trim();
+  const locations = getLocationsFromInput();
+  const contracts = selectedContracts();
   const maxJobs = parseInt($("maxJobs").value, 10) || 25;
 
   if (platforms.length === 0) {
@@ -125,8 +156,9 @@ $("startBtn").addEventListener("click", async () => {
 
   await chrome.storage.local.set({
     lastKeywords: keywords,
-    lastLocation: location,
-    lastContract: contract,
+    lastLocations: locations,
+    lastLocation: locations[0] || "",
+    lastContracts: contracts,
     lastPlatforms: platforms,
     autoApplySettings: {
       ...(await chrome.storage.local.get(["autoApplySettings"])).autoApplySettings,
@@ -138,8 +170,9 @@ $("startBtn").addEventListener("click", async () => {
     action: "startMultiSession",
     platforms,
     keywords,
-    location,
-    contract,
+    locations,
+    location: locations[0] || "",
+    contracts,
     maxJobs,
   });
 
