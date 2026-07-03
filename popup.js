@@ -88,7 +88,7 @@ async function refresh() {
   $("applied").textContent = state.stats?.applied || 0;
   $("skipped").textContent = state.stats?.skipped || 0;
   $("errors").textContent = state.stats?.errors || 0;
-  $("maxJobs").value = state.autoApplySettings?.maxJobsPerSession || 25;
+  if (!formTouched) $("maxJobs").value = state.autoApplySettings?.maxJobsPerSession || 25;
 
   const statusEl = $("status");
   const active = state.activePlatforms || [];
@@ -130,9 +130,11 @@ async function restoreFormInputs() {
   ]);
   // The user may have started typing before this async read resolved.
   if (formTouched) return;
-  if (saved.lastKeywords) $("keywords").value = saved.lastKeywords;
+  // Only fill fields that are still empty so a late-resolving read can never
+  // clobber text the user already typed.
+  if (saved.lastKeywords && !$("keywords").value) $("keywords").value = saved.lastKeywords;
   const locs = saved.lastLocations?.length ? saved.lastLocations : asArray(saved.lastLocation);
-  if (locs.length && $("locations")) $("locations").value = locs.join("\n");
+  if (locs.length && $("locations") && !$("locations").value) $("locations").value = locs.join("\n");
   if (saved.lastContracts?.length) {
     const map = { CDI: "contractCDI", CDD: "contractCDD", Alternance: "contractAlternance", Stage: "contractStage", Freelance: "contractFreelance" };
     for (const c of saved.lastContracts) {
