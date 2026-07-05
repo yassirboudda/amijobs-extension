@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.2.5";
+const EXT_VERSION = "1.2.6";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -244,6 +244,7 @@ function buildIndeedSearchUrl(keywords, location, page = 0) {
   const p = new URLSearchParams();
   if (keywords) p.set("q", keywords);
   if (location) p.set("l", location);
+  p.set("iafilter", "1");
   if (page > 0) p.set("start", String(page * 10));
   return `https://fr.indeed.com/jobs?${p.toString()}`;
 }

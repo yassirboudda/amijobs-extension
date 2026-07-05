@@ -240,12 +240,31 @@
     }
   }
 
-  function findActionButton(patterns) {
-    const buttons = $$("button, a[role='button'], input[type='submit']");
+  function findActionButton(patterns, root = document) {
+    const buttons = $$("button, a[role='button'], input[type='submit']", root);
     for (const btn of buttons) {
       if (!isVisible(btn) || btn.disabled) continue;
       const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.toLowerCase();
       if (patterns.some((p) => p.test(text))) return btn;
+    }
+    return null;
+  }
+
+  function findActionButtonDeep(patterns) {
+    const roots = [document];
+    try {
+      for (const frame of document.querySelectorAll("iframe")) {
+        try {
+          const doc = frame.contentDocument || frame.contentWindow?.document;
+          if (doc) roots.push(doc);
+        } catch (_e) {
+          /* cross-origin */
+        }
+      }
+    } catch (_e) {}
+    for (const root of roots) {
+      const btn = findActionButton(patterns, root);
+      if (btn) return btn;
     }
     return null;
   }
@@ -266,6 +285,7 @@
     fillVisibleFields,
     collectFields,
     findActionButton,
+    findActionButtonDeep,
     log(platform, msg, level = "info") {
       const ts = new Date().toISOString().slice(11, 23);
       console.log(`[AmiJobs ${platform} ${ts}] ${msg}`);
