@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.2.0";
+  const VERSION = "1.2.2";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -50,6 +50,19 @@
     if (reason) S().log(PLATFORM, `Session terminée: ${reason}`, "warn");
   }
 
+  function detectNoResultsPage() {
+    const text = document.body?.innerText?.toLowerCase() || "";
+    return (
+      text.includes("aucun emploi ne correspond") ||
+      text.includes("aucune offre ne correspond") ||
+      text.includes("no matching jobs") ||
+      text.includes("0 emplois") ||
+      text.includes("0 jobs") ||
+      !!S().$('[data-testid="zero-results"]') ||
+      !!S().$(".jobsearch-NoResult")
+    );
+  }
+
   function collectJobCards() {
     const selectors = [
       ".job_seen_beacon",
@@ -61,6 +74,10 @@
       "ul#job-results-list > li",
       ".jobsearch-ResultsList > li",
       '[data-testid="slider_item"]',
+      '[data-testid="job-card"]',
+      ".mosaic-provider-jobcards li",
+      ".jobsearch-SerpJobCard",
+      "div.slider_item",
     ];
     const nodes = new Set();
     for (const sel of selectors) {
@@ -223,11 +240,19 @@
     let qIndex = session.qIndex || 0;
 
     if (!queue.length) {
-      await S().sleep(2000);
+      await S().sleep(2500);
+      if (detectNoResultsPage()) {
+        await endSession("Aucun résultat pour ce lieu/mot-clé");
+        return;
+      }
       const cards = collectJobCards();
       if (!cards.length) {
         const noPages = (session.noApplyPages || 0) + 1;
         await setSession({ noApplyPages: noPages });
+        if (noPages >= 3 && detectNoResultsPage()) {
+          await endSession("Aucun résultat pour ce lieu/mot-clé");
+          return;
+        }
         if (noPages >= (settings.maxConsecutiveNoApplyPages || 20)) {
           await endSession("Aucune offre trouvée");
           return;
@@ -395,8 +420,13 @@
     window.location.href = session.searchUrl || buildSearchUrl(session.keywords, session.location, session.currentPage || 0);
   }
 
+  let lastIndeedRunAt = 0;
+
   async function runAutoApplySession() {
     if (isRunning) return;
+    const now = Date.now();
+    if (now - lastIndeedRunAt < 3000) return;
+    lastIndeedRunAt = now;
     isRunning = true;
     try {
       const session = await getSession();

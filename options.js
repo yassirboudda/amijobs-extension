@@ -65,10 +65,10 @@ async function load() {
   $("maxJobsPerSession").value = settings.maxJobsPerSession || 25;
   $("maxNoApplyPages").value = settings.maxConsecutiveNoApplyPages || 20;
   $("maxApplicationsPerCompany").value = settings.maxApplicationsPerCompany ?? 0;
-  $("delayJobMin").value = settings.delayBetweenJobs?.min || 6000;
-  $("delayJobMax").value = settings.delayBetweenJobs?.max || 14000;
-  $("delayStepMin").value = settings.delayBetweenSteps?.min || 700;
-  $("delayStepMax").value = settings.delayBetweenSteps?.max || 1600;
+  $("delayJobMin").value = settings.delayBetweenJobs?.min || 500;
+  $("delayJobMax").value = settings.delayBetweenJobs?.max || 500;
+  $("delayStepMin").value = settings.delayBetweenSteps?.min || 100;
+  $("delayStepMax").value = settings.delayBetweenSteps?.max || 100;
   $("autoSubmit").checked = settings.autoSubmit !== false;
   $("onlyEasyApply").checked = settings.onlyEasyApply !== false;
 }
@@ -104,14 +104,14 @@ async function save() {
   updateBlacklistCount(blacklistedCompanies.length);
 
   const autoApplySettings = {
-    maxJobsPerSession: parseInt($("maxJobsPerSession").value, 10) || 25,
+    maxJobsPerSession: Math.min(Math.max(parseInt($("maxJobsPerSession").value, 10) || 25, 1), 10000),
     delayBetweenJobs: {
-      min: parseInt($("delayJobMin").value, 10) || 6000,
-      max: parseInt($("delayJobMax").value, 10) || 14000,
+      min: parseInt($("delayJobMin").value, 10) || 500,
+      max: parseInt($("delayJobMax").value, 10) || 500,
     },
     delayBetweenSteps: {
-      min: parseInt($("delayStepMin").value, 10) || 700,
-      max: parseInt($("delayStepMax").value, 10) || 1600,
+      min: parseInt($("delayStepMin").value, 10) || 100,
+      max: parseInt($("delayStepMax").value, 10) || 100,
     },
     autoSubmit: $("autoSubmit").checked,
     onlyEasyApply: $("onlyEasyApply").checked,

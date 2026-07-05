@@ -4,10 +4,25 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.1.0";
+  const VERSION = "1.2.0";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
+  let lastGlassdoorRunAt = 0;
+
+  function isBlockedPage() {
+    const text = document.body?.innerText?.toLowerCase() || "";
+    const title = document.title?.toLowerCase() || "";
+    return (
+      text.includes("aidez-nous à protéger glassdoor") ||
+      text.includes("help us protect glassdoor") ||
+      text.includes("bad gateway") ||
+      text.includes("ray id:") ||
+      title.includes("bad gateway") ||
+      document.body?.innerHTML?.includes("cf-error") ||
+      !!S().$("h1")?.textContent?.match(/502|503|429/i)
+    );
+  }
 
   function isSearchPage() {
     return /glassdoor\.(com|fr)\/(Job|Emploi)/i.test(window.location.href);
@@ -136,8 +151,23 @@
 
   async function runAutoApplySession() {
     if (isRunning) return;
+    const now = Date.now();
+    if (now - lastGlassdoorRunAt < 12000) return;
+    lastGlassdoorRunAt = now;
     isRunning = true;
     shouldStop = false;
+
+    if (isBlockedPage()) {
+      S().log(PLATFORM, "Glassdoor bloque temporairement (protection anti-bot / 502) — pause 2 min", "warn");
+      await chrome.runtime.sendMessage({
+        action: "endPlatformSession",
+        platform: PLATFORM,
+        reason: "Arrêt: protection Glassdoor",
+      });
+      isRunning = false;
+      return;
+    }
+
     const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
     const state = await chrome.runtime.sendMessage({ action: "getState" });
     const settings = state?.autoApplySettings || {};
@@ -149,13 +179,27 @@
     const cards = collectJobCards();
     if (!cards.length) {
       S().log(PLATFORM, "Aucune offre Glassdoor trouvée", "error");
-      await chrome.runtime.sendMessage({ action: "endPlatformSession", platform: PLATFORM });
+      await chrome.runtime.sendMessage({
+        action: "endPlatformSession",
+        platform: PLATFORM,
+        reason: "Aucune offre trouvée",
+      });
       isRunning = false;
       return;
     }
 
     try {
       for (let i = 0; i < cards.length && !shouldStop; i++) {
+        if (isBlockedPage()) {
+          S().log(PLATFORM, "Protection Glassdoor détectée — arrêt session", "warn");
+          await chrome.runtime.sendMessage({
+            action: "endPlatformSession",
+            platform: PLATFORM,
+            reason: "Arrêt: protection Glassdoor",
+          });
+          break;
+        }
+
         const { sessionGlassdoor: current } = await chrome.storage.local.get(["sessionGlassdoor"]);
         if ((current?.applied || 0) >= maxJobs) break;
 
@@ -222,16 +266,30 @@
         }
 
         if (i < cards.length - 1) {
-          await S().sleep(S().randomDelay(settings.delayBetweenJobs?.min || 6000, settings.delayBetweenJobs?.max || 14000));
+          const jobDelay = Math.max(
+            settings.delayBetweenJobs?.min || 500,
+            8000
+          );
+          const jobDelayMax = Math.max(settings.delayBetweenJobs?.max || jobDelay, jobDelay);
+          await S().sleep(S().randomDelay(jobDelay, jobDelayMax));
         }
       }
 
       const { sessionGlassdoor: updated } = await chrome.storage.local.get(["sessionGlassdoor"]);
       if (updated?.active) {
-        await chrome.runtime.sendMessage({ action: "endPlatformSession", platform: PLATFORM });
+        await chrome.runtime.sendMessage({
+          action: "endPlatformSession",
+          platform: PLATFORM,
+          reason: "Session terminée",
+        });
       }
     } catch (err) {
       S().log(PLATFORM, `Erreur: ${err.message}`, "error");
+      await chrome.runtime.sendMessage({
+        action: "endPlatformSession",
+        platform: PLATFORM,
+        reason: "Arrêt: erreur",
+      });
     }
 
     isRunning = false;
@@ -258,10 +316,18 @@
 
   async function checkAndResumeSession() {
     if (!isSearchPage()) return;
+    if (isBlockedPage()) return;
     const start = Date.now();
     while (Date.now() - start < 60000) {
       const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
       if (session?.active && !isRunning) {
+        if (session.lastRunAt && Date.now() - session.lastRunAt < 15000) {
+          await S().sleep(3000);
+          continue;
+        }
+        await chrome.storage.local.set({
+          sessionGlassdoor: { ...session, lastRunAt: Date.now() },
+        });
         await S().sleep(2500);
         await runAutoApplySession();
         return;

@@ -1704,7 +1704,7 @@
     const { sessionLinkedin: session } = await chrome.storage.local.get(["sessionLinkedin"]);
     const state = await chrome.runtime.sendMessage({ action: "getState" });
     const settings = state.autoApplySettings || {};
-    const maxJobs = Math.min(Math.max(session?.maxJobs || settings.maxJobsPerSession || 25, 1), 200);
+    const maxJobs = Math.min(Math.max(session?.maxJobs || settings.maxJobsPerSession || 25, 1), 10000);
     const appliedJobs = state.appliedJobs || {};
     const totalApplied = session?.applied || 0;
 
@@ -1975,6 +1975,27 @@
   }
 
   // ── Auto-resume session — READS DIRECTLY FROM STORAGE ──────────────────
+  function isLinkedInSearchUrl(url = window.location.href) {
+    return url.includes("/jobs/search") || url.includes("/jobs/collection");
+  }
+
+  function sameLinkedInSearchContext(before, after) {
+    if (!isLinkedInSearchUrl(after)) return false;
+    try {
+      const u1 = new URL(before);
+      const u2 = new URL(after);
+      if (u1.searchParams.get("keywords") && u2.searchParams.get("keywords") && u1.searchParams.get("keywords") !== u2.searchParams.get("keywords")) {
+        return false;
+      }
+      if (u1.searchParams.get("location") && u2.searchParams.get("location") && u1.searchParams.get("location") !== u2.searchParams.get("location")) {
+        return false;
+      }
+      return true;
+    } catch {
+      return isLinkedInSearchUrl(after);
+    }
+  }
+
   async function checkAndResumeSession() {
     const url = window.location.href;
     const isSearchPage = url.includes("/jobs/search") || url.includes("/jobs/collection");
@@ -2011,8 +2032,8 @@
             log("[DEBUG] Session désactivée pendant le délai de reprise — annulation", "info");
             return;
           }
-          if (window.location.href !== resumeUrl) {
-            log("[DEBUG] URL changée pendant le délai de reprise — annulation", "info");
+          if (!sameLinkedInSearchContext(resumeUrl, window.location.href)) {
+            log("[DEBUG] Navigation hors recherche pendant le délai de reprise — annulation", "info");
             return;
           }
           if (!isRunning) {

@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.2.1";
+const EXT_VERSION = "1.2.5";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -32,8 +32,8 @@ const DEFAULT_PROFILE = {
 
 const DEFAULT_SETTINGS = {
   maxJobsPerSession: 25,
-  delayBetweenJobs: { min: 6000, max: 14000 },
-  delayBetweenSteps: { min: 700, max: 1600 },
+  delayBetweenJobs: { min: 500, max: 500 },
+  delayBetweenSteps: { min: 100, max: 100 },
   autoSubmit: true,
   onlyEasyApply: true,
   maxConsecutiveNoApplyPages: 20,
@@ -50,24 +50,69 @@ function clampInt(value, min, max, fallback) {
 // that froze LinkedIn with multi-million-second pauses).
 function sanitizeSettings(settings = {}) {
   const s = { ...DEFAULT_SETTINGS, ...settings };
-  s.maxJobsPerSession = clampInt(s.maxJobsPerSession, 1, 200, 25);
+  s.maxJobsPerSession = clampInt(s.maxJobsPerSession, 1, 10000, 25);
   s.maxConsecutiveNoApplyPages = clampInt(s.maxConsecutiveNoApplyPages, 1, 50, 20);
   s.maxApplicationsPerCompany = clampInt(s.maxApplicationsPerCompany, 0, 100, 0);
   const dj = s.delayBetweenJobs || {};
   s.delayBetweenJobs = {
-    min: clampInt(dj.min, 1000, 120000, 6000),
-    max: clampInt(dj.max, 1000, 120000, 14000),
+    min: clampInt(dj.min, 100, 120000, 500),
+    max: clampInt(dj.max, 100, 120000, 500),
   };
   if (s.delayBetweenJobs.max < s.delayBetweenJobs.min) s.delayBetweenJobs.max = s.delayBetweenJobs.min;
   const ds = s.delayBetweenSteps || {};
   s.delayBetweenSteps = {
-    min: clampInt(ds.min, 200, 20000, 700),
-    max: clampInt(ds.max, 200, 20000, 1600),
+    min: clampInt(ds.min, 50, 20000, 100),
+    max: clampInt(ds.max, 50, 20000, 100),
   };
   if (s.delayBetweenSteps.max < s.delayBetweenSteps.min) s.delayBetweenSteps.max = s.delayBetweenSteps.min;
   s.autoSubmit = s.autoSubmit !== false;
   s.onlyEasyApply = s.onlyEasyApply !== false;
   return s;
+}
+
+async function fetchIndeedLocationSuggestions(query, country = "FR", language = "fr") {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  try {
+    const params = new URLSearchParams({
+      country,
+      language,
+      count: "10",
+      formatted: "1",
+      query: q,
+      useEachWord: "false",
+    });
+    const res = await fetch(`https://autocomplete.indeed.com/api/v0/suggestions/location?${params}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!Array.isArray(data)) return [];
+    return data.map((item) => item?.suggestion).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function resolveIndeedLocation(query) {
+  const raw = String(query || "").trim();
+  if (!raw) return raw;
+  const suggestions = await fetchIndeedLocationSuggestions(raw);
+  if (!suggestions.length) return raw;
+  const exact = suggestions.find((s) => s.toLowerCase() === raw.toLowerCase());
+  if (exact) return exact;
+  const contains = suggestions.find((s) => s.toLowerCase().includes(raw.toLowerCase()) || raw.toLowerCase().includes(s.toLowerCase()));
+  return contains || suggestions[0];
+}
+
+async function normalizeLocations(locations) {
+  const out = [];
+  for (const loc of locations) {
+    const normalized = await resolveIndeedLocation(loc);
+    if (normalized && normalized !== loc) {
+      await appendLog(`Lieu normalisé: "${loc}" → "${normalized}"`, "info");
+    }
+    out.push(normalized || loc);
+  }
+  return out;
 }
 
 const SESSION_KEYS = {
@@ -577,10 +622,13 @@ async function startMultiSession(msg) {
   const platforms = (msg.platforms || []).filter((p) => SUPPORTED_PLATFORMS.includes(p));
   if (platforms.length === 0) return { ok: false, reason: "no_platform" };
 
-  const maxJobs = clampInt(msg.maxJobs, 1, 200, 25);
+  const stored = await chrome.storage.local.get(["autoApplySettings"]);
+  const settings = sanitizeSettings(stored.autoApplySettings || DEFAULT_SETTINGS);
+  const maxJobs = clampInt(msg.maxJobs ?? settings.maxJobsPerSession, 1, 10000, 25);
   const keywords = msg.keywords || "";
   // Backward compatible: accept either a single location/contract or arrays.
-  const locations = asArray(msg.locations).length ? asArray(msg.locations) : asArray(msg.location);
+  let locations = asArray(msg.locations).length ? asArray(msg.locations) : asArray(msg.location);
+  if (locations.length) locations = await normalizeLocations(locations);
   const contracts = asArray(msg.contracts).length ? asArray(msg.contracts) : asArray(msg.contract);
   const location = locations[0] || "";
   const locationsOrEmpty = locations.length ? locations : [""];
@@ -662,6 +710,18 @@ function handleMessage(msg, sendResponse) {
 
   if (msg.action === "getState") {
     getState().then(sendResponse);
+    return true;
+  }
+
+  if (msg.action === "indeedLocationSuggestions") {
+    fetchIndeedLocationSuggestions(msg.query || "", msg.country || "FR", msg.language || "fr").then((suggestions) =>
+      sendResponse({ ok: true, suggestions })
+    );
+    return true;
+  }
+
+  if (msg.action === "normalizeLocations") {
+    normalizeLocations(asArray(msg.locations)).then((locations) => sendResponse({ ok: true, locations }));
     return true;
   }
 

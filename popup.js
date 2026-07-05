@@ -88,7 +88,6 @@ async function refresh() {
   $("applied").textContent = state.stats?.applied || 0;
   $("skipped").textContent = state.stats?.skipped || 0;
   $("errors").textContent = state.stats?.errors || 0;
-  if (!formTouched) $("maxJobs").value = state.autoApplySettings?.maxJobsPerSession || 25;
 
   const statusEl = $("status");
   const active = state.activePlatforms || [];
@@ -152,9 +151,10 @@ async function restoreFormInputs() {
 $("startBtn").addEventListener("click", async () => {
   const platforms = selectedPlatforms();
   const keywords = $("keywords").value.trim();
-  const locations = getLocationsFromInput();
+  let locations = getLocationsFromInput();
   const contracts = selectedContracts();
-  const maxJobs = Math.min(Math.max(parseInt($("maxJobs").value, 10) || 25, 1), 200);
+  const state = await sendBg({ action: "getState" });
+  const maxJobs = state?.autoApplySettings?.maxJobsPerSession || 25;
 
   if (platforms.length === 0) {
     $("status").textContent = t("selectPlatform", uiLang);
@@ -165,16 +165,20 @@ $("startBtn").addEventListener("click", async () => {
     return;
   }
 
+  if (locations.length) {
+    const norm = await sendBg({ action: "normalizeLocations", locations });
+    if (norm?.locations?.length) {
+      locations = norm.locations;
+      if ($("locations")) $("locations").value = locations.join("\n");
+    }
+  }
+
   await chrome.storage.local.set({
     lastKeywords: keywords,
     lastLocations: locations,
     lastLocation: locations[0] || "",
     lastContracts: contracts,
     lastPlatforms: platforms,
-    autoApplySettings: {
-      ...(await chrome.storage.local.get(["autoApplySettings"])).autoApplySettings,
-      maxJobsPerSession: maxJobs,
-    },
   });
 
   const result = await sendBg({
@@ -195,14 +199,8 @@ $("startBtn").addEventListener("click", async () => {
   let first = true;
   for (const p of PLATFORM_OPEN_ORDER) {
     if (!platforms.includes(p) || !result.urls?.[p]) continue;
-    if (first) {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.id) await chrome.tabs.update(tab.id, { url: result.urls[p] });
-      else await chrome.tabs.create({ url: result.urls[p] });
-      first = false;
-    } else {
-      await chrome.tabs.create({ url: result.urls[p], active: false });
-    }
+    await chrome.tabs.create({ url: result.urls[p], active: first });
+    first = false;
   }
 
   window.close();
@@ -253,7 +251,6 @@ $("resetStats").addEventListener("click", async () => {
 const FORM_INPUT_IDS = [
   "keywords",
   "locations",
-  "maxJobs",
   "contractCDI",
   "contractCDD",
   "contractAlternance",
@@ -272,6 +269,72 @@ for (const id of FORM_INPUT_IDS) {
   };
   el.addEventListener("input", markTouched);
   el.addEventListener("change", markTouched);
+}
+
+let locationSuggestTimer = null;
+
+function getCurrentLocationLine(textarea) {
+  const pos = textarea.selectionStart ?? textarea.value.length;
+  const text = textarea.value;
+  const lineStart = text.lastIndexOf("\n", Math.max(0, pos - 1)) + 1;
+  const lineEndRaw = text.indexOf("\n", pos);
+  const lineEnd = lineEndRaw === -1 ? text.length : lineEndRaw;
+  return { lineStart, lineEnd, currentLine: text.slice(lineStart, lineEnd) };
+}
+
+function hideLocationSuggestions() {
+  const box = $("locationSuggestions");
+  if (!box) return;
+  box.innerHTML = "";
+  box.style.display = "none";
+}
+
+function showLocationSuggestions(items) {
+  const box = $("locationSuggestions");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!items.length) {
+    box.style.display = "none";
+    return;
+  }
+  for (const item of items) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "loc-suggestion";
+    btn.textContent = item;
+    btn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const ta = $("locations");
+      const { lineStart, lineEnd } = getCurrentLocationLine(ta);
+      const text = ta.value;
+      ta.value = `${text.slice(0, lineStart)}${item}${text.slice(lineEnd)}`;
+      formTouched = true;
+      hideLocationSuggestions();
+    });
+    box.appendChild(btn);
+  }
+  box.style.display = "block";
+}
+
+const locationsInput = $("locations");
+if (locationsInput) {
+  locationsInput.addEventListener("input", () => {
+    formTouched = true;
+    clearTimeout(locationSuggestTimer);
+    locationSuggestTimer = setTimeout(async () => {
+      const { currentLine } = getCurrentLocationLine(locationsInput);
+      const query = currentLine.trim();
+      if (query.length < 2) {
+        hideLocationSuggestions();
+        return;
+      }
+      const res = await sendBg({ action: "indeedLocationSuggestions", query });
+      showLocationSuggestions(res?.suggestions || []);
+    }, 250);
+  });
+  locationsInput.addEventListener("blur", () => {
+    setTimeout(hideLocationSuggestions, 150);
+  });
 }
 
 restoreFormInputs();

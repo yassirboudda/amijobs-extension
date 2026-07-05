@@ -145,6 +145,38 @@
       letter-spacing: 0.4px;
       margin-bottom: 4px;
     }
+    .location-wrap { position: relative; }
+    .location-suggestions {
+      display: none;
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 2px);
+      z-index: 20;
+      background: white;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.12);
+      max-height: 140px;
+      overflow-y: auto;
+    }
+    .loc-suggestion {
+      display: block;
+      width: 100%;
+      text-align: left;
+      border: none;
+      border-bottom: 1px solid #f1f5f9;
+      background: white;
+      padding: 8px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .loc-suggestion:hover { background: #eef2ff; }
+    .loc-hint {
+      font-size: 10px;
+      color: #64748b;
+      margin-top: 4px;
+    }
   </style>
 </head>
 <body>
@@ -156,7 +188,7 @@
         <div class="sub" data-i18n="tagline">Candidatures automatiques multi-plateformes</div>
       </div>
     </div>
-    <div class="v">v1.2.4</div>
+    <div class="v">v1.2.5</div>
   </div>
 
   <div class="block">
@@ -187,9 +219,11 @@
     </div>
     <div style="height:8px"></div>
     <div class="row">
-      <div style="flex:1">
+      <div style="flex:1" class="location-wrap">
         <div class="field-label" data-i18n="location">Localisation(s)</div>
         <textarea id="locations" class="locations" data-i18n-ph="locationsPh" placeholder="Paris&#10;Lyon&#10;Marseille"></textarea>
+        <div id="locationSuggestions" class="location-suggestions"></div>
+        <div class="loc-hint" data-i18n="locationsHint">Une ville/région par ligne — suggestions Indeed (ex: Île-de-France)</div>
       </div>
     </div>
     <div style="height:8px"></div>
@@ -204,10 +238,7 @@
       </div>
     </div>
     <div style="height:8px"></div>
-    <div class="row">
-      <input id="maxJobs" type="number" min="1" max="100" value="25" />
-      <button class="btn-main" id="startBtn" data-i18n="startSession">Lancer la session</button>
-    </div>
+    <button class="btn-main" id="startBtn" data-i18n="startSession">Lancer la session</button>
     <div style="height:8px"></div>
     <div class="row">
       <button class="btn-stop" id="stopBtn" disabled data-i18n="stopSession">Arrêter</button>
