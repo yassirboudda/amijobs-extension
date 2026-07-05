@@ -1,10 +1,10 @@
-// AmiJobs — Indeed auto-apply content script (phase-based, v1.2.0)
+// AmiJobs — Indeed auto-apply content script (phase-based, v1.2.5)
 (function () {
   if (window.__AmijobsIndeedLoaded) return;
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.2.2";
+  const VERSION = "1.2.5";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;

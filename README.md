@@ -10,7 +10,9 @@ Website: [amijobs.com](https://amijobs.com)
 - Unified **candidate profile** (used by all platforms + Mistral)
 - **Blacklisted companies** (shared across platforms)
 - **Mistral AI** for smart form filling and screening questions
-- **French / English** UI with automatic browser language detection
+- **French / English / Spanish** UI with automatic browser language detection
+- **Indeed location autocomplete** (canonical city/region names for better search results)
+- **Multi-location** and **multi-contract** search in the popup
 
 ## Install (developer mode)
 
@@ -55,7 +57,7 @@ amijobs/
 
 ```bash
 cd amijobs
-zip -r dist/amijobs-extension-v1.1.0.zip . \
+zip -r dist/amijobs-extension-v1.2.5.zip . \
   -x "*.git*" -x "dist/*" -x "scripts/*" -x "*.md"
 ```
 
