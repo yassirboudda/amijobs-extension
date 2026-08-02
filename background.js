@@ -250,6 +250,7 @@ function buildIndeedSearchUrl(keywords, location, page = 0) {
 }
 
 function buildGlassdoorSearchUrl(keywords, location) {
+  // Prefer classic Job/jobs.htm search (live browser: Job/index.htm also lists Easy Apply cards)
   const p = new URLSearchParams();
   if (keywords) p.set("sc.keyword", keywords);
   if (location) p.set("sc.location", location);
