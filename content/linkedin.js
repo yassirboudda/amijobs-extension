@@ -14,7 +14,7 @@
   if (window.__AmijobsLinkedinLoaded) return;
   window.__AmijobsLinkedinLoaded = true;
 
-  const VERSION = "1.2.7";
+  const VERSION = "1.2.8";
   let isRunning = false;
   let shouldStop = false;
   const sessionStats = { applied: 0, skipped: 0, errors: 0 };

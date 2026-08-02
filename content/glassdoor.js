@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.2.7";
+  const VERSION = "1.2.8";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -152,13 +152,18 @@
   }
 
   function findApplyButton() {
+    // Live headed Chrome (HAR cookies): button[data-test="easyApply"] text "Candidature facile"
+    // → opens smartapply.indeed.com/beta/indeedapply/applybyapplyablejobid?...
     const selectors = [
+      'button[data-test="easyApply"]',
+      '[data-test="easyApply"]',
       '[data-test="applyButton"]',
       '[data-test="apply-button"]',
       '[data-test="easy-apply-button"]',
       'button[data-test*="apply" i]',
       'a[data-test*="apply" i]',
       'button[aria-label*="Easy Apply" i]',
+      'button[aria-label*="Candidature" i]',
       'button[aria-label*="Postuler" i]',
     ];
     for (const sel of selectors) {
@@ -166,6 +171,7 @@
       if (el && S().isVisible(el)) return el;
     }
     return S().findActionButton([
+      /candidature facile/i,
       /easy apply/i,
       /candidature simplifiée/i,
       /postuler facilement/i,

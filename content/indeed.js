@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.2.7";
+  const VERSION = "1.2.8";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -316,82 +316,179 @@
     return S().shouldSkipCompany(company);
   }
 
-  function clickResumeIfNeeded() {
-    const resumeCard =
-      S().$('[data-testid="resume-selection-card"]') ||
-      S().$('div[data-testid*="resume"] input[type="radio"]:checked') ||
-      S().$('input[name*="resume"]:checked');
-    if (resumeCard) return true;
-    const firstResume =
-      S().$('[data-testid="resume-selection-card"]') ||
-      S().$('label[for*="resume"]') ||
-      S().findActionButtonDeep([/utiliser ce cv/i, /use this resume/i, /select resume/i]);
-    if (firstResume) {
-      firstResume.click();
+  function smartApplyPath() {
+    try {
+      return new URL(window.location.href).pathname;
+    } catch (_e) {
+      return window.location.pathname || "";
+    }
+  }
+
+  async function fillProfileLocationStep() {
+    // Live DOM (headed Chrome + HAR cookies): profile-location page
+    const profile = await S().getProfile();
+    const city = (profile.location || "").split(",")[0].trim() || "Paris";
+    const postal = profile.postalCode || "75001";
+    const address = profile.address || profile.street || "1 Rue de Rivoli";
+    const map = [
+      ['[data-testid="location-fields-postal-code-input"]', "#location-fields-postal-code-input", postal],
+      ['[data-testid="location-fields-locality-input"]', "#location-fields-locality-input", city],
+      ['[data-testid="location-fields-address-input"]', "#location-fields-address-input", address],
+    ];
+    for (const [a, b, val] of map) {
+      const el = S().$(a) || S().$(b);
+      if (el && S().isVisible(el) && !el.value) {
+        await S().humanType(el, val);
+        await S().sleep(200);
+      }
+    }
+  }
+
+  async function clickResumeIfNeeded() {
+    // Live DOM: resume-selection-file-resume-radio-card (+ label/input)
+    const label =
+      S().$('[data-testid="resume-selection-file-resume-radio-card-label"]') ||
+      S().$('[data-testid="resume-selection-file-resume-radio-card"]') ||
+      S().$('[data-testid="resume-selection-radio-card-group"] label') ||
+      S().$('label[data-testid*="resume"]');
+    if (label && S().isVisible(label)) {
+      await S().humanClick(label);
+      await S().sleep(400);
       return true;
     }
-    const radio = S().$('input[type="radio"][name*="resume"], input[type="radio"][id*="resume"]');
-    if (radio && !radio.checked) radio.click();
-    return !!radio;
+    const radio =
+      S().$('[data-testid="resume-selection-file-resume-radio-card-input"]') ||
+      S().$('input[type="radio"][name="resume-selection"]') ||
+      S().$('input[type="radio"][name*="resume"]');
+    if (radio) {
+      try {
+        radio.checked = true;
+        radio.dispatchEvent(new Event("input", { bubbles: true }));
+        radio.dispatchEvent(new Event("change", { bubbles: true }));
+        const wrap = radio.closest('[data-testid*="resume"]') || radio.parentElement;
+        if (wrap) await S().humanClick(wrap);
+      } catch (_e) {
+        /* ignore */
+      }
+      return true;
+    }
+    return false;
+  }
+
+  async function fillRelevantExperienceStep() {
+    const profile = await S().getProfile();
+    const title = profile.title || jobInfoTitleFallback() || "Développeur";
+    const company = profile.company || profile.currentCompany || "Freelance";
+    const titleEl = S().$('[data-testid="job-title-input"]') || S().$("#job-title-input");
+    const companyEl = S().$('[data-testid="company-name-input"]') || S().$("#company-name-input");
+    if (titleEl && S().isVisible(titleEl) && !titleEl.value) await S().humanType(titleEl, title);
+    if (companyEl && S().isVisible(companyEl) && !companyEl.value) await S().humanType(companyEl, company);
+  }
+
+  function jobInfoTitleFallback() {
+    return (
+      S().$('[data-testid="ia-JobHeader-headerContainer"]')?.textContent?.trim()?.split("\n")[0] || ""
+    );
+  }
+
+  function findVisibleContinueOrSubmit() {
+    // Prefer Indeed Smart Apply testids observed in live browser
+    const testIds = [
+      '[data-testid="continue-button"]',
+      '[data-testid^="hp-continue-button"]',
+      '[data-testid="resume-selection-continue-button"]',
+    ];
+    for (const sel of testIds) {
+      for (const el of S().$$(sel)) {
+        if (S().isVisible(el) && !el.disabled) return { el, kind: "next" };
+      }
+    }
+
+    const submitRe = [
+      /submit (my )?application/i,
+      /soumettre (ma )?candidature/i,
+      /envoyer (ma )?candidature/i,
+      /send application/i,
+      /déposer ma candidature/i,
+      /^soumettre$/i,
+    ];
+    const nextRe = [
+      /^continue$/i,
+      /^continuer$/i,
+      /^next$/i,
+      /^suivant$/i,
+      /review( your)?( application)?/i,
+      /vérifier/i,
+      /examiner/i,
+      /enregistrer et continuer/i,
+      /save and continue/i,
+    ];
+
+    const buttons = S().$$("button, a[role='button'], input[type='submit']");
+    for (const btn of buttons) {
+      if (!S().isVisible(btn) || btn.disabled) continue;
+      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
+      if (!text || /signaler|fermer|close|exit|options de cv/i.test(text)) continue;
+      if (submitRe.some((p) => p.test(text))) return { el: btn, kind: "submit" };
+    }
+    for (const btn of buttons) {
+      if (!S().isVisible(btn) || btn.disabled) continue;
+      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
+      if (!text || /signaler|fermer|close|exit|options de cv|passer au contenu/i.test(text)) continue;
+      if (nextRe.some((p) => p.test(text))) return { el: btn, kind: "next" };
+    }
+    return null;
   }
 
   async function runApplyWizard(jobInfo, settings) {
-    S().log(PLATFORM, "Assistant Smart Apply — remplissage");
-    for (let step = 0; step < 24; step++) {
+    S().log(PLATFORM, `Assistant Smart Apply — ${smartApplyPath()}`);
+    for (let step = 0; step < 28; step++) {
       if (shouldStop) return { success: false, reason: "stopped" };
       if (detectApplySuccess()) return { success: true };
 
-      clickResumeIfNeeded();
+      const path = smartApplyPath();
+      // Wait for loading indicator on review
+      if (S().$('[data-testid="loading-indicator"]')) {
+        await S().sleep(1500);
+        continue;
+      }
+
+      if (/profile-location/i.test(path)) {
+        await fillProfileLocationStep();
+      }
+      if (/resume-selection/i.test(path)) {
+        await clickResumeIfNeeded();
+      }
+      if (/relevant-experience/i.test(path)) {
+        await fillRelevantExperienceStep();
+      }
+
       await S().fillVisibleFields(jobInfo, PLATFORM);
 
-      const submit = S().findActionButtonDeep([
-        /submit (my )?application/i,
-        /soumettre (ma )?candidature/i,
-        /envoyer (ma )?candidature/i,
-        /send application/i,
-        /déposer ma candidature/i,
-        /^soumettre$/i,
-        /^envoyer$/i,
-      ]);
-      const next = S().findActionButtonDeep([
-        /^continue$/i,
-        /^continuer$/i,
-        /^next$/i,
-        /^suivant$/i,
-        /review( your)?( application)?/i,
-        /vérifier/i,
-        /examiner/i,
-        /valider/i,
-        /enregistrer et continuer/i,
-        /save and continue/i,
-      ]);
+      const action = findVisibleContinueOrSubmit();
+      if (!action) {
+        await S().sleep(900);
+        if (detectApplySuccess()) return { success: true };
+        continue;
+      }
 
-      if (submit) {
+      if (action.kind === "submit") {
         if (settings.autoSubmit !== false) {
-          await S().humanClick(submit);
+          await S().humanClick(action.el);
           await S().sleep(2800);
-          if (detectApplySuccess()) return { success: true };
-          // Often success UI is delayed
-          for (let i = 0; i < 6; i++) {
-            await S().sleep(800);
+          for (let i = 0; i < 8; i++) {
             if (detectApplySuccess()) return { success: true };
+            await S().sleep(700);
           }
           return { success: true, reason: "submitted" };
         }
         return { success: false, reason: "review" };
       }
 
-      if (next) {
-        await S().humanClick(next);
-        await S().sleep(
-          S().randomDelay(settings.delayBetweenSteps?.min || 400, settings.delayBetweenSteps?.max || 1200)
-        );
-        continue;
-      }
-
-      // Wait for next step to hydrate
-      await S().sleep(900);
-      if (detectApplySuccess()) return { success: true };
+      await S().humanClick(action.el);
+      await S().sleep(
+        S().randomDelay(settings.delayBetweenSteps?.min || 500, settings.delayBetweenSteps?.max || 1400)
+      );
     }
     return { success: false, reason: "wizard_timeout" };
   }
