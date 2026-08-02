@@ -14,7 +14,7 @@
   if (window.__AmijobsLinkedinLoaded) return;
   window.__AmijobsLinkedinLoaded = true;
 
-  const VERSION = "1.0.0";
+  const VERSION = "1.2.7";
   let isRunning = false;
   let shouldStop = false;
   const sessionStats = { applied: 0, skipped: 0, errors: 0 };
@@ -311,13 +311,21 @@
   function findEasyApplyButton() {
     const selectors = [
       'button.jobs-apply-button',
-      'button[aria-label*="Easy Apply"]',
-      'button[aria-label*="Candidature simplifiée"]',
-      'button[aria-label*="Postuler"]',
+      'button.jobs-apply-button--top-card',
+      '.jobs-s-apply button',
+      '.jobs-apply-button--top-card',
+      'button[aria-label*="Easy Apply" i]',
+      'button[aria-label*="Candidature simplifiée" i]',
+      'button[aria-label*="Postuler simplement" i]',
+      'button[data-live-test-job-apply-button]',
+      'button[data-job-id][aria-label*="Postuler" i]',
     ];
     for (const sel of selectors) {
       const btn = $(sel);
-      if (btn && btn.offsetParent !== null) {
+      if (btn && btn.offsetParent !== null && !btn.disabled) {
+        const t = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.toLowerCase();
+        // Prefer Easy Apply / candidature simplifiée over external apply
+        if (t.includes("site de l") || t.includes("company website") || t.includes("external")) continue;
         log(`[DEBUG] Easy Apply trouvé via selector: ${sel}`, "info");
         return btn;
       }
@@ -325,17 +333,24 @@
     const buttons = $$("button");
     for (const btn of buttons) {
       const text = btn.textContent.trim().toLowerCase();
-      if ((text.includes("easy apply") || text.includes("candidature simplifiée") ||
-           text.includes("postuler") || text.includes("postuler facilement")) &&
-          btn.offsetParent !== null && !btn.disabled) {
-        log(`[DEBUG] Easy Apply trouvé via texte: "${text}"`, "info");
+      const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+      const hay = `${text} ${aria}`;
+      if (
+        (hay.includes("easy apply") ||
+          hay.includes("candidature simplifiée") ||
+          hay.includes("postuler simplement") ||
+          (hay.includes("postuler") && !hay.includes("site"))) &&
+        btn.offsetParent !== null &&
+        !btn.disabled
+      ) {
+        log(`[DEBUG] Easy Apply trouvé via texte: "${text || aria}"`, "info");
         return btn;
       }
     }
     const spans = $$("span");
     for (const span of spans) {
       const text = span.textContent.trim().toLowerCase();
-      if (text === "candidature simplifiée" || text === "easy apply" || text === "postuler") {
+      if (text === "candidature simplifiée" || text === "easy apply" || text === "postuler simplement") {
         let parent = span.parentElement;
         while (parent && parent.tagName !== "BUTTON" && parent.tagName !== "A") {
           parent = parent.parentElement;
@@ -1549,86 +1564,91 @@
   // ── Job List Scanning ───────────────────────────────────────────────────
   function getJobCards() {
     const cards = [];
+    const seen = new Set();
     const cardSelectors = [
       "li.jobs-search-results__list-item",
       "li.ember-view.occludable-update",
-      'div[data-job-id]',
-      'li[data-occludable-job-id]',
-      'li.scaffold-layout__list-item',
-      '.jobs-search-results-list li',
-      '.scaffold-layout__list li.ember-view',
-      'ul.scaffold-layout__list-container li',
+      "div[data-job-id]",
+      "li[data-occludable-job-id]",
+      "li.scaffold-layout__list-item",
+      ".jobs-search-results-list li",
+      ".scaffold-layout__list li.ember-view",
+      "ul.scaffold-layout__list-container li",
+      ".job-card-container",
+      "div.job-card-list__entity-lockup",
+      '[data-view-name="job-card"]',
+      "li.jobs-search-two-pane__job-card-container--scaffold",
     ];
+    const pushCard = (el) => {
+      const jobId =
+        el.getAttribute("data-job-id") ||
+        el.getAttribute("data-occludable-job-id") ||
+        el.querySelector("[data-job-id]")?.getAttribute("data-job-id") ||
+        el.querySelector("[data-occludable-job-id]")?.getAttribute("data-occludable-job-id") ||
+        el.querySelector("a[href*='/jobs/view/']")?.href?.match(/\/jobs\/view\/(\d+)/)?.[1] ||
+        "";
+      const key = jobId || el.textContent?.slice(0, 40);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      cards.push({ element: el, jobId });
+    };
     for (const sel of cardSelectors) {
       const els = $$(sel);
-      if (els.length > 0) {
-        for (const el of els) {
-          const jobId = el.getAttribute("data-job-id") ||
-            el.getAttribute("data-occludable-job-id") ||
-            el.querySelector("a")?.href?.match(/\/jobs\/view\/(\d+)/)?.[1] ||
-            el.querySelector('[data-job-id]')?.getAttribute('data-job-id') || "";
-          cards.push({ element: el, jobId });
-        }
-        return cards;
-      }
+      for (const el of els) pushCard(el);
+      if (cards.length > 0) return cards;
     }
     const listContainer =
       $("ul.jobs-search-results__list") ||
       $("div.jobs-search-results-list") ||
       $(".scaffold-layout__list") ||
-      $('[class*="jobs-search-results"]');
+      $('[class*="jobs-search-results"]') ||
+      $("div.scaffold-layout__list-detail-container");
     if (listContainer) {
-      const items = $$("li", listContainer);
-      for (const item of items) {
-        const link = $("a", item);
-        const match = link?.href?.match(/\/jobs\/view\/(\d+)/);
-        cards.push({ element: item, jobId: match?.[1] || "" });
-      }
+      for (const item of $$("li, .job-card-container", listContainer)) pushCard(item);
     }
     return cards;
   }
 
   async function clickJobCard(card) {
-    // v1.6.0 CRITICAL: Do NOT click <a> links at all — even synthetic MouseEvent
-    // on <a> tags causes real navigation away from the search page.
-    // Instead, update the URL's currentJobId param. LinkedIn's SPA watches
-    // for URL changes and loads job details in the right split-pane panel.
+    // Prefer selecting the job in the two-pane UI without full navigation.
     log(`[DEBUG] clickJobCard: jobId=${card.jobId}`, "info");
 
-    // Scroll the card into view for visual feedback
     card.element.scrollIntoView({ behavior: "smooth", block: "center" });
     await sleep(randomDelay(300, 600));
 
+    // Method 1: click non-anchor clickable region on the card (LinkedIn 2024–2026 UI)
+    const clickTarget =
+      card.element.querySelector(
+        ".job-card-list__title--link, .job-card-container--clickable, .job-card-list__entity-lockup, div.artdeco-entity-lockup"
+      ) || card.element;
+    try {
+      const rect = clickTarget.getBoundingClientRect();
+      const x = rect.left + Math.min(40, rect.width / 2);
+      const y = rect.top + rect.height / 2;
+      clickTarget.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, clientX: x, clientY: y }));
+      clickTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y, buttons: 1 }));
+      await sleep(40);
+      clickTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y }));
+      clickTarget.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y }));
+    } catch (_e) {
+      /* ignore */
+    }
+
     if (card.jobId) {
-      // Method 1 (preferred): Update URL param — LinkedIn SPA loads job in right panel
       const url = new URL(window.location.href);
       url.searchParams.set("currentJobId", card.jobId);
       window.history.replaceState(null, "", url.toString());
-      // Trigger popstate so LinkedIn's router picks up the change
       window.dispatchEvent(new PopStateEvent("popstate", { state: null }));
       log(`[DEBUG] URL updated with currentJobId=${card.jobId}`, "info");
-      await sleep(randomDelay(2500, 4000));
-
-      // Check if the right panel loaded by looking for job title change
-      const rightPanel = $(".jobs-search__job-details, .scaffold-layout__detail, .job-details-module");
-      if (rightPanel) {
-        log(`[DEBUG] Panneau détail trouvé`, "info");
-      }
     }
 
-    // Method 2 (fallback): If URL param didn't work, click the card's container
-    // element (NOT the <a> tag) to trigger LinkedIn's delegation handler
-    if (!findEasyApplyButton()) {
-      log(`[DEBUG] Easy Apply non visible après URL update — click sur carte`, "info");
-      const clickTarget = card.element; // the <li>, NOT the <a> inside
-      const rect = clickTarget.getBoundingClientRect();
-      const x = rect.left + rect.width / 2;
-      const y = rect.top + rect.height / 2;
-      clickTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: x, clientY: y }));
-      await sleep(50);
-      clickTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: x, clientY: y }));
-      clickTarget.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: x, clientY: y }));
-      await sleep(randomDelay(2000, 3000));
+    // Wait for Easy Apply / detail pane to hydrate
+    for (let i = 0; i < 10; i++) {
+      await sleep(500);
+      if (findEasyApplyButton()) {
+        log("[DEBUG] Easy Apply visible après sélection carte", "info");
+        break;
+      }
     }
 
     // Safety: verify we're still on the search page

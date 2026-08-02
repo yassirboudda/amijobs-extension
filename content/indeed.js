@@ -1,13 +1,14 @@
-// AmiJobs — Indeed auto-apply content script (phase-based, v1.2.6)
+// AmiJobs — Indeed auto-apply content script (phase-based, v1.2.7)
 (function () {
   if (window.__AmijobsIndeedLoaded) return;
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.2.6";
+  const VERSION = "1.2.7";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
+  let lastIndeedRunAt = 0;
 
   function getIndeedHost(session) {
     if (session?.searchUrl) {
@@ -22,15 +23,23 @@
   }
 
   function isSearchPage(url = window.location.href) {
-    return /indeed\.(com|fr)\/jobs/.test(url);
+    return /indeed\.(com|fr)\/jobs(\?|$)/.test(url) || /indeed\.(com|fr)\/jobs\//.test(url);
   }
 
   function isViewJobPage(url = window.location.href) {
-    return /indeed\.(com|fr)\/viewjob/.test(url) || /indeed\.(com|fr)\/rc\/clk/.test(url);
+    return (
+      /indeed\.(com|fr)\/viewjob/.test(url) ||
+      /indeed\.(com|fr)\/rc\/clk/.test(url) ||
+      /indeed\.(com|fr)\/pagead\/clk/.test(url)
+    );
   }
 
   function isSmartApplyPage(url = window.location.href) {
-    return /indeed\.(com|fr)\/apply/.test(url) || /smartapply\.indeed\.com/.test(url);
+    return (
+      /smartapply\.indeed\.com/i.test(url) ||
+      /indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(url) ||
+      /indeed\.(com|fr)\/apply/i.test(url)
+    );
   }
 
   function buildSearchUrl(keywords, location, page = 0, session = null) {
@@ -39,40 +48,29 @@
     if (keywords) p.set("q", keywords);
     if (location) p.set("l", location);
     p.set("iafilter", "1");
+    p.set("fromage", "14");
     if (page > 0) p.set("start", String(page * 10));
     return `${host}/jobs?${p.toString()}`;
   }
 
   function extractJobKey(el) {
     if (!el) return null;
-    const direct = el.getAttribute("data-jk") || el.closest("[data-jk]")?.getAttribute("data-jk");
+    const direct =
+      el.getAttribute("data-jk") ||
+      el.getAttribute("data-jobkey") ||
+      el.closest("[data-jk]")?.getAttribute("data-jk") ||
+      el.closest("[data-jobkey]")?.getAttribute("data-jobkey");
     if (direct) return direct;
-    const link = el.querySelector?.('a[href*="jk="], a[href*="viewjob"]') || (el.matches?.('a[href*="jk="]') ? el : null);
+    const link =
+      el.querySelector?.('a[href*="jk="], a[href*="viewjob"], a[data-jk]') ||
+      (el.matches?.('a[href*="jk="]') ? el : null);
     const href = link?.getAttribute?.("href") || el.getAttribute?.("href") || "";
     const m = href.match(/[?&]jk=([^&]+)/) || href.match(/[?&]vjk=([^&]+)/);
-    if (m) return m[1];
+    if (m) return decodeURIComponent(m[1]);
     const id = el.getAttribute?.("id") || "";
     const idMatch = id.match(/job_([a-f0-9]+)/i);
     if (idMatch) return idMatch[1];
     return null;
-  }
-
-  async function waitForJobCards(maxWaitMs = 30000) {
-    const start = Date.now();
-    let attempt = 0;
-    while (Date.now() - start < maxWaitMs) {
-      attempt++;
-      window.scrollBy(0, 400);
-      await S().sleep(400);
-      window.scrollTo(0, 0);
-      const cards = collectJobCards();
-      if (cards.length > 0) {
-        S().log(PLATFORM, `${cards.length} offres détectées (tentative ${attempt})`);
-        return cards;
-      }
-      await S().sleep(1500);
-    }
-    return collectJobCards();
   }
 
   async function getSession() {
@@ -83,7 +81,7 @@
   async function setSession(updates) {
     const session = await getSession();
     if (!session) return null;
-    const next = { ...session, ...updates };
+    const next = { ...session, ...updates, lastRunAt: Date.now() };
     await chrome.storage.local.set({ sessionIndeed: next });
     return next;
   }
@@ -93,12 +91,26 @@
     if (reason) S().log(PLATFORM, `Session terminée: ${reason}`, "warn");
   }
 
+  function detectBlockedPage() {
+    const text = document.body?.innerText?.toLowerCase() || "";
+    const title = document.title?.toLowerCase() || "";
+    return (
+      title.includes("blocked") ||
+      text.includes("requête bloquée") ||
+      text.includes("request blocked") ||
+      text.includes("you have been blocked") ||
+      text.includes("vous avez été bloqué") ||
+      !!document.querySelector("#captcha-challenge, .cf-challenge, [data-testid='blocked']")
+    );
+  }
+
   function detectLoginWall() {
     const text = document.body?.innerText?.toLowerCase() || "";
     return (
       text.includes("connectez-vous pour continuer") ||
       text.includes("sign in to continue") ||
-      !!document.querySelector('a[href*="/account/login"], button[data-tn-element="login"]')
+      text.includes("create an account to continue") ||
+      !!document.querySelector('form[action*="login"], a[href*="/account/login"], button[data-tn-element="login"]')
     );
   }
 
@@ -107,9 +119,9 @@
     return (
       text.includes("aucun emploi ne correspond") ||
       text.includes("aucune offre ne correspond") ||
+      text.includes("did not match any jobs") ||
       text.includes("no matching jobs") ||
       text.includes("0 emplois") ||
-      text.includes("0 jobs") ||
       !!S().$('[data-testid="zero-results"]') ||
       !!S().$(".jobsearch-NoResult")
     );
@@ -117,6 +129,8 @@
 
   function collectJobCards() {
     const selectors = [
+      "#mosaic-provider-jobcards li",
+      "#mosaic-provider-jobcards .cardOutline",
       ".job_seen_beacon",
       "div.job_seen_beacon",
       "li[data-jk]",
@@ -130,10 +144,16 @@
       ".mosaic-provider-jobcards li",
       ".jobsearch-SerpJobCard",
       "div.slider_item",
+      "a.jcs-JobTitle",
+      "h2.jobTitle a",
     ];
     const nodes = new Set();
     for (const sel of selectors) {
-      for (const el of S().$$(sel)) nodes.add(el);
+      for (const el of S().$$(sel)) {
+        const card =
+          el.closest("[data-jk], .job_seen_beacon, .cardOutline, li, [data-testid='slider_item']") || el;
+        nodes.add(card);
+      }
     }
     const out = [];
     const seen = new Set();
@@ -142,19 +162,50 @@
       if (!jk || seen.has(jk)) continue;
       seen.add(jk);
       const title =
-        el.querySelector("h2.jobTitle span, h2.jobTitle a, .jobTitle, [data-testid='job-title']")?.textContent?.trim() ||
-        "";
+        el.querySelector("h2.jobTitle span, h2.jobTitle a, .jobTitle, [data-testid='job-title'], a.jcs-JobTitle")
+          ?.textContent?.trim() || "";
       const company =
-        el.querySelector("[data-testid='company-name'], .companyName, .company")?.textContent?.trim() || "";
+        el.querySelector("[data-testid='company-name'], .companyName, .company, span.companyName")
+          ?.textContent?.trim() || "";
       out.push({ element: el, jobId: jk, title, company });
     }
     return out;
+  }
+
+  async function waitForJobCards(maxWaitMs = 45000) {
+    const start = Date.now();
+    let attempt = 0;
+    while (Date.now() - start < maxWaitMs) {
+      attempt++;
+      if (detectBlockedPage()) return [];
+      if (detectNoResultsPage() && attempt > 3) return [];
+      const scrollRoot =
+        S().$("#mosaic-provider-jobcards") ||
+        S().$(".jobsearch-ResultsList") ||
+        S().$("main") ||
+        document.scrollingElement;
+      if (scrollRoot) {
+        scrollRoot.scrollTop = Math.min((scrollRoot.scrollTop || 0) + 500, scrollRoot.scrollHeight || 5000);
+      } else {
+        window.scrollBy(0, 500);
+      }
+      await S().sleep(500);
+      const cards = collectJobCards();
+      if (cards.length > 0) {
+        S().log(PLATFORM, `${cards.length} offres détectées (tentative ${attempt})`);
+        window.scrollTo(0, 0);
+        return cards;
+      }
+      await S().sleep(1200);
+    }
+    return collectJobCards();
   }
 
   function getJobInfoFromPage(jobId) {
     const title =
       S().$('[data-testid="jobsearch-JobInfoHeader-title"]')?.textContent?.trim() ||
       S().$(".jobsearch-JobInfoHeader-title")?.textContent?.trim() ||
+      S().$("h1.jobsearch-JobInfoHeader-title")?.textContent?.trim() ||
       S().$("h1")?.textContent?.trim() ||
       "";
     const company =
@@ -179,8 +230,9 @@
   function jkFromUrl() {
     const m =
       window.location.href.match(/[?&]vjk=([^&]+)/) ||
-      window.location.href.match(/[?&]jk=([^&]+)/);
-    return m ? m[1] : `indeed_${Date.now()}`;
+      window.location.href.match(/[?&]jk=([^&]+)/) ||
+      window.location.href.match(/indeedApplyableJobId=([^&]+)/);
+    return m ? decodeURIComponent(m[1]) : `indeed_${Date.now()}`;
   }
 
   function findApplyButton() {
@@ -196,15 +248,25 @@
       }
     } catch (_e) {}
 
+    const selectors = [
+      '[data-testid="indeedApplyButton"]',
+      "#indeedApplyButton",
+      '[data-indeed-apply-button]',
+      "button.ia-IndeedApplyButton",
+      'button[aria-label*="Postuler sur Indeed" i]',
+      'button[aria-label*="Indeed Apply" i]',
+      'button[aria-label*="Apply now" i]',
+      'a[data-indeed-apply-button]',
+      "#applyButtonLinkContainer button",
+      ".jobsearch-IndeedApplyButton-newDesign",
+      'button[id*="indeedApply"]',
+    ];
+
     for (const root of roots) {
-      const btn =
-        root.querySelector('[data-testid="indeedApplyButton"]') ||
-        root.querySelector("#indeedApplyButton") ||
-        root.querySelector('[data-indeed-apply-button]') ||
-        root.querySelector("button.ia-IndeedApplyButton") ||
-        root.querySelector('button[aria-label*="Postuler sur Indeed" i]') ||
-        root.querySelector('button[aria-label*="Indeed Apply" i]');
-      if (btn && S().isVisible(btn)) return btn;
+      for (const sel of selectors) {
+        const btn = root.querySelector(sel);
+        if (btn && S().isVisible(btn)) return btn;
+      }
     }
 
     return (
@@ -216,28 +278,32 @@
         /^postuler$/i,
         /apply now/i,
         /continuer à postuler/i,
+        /continue applying/i,
       ]) || null
     );
   }
 
-  async function waitForApplyButton(timeoutMs = 10000) {
+  async function waitForApplyButton(timeoutMs = 14000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const btn = findApplyButton();
       if (btn) return btn;
-      await S().sleep(500);
+      await S().sleep(400);
     }
     return null;
   }
 
   function detectApplySuccess() {
-    const body = document.body.innerText.toLowerCase();
+    const body = document.body?.innerText?.toLowerCase() || "";
     return (
       body.includes("application submitted") ||
       body.includes("candidature envoyée") ||
       body.includes("your application has been submitted") ||
       body.includes("vous avez postulé") ||
-      body.includes("candidature a été envoyée")
+      body.includes("candidature a été envoyée") ||
+      body.includes("we have received your application") ||
+      body.includes("nous avons bien reçu") ||
+      !!S().$('[data-testid="apply-success"], .ia-BasePage-heading')
     );
   }
 
@@ -246,64 +312,130 @@
     return !!(appliedJobs[jobId] || appliedJobs[`ind_${jobId}`]);
   }
 
-  async function shouldSkipCompany(company, settings) {
-    const skip = await S().shouldSkipCompany(company);
-    return skip;
+  async function shouldSkipCompany(company) {
+    return S().shouldSkipCompany(company);
+  }
+
+  function clickResumeIfNeeded() {
+    const resumeCard =
+      S().$('[data-testid="resume-selection-card"]') ||
+      S().$('div[data-testid*="resume"] input[type="radio"]:checked') ||
+      S().$('input[name*="resume"]:checked');
+    if (resumeCard) return true;
+    const firstResume =
+      S().$('[data-testid="resume-selection-card"]') ||
+      S().$('label[for*="resume"]') ||
+      S().findActionButtonDeep([/utiliser ce cv/i, /use this resume/i, /select resume/i]);
+    if (firstResume) {
+      firstResume.click();
+      return true;
+    }
+    const radio = S().$('input[type="radio"][name*="resume"], input[type="radio"][id*="resume"]');
+    if (radio && !radio.checked) radio.click();
+    return !!radio;
   }
 
   async function runApplyWizard(jobInfo, settings) {
-    for (let step = 0; step < 20; step++) {
+    S().log(PLATFORM, "Assistant Smart Apply — remplissage");
+    for (let step = 0; step < 24; step++) {
       if (shouldStop) return { success: false, reason: "stopped" };
+      if (detectApplySuccess()) return { success: true };
+
+      clickResumeIfNeeded();
       await S().fillVisibleFields(jobInfo, PLATFORM);
+
       const submit = S().findActionButtonDeep([
-        /submit application/i,
-        /soumettre la candidature/i,
-        /envoyer la candidature/i,
+        /submit (my )?application/i,
+        /soumettre (ma )?candidature/i,
+        /envoyer (ma )?candidature/i,
         /send application/i,
-        /soumettre/i,
-        /envoyer/i,
+        /déposer ma candidature/i,
+        /^soumettre$/i,
+        /^envoyer$/i,
       ]);
       const next = S().findActionButtonDeep([
-        /continue/i,
-        /continuer/i,
-        /next/i,
-        /suivant/i,
-        /review/i,
+        /^continue$/i,
+        /^continuer$/i,
+        /^next$/i,
+        /^suivant$/i,
+        /review( your)?( application)?/i,
         /vérifier/i,
+        /examiner/i,
         /valider/i,
+        /enregistrer et continuer/i,
+        /save and continue/i,
       ]);
+
       if (submit) {
         if (settings.autoSubmit !== false) {
           await S().humanClick(submit);
-          await S().sleep(2500);
+          await S().sleep(2800);
           if (detectApplySuccess()) return { success: true };
+          // Often success UI is delayed
+          for (let i = 0; i < 6; i++) {
+            await S().sleep(800);
+            if (detectApplySuccess()) return { success: true };
+          }
           return { success: true, reason: "submitted" };
         }
         return { success: false, reason: "review" };
       }
+
       if (next) {
         await S().humanClick(next);
-        await S().sleep(S().randomDelay(settings.delayBetweenSteps?.min || 100, settings.delayBetweenSteps?.max || 500));
+        await S().sleep(
+          S().randomDelay(settings.delayBetweenSteps?.min || 400, settings.delayBetweenSteps?.max || 1200)
+        );
         continue;
       }
-      await S().sleep(600);
+
+      // Wait for next step to hydrate
+      await S().sleep(900);
+      if (detectApplySuccess()) return { success: true };
     }
     return { success: false, reason: "wizard_timeout" };
   }
 
   async function applyCurrentJob(settings, jobInfo) {
     const info = jobInfo || getJobInfoFromPage();
-    const btn = await waitForApplyButton();
-    if (!btn) return { success: false, reason: "no_indeed_apply" };
-    await S().humanClick(btn);
-    await S().sleep(S().randomDelay(2000, 3500));
 
     if (isSmartApplyPage()) {
       return runApplyWizard(info, settings);
     }
 
-    for (let i = 0; i < 12; i++) {
+    const btn = await waitForApplyButton();
+    if (!btn) return { success: false, reason: "no_indeed_apply" };
+
+    const popupPromise = new Promise((resolve) => {
+      const onMsg = (msg) => {
+        if (msg?.action === "indeedSmartApplyOpened") {
+          chrome.runtime.onMessage.removeListener(onMsg);
+          resolve(true);
+        }
+      };
+      chrome.runtime.onMessage.addListener(onMsg);
+      setTimeout(() => {
+        chrome.runtime.onMessage.removeListener(onMsg);
+        resolve(false);
+      }, 8000);
+    });
+
+    await S().humanClick(btn);
+    await S().sleep(S().randomDelay(1500, 2800));
+
+    if (isSmartApplyPage()) {
+      return runApplyWizard(info, settings);
+    }
+
+    const opened = await popupPromise;
+    if (opened) {
+      // Smart Apply opened in another tab — that tab's content script finishes the apply
+      return { success: true, reason: "smartapply_tab" };
+    }
+
+    for (let i = 0; i < 16; i++) {
       if (isSmartApplyPage()) return runApplyWizard(info, settings);
+      if (detectApplySuccess()) return { success: true };
       await S().sleep(500);
     }
     return runApplyWizard(info, settings);
@@ -318,6 +450,11 @@
       return;
     }
 
+    if (detectBlockedPage()) {
+      await endSession("Indeed a bloqué la requête (anti-bot)");
+      return;
+    }
+
     let queue = session.queue || [];
     let qIndex = session.qIndex || 0;
 
@@ -326,7 +463,7 @@
         await endSession("Aucun résultat pour ce lieu/mot-clé");
         return;
       }
-      const cards = await waitForJobCards(30000);
+      const cards = await waitForJobCards(45000);
       if (!cards.length) {
         const noPages = (session.noApplyPages || 0) + 1;
         await setSession({ noApplyPages: noPages });
@@ -334,7 +471,7 @@
           await endSession("Aucun résultat pour ce lieu/mot-clé");
           return;
         }
-        if (noPages >= (settings.maxConsecutiveNoApplyPages || 20)) {
+        if (noPages >= (settings.maxConsecutiveNoApplyPages || 12)) {
           await endSession("Aucune offre trouvée");
           return;
         }
@@ -373,7 +510,7 @@
         continue;
       }
 
-      const skipReason = await shouldSkipCompany(item.company, settings);
+      const skipReason = await shouldSkipCompany(item.company);
       if (skipReason) {
         await chrome.runtime.sendMessage({
           action: "markSkipped",
@@ -393,11 +530,13 @@
       await setSession({
         phase: "viewjob",
         currentJk: item.jobId,
+        currentTitle: item.title,
+        currentCompany: item.company,
         qIndex: qIndex + 1,
       });
 
       const host = getIndeedHost(session);
-      window.location.href = `${host}/viewjob?jk=${item.jobId}`;
+      window.location.href = `${host}/viewjob?jk=${encodeURIComponent(item.jobId)}&from=amijobs`;
       return;
     }
 
@@ -408,11 +547,23 @@
 
   async function handleViewJobPage(session, settings) {
     const jobId = session.currentJk || jkFromUrl();
-    await S().sleep(2000);
+    await S().sleep(2200);
     const jobInfo = getJobInfoFromPage(jobId);
-    if (!jobInfo.title) jobInfo.title = session.queue?.find((q) => q.jobId === jobId)?.title || "";
+    if (!jobInfo.title) {
+      jobInfo.title =
+        session.currentTitle || session.queue?.find((q) => q.jobId === jobId)?.title || "";
+    }
+    if (!jobInfo.company) {
+      jobInfo.company =
+        session.currentCompany || session.queue?.find((q) => q.jobId === jobId)?.company || "";
+    }
 
-    const skipReason = await shouldSkipCompany(jobInfo.company, settings);
+    if (detectBlockedPage()) {
+      await endSession("Indeed a bloqué la requête (anti-bot)");
+      return;
+    }
+
+    const skipReason = await shouldSkipCompany(jobInfo.company);
     if (skipReason) {
       await chrome.runtime.sendMessage({
         action: "markSkipped",
@@ -425,11 +576,13 @@
             : `Limite entreprise (${jobInfo.company})`,
       });
       await setSession({ phase: "search" });
-      window.location.href = session.searchUrl || buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      window.location.href =
+        session.searchUrl ||
+        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
       return;
     }
 
-    const btn = await waitForApplyButton(12000);
+    const btn = await waitForApplyButton(14000);
     if (!btn) {
       await chrome.runtime.sendMessage({
         action: "markSkipped",
@@ -439,12 +592,28 @@
         reason: "Pas de candidature Indeed",
       });
       await setSession({ phase: "search" });
-      window.location.href = session.searchUrl || buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      window.location.href =
+        session.searchUrl ||
+        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
       return;
     }
 
-    await setSession({ phase: "apply" });
+    await setSession({ phase: "apply", currentJk: jobInfo.jobId });
     const result = await applyCurrentJob(settings, jobInfo);
+
+    if (result.reason === "smartapply_tab") {
+      // Another tab owns the wizard; keep phase apply until that tab reports back or times out
+      S().log(PLATFORM, "Smart Apply ouvert dans un onglet — attente");
+      await S().sleep(12000);
+      const fresh = await getSession();
+      if (fresh?.phase === "apply") {
+        await setSession({ phase: "search" });
+        window.location.href =
+          session.searchUrl ||
+          buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      }
+      return;
+    }
 
     if (result.success) {
       await chrome.runtime.sendMessage({
@@ -466,51 +635,96 @@
       });
     }
 
-    await S().sleep(S().randomDelay(settings.delayBetweenJobs?.min || 500, settings.delayBetweenJobs?.max || 500));
+    await S().sleep(
+      S().randomDelay(settings.delayBetweenJobs?.min || 800, settings.delayBetweenJobs?.max || 1800)
+    );
     await setSession({ phase: "search" });
-    window.location.href = session.searchUrl || buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+    window.location.href =
+      session.searchUrl ||
+      buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
   }
 
   async function handleApplyPage(session, settings) {
     const jobInfo = getJobInfoFromPage(session.currentJk);
+    if (!jobInfo.title) jobInfo.title = session.currentTitle || "";
+    if (!jobInfo.company) jobInfo.company = session.currentCompany || "";
+
     const result = await runApplyWizard(jobInfo, settings);
 
     if (result.success) {
       await chrome.runtime.sendMessage({
         action: "markApplied",
         platform: PLATFORM,
-        jobId: jobInfo.jobId,
+        jobId: jobInfo.jobId || session.currentJk,
         title: jobInfo.title,
         company: jobInfo.company,
         url: jobInfo.url,
       });
-      S().log(PLATFORM, `Postulé: ${jobInfo.title}`, "success");
+      S().log(PLATFORM, `Postulé: ${jobInfo.title || jobInfo.jobId}`, "success");
     } else {
       await chrome.runtime.sendMessage({
         action: "markError",
         platform: PLATFORM,
-        jobId: jobInfo.jobId,
+        jobId: jobInfo.jobId || session.currentJk,
         title: jobInfo.title,
         error: result.reason || "error",
       });
     }
 
     await setSession({ phase: "search" });
-    window.location.href = session.searchUrl || buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+    // Prefer closing smartapply tab and returning to search on fr.indeed
+    if (/smartapply\.indeed\.com/i.test(window.location.href)) {
+      await chrome.runtime.sendMessage({
+        action: "closeTabAndResumeIndeed",
+        searchUrl:
+          session.searchUrl ||
+          buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session),
+      });
+      return;
+    }
+    window.location.href =
+      session.searchUrl ||
+      buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
   }
-
-  let lastIndeedRunAt = 0;
 
   async function runAutoApplySession() {
     if (isRunning) return;
     const now = Date.now();
-    if (now - lastIndeedRunAt < 3000) return;
+    if (now - lastIndeedRunAt < 2500) return;
     lastIndeedRunAt = now;
     isRunning = true;
     try {
-      const session = await getSession();
+      let session = await getSession();
+      // Glassdoor handoff can activate Indeed apply without a full session
+      if (!session?.active && isSmartApplyPage()) {
+        const { sessionGlassdoor } = await chrome.storage.local.get(["sessionGlassdoor"]);
+        if (sessionGlassdoor?.active) {
+          await chrome.storage.local.set({
+            sessionIndeed: {
+              active: true,
+              platform: PLATFORM,
+              applied: sessionGlassdoor.applied || 0,
+              skipped: 0,
+              errors: 0,
+              maxJobs: sessionGlassdoor.maxJobs || 25,
+              keywords: sessionGlassdoor.keywords || "",
+              location: sessionGlassdoor.location || "",
+              phase: "apply",
+              currentJk: sessionGlassdoor.currentJk || jkFromUrl(),
+              searchUrl: sessionGlassdoor.searchUrl || "",
+              fromGlassdoor: true,
+            },
+          });
+          session = await getSession();
+        }
+      }
       if (!session?.active) return;
-      if (detectLoginWall()) {
+
+      if (detectBlockedPage()) {
+        await endSession("Indeed a bloqué la requête (anti-bot)");
+        return;
+      }
+      if (detectLoginWall() && !isSmartApplyPage()) {
         await endSession("Connexion Indeed requise");
         return;
       }
@@ -533,9 +747,7 @@
         await handleSearchPage(session, settings);
       } else {
         S().log(PLATFORM, `Page non gérée: ${url}`, "warn");
-        if (session.searchUrl) {
-          window.location.href = session.searchUrl;
-        }
+        if (session.searchUrl) window.location.href = session.searchUrl;
       }
     } catch (err) {
       S().log(PLATFORM, `Erreur: ${err.message}`, "error");
@@ -595,7 +807,7 @@
   S().log(PLATFORM, `Indeed module v${VERSION} chargé`);
   setTimeout(() => {
     getSession().then((session) => {
-      if (session?.active) runAutoApplySession();
+      if (session?.active || isSmartApplyPage()) runAutoApplySession();
     });
-  }, 1500);
+  }, 1800);
 })();

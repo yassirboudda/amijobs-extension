@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.2.6";
+const EXT_VERSION = "1.2.7";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -267,9 +267,90 @@ function buildPlatformSearchUrl(platform, keywords, location, contracts, page = 
 const PLATFORM_URL_MATCH = {
   hellowork: ["hellowork.com"],
   linkedin: ["linkedin.com/jobs"],
-  indeed: ["indeed.com", "indeed.fr"],
+  indeed: ["indeed.com", "indeed.fr", "smartapply.indeed.com"],
   glassdoor: ["glassdoor.com", "glassdoor.fr"],
 };
+
+let watchingIndeedFromGlassdoor = null;
+let lastSmartApplyKick = 0;
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  const url = changeInfo.url || tab?.url || "";
+  if (!url || changeInfo.status === "loading" && !changeInfo.url) return;
+  if (!/smartapply\.indeed\.com/i.test(url) && !/indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(url)) {
+    return;
+  }
+  // Debounce duplicate kicks
+  const now = Date.now();
+  if (now - lastSmartApplyKick < 2000) return;
+  lastSmartApplyKick = now;
+
+  try {
+    const { sessionIndeed, sessionGlassdoor } = await chrome.storage.local.get([
+      "sessionIndeed",
+      "sessionGlassdoor",
+    ]);
+    if (sessionIndeed?.active) {
+      await chrome.storage.local.set({
+        sessionIndeed: {
+          ...sessionIndeed,
+          phase: "apply",
+          lastRunAt: Date.now(),
+        },
+      });
+      setTimeout(() => {
+        chrome.tabs.sendMessage(tabId, { action: "startAutoApply" }).catch(() => {});
+      }, 1500);
+      // Notify other Indeed tabs that Smart Apply opened
+      const tabs = await chrome.tabs.query({});
+      for (const t of tabs) {
+        if (!t.id || t.id === tabId) continue;
+        if (/indeed\.(com|fr)/i.test(t.url || "")) {
+          chrome.tabs.sendMessage(t.id, { action: "indeedSmartApplyOpened" }).catch(() => {});
+        }
+      }
+      return;
+    }
+
+    if (sessionGlassdoor?.active || watchingIndeedFromGlassdoor) {
+      const job = watchingIndeedFromGlassdoor || {};
+      await chrome.storage.local.set({
+        sessionIndeed: {
+          active: true,
+          platform: "indeed",
+          applied: sessionGlassdoor?.applied || 0,
+          skipped: 0,
+          errors: 0,
+          maxJobs: sessionGlassdoor?.maxJobs || 25,
+          keywords: sessionGlassdoor?.keywords || "",
+          location: sessionGlassdoor?.location || "",
+          phase: "apply",
+          currentJk: job.jobId || sessionGlassdoor?.currentJk || "",
+          currentTitle: job.title || sessionGlassdoor?.currentTitle || "",
+          currentCompany: job.company || sessionGlassdoor?.currentCompany || "",
+          searchUrl: sessionGlassdoor?.searchUrl || "",
+          fromGlassdoor: true,
+          startedAt: new Date().toISOString(),
+        },
+      });
+      if (sessionGlassdoor?.active) {
+        await chrome.storage.local.set({
+          sessionGlassdoor: {
+            ...sessionGlassdoor,
+            indeedHandoffDone: true,
+            awaitingIndeed: false,
+          },
+        });
+      }
+      watchingIndeedFromGlassdoor = null;
+      setTimeout(() => {
+        chrome.tabs.sendMessage(tabId, { action: "startAutoApply" }).catch(() => {});
+      }, 1500);
+    }
+  } catch (_e) {
+    /* ignore */
+  }
+});
 
 async function navigatePlatformTab(platform, url) {
   const patterns = PLATFORM_URL_MATCH[platform] || [];
@@ -698,7 +779,7 @@ async function startMultiSession(msg) {
   return { ok: true, urls, platforms };
 }
 
-function handleMessage(msg, sendResponse) {
+function handleMessage(msg, sendResponse, sender = null) {
   if (msg.action === "ping") {
     sendResponse({ ok: true, version: EXT_VERSION });
     return false;
@@ -956,13 +1037,57 @@ function handleMessage(msg, sendResponse) {
     return true;
   }
 
+  if (msg.action === "watchIndeedApplyFromGlassdoor") {
+    watchingIndeedFromGlassdoor = msg.jobInfo || {};
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.action === "closeTabAndResumeIndeed") {
+    (async () => {
+      const tabId = sender?.tab?.id;
+      const searchUrl = msg.searchUrl || "";
+      if (searchUrl) {
+        const tabs = await chrome.tabs.query({});
+        const indeedTab = tabs.find(
+          (t) =>
+            t.url &&
+            (t.url.includes("indeed.com/jobs") || t.url.includes("indeed.fr/jobs")) &&
+            t.id !== tabId
+        );
+        if (indeedTab?.id) {
+          await chrome.tabs.update(indeedTab.id, { url: searchUrl, active: true });
+        } else {
+          await chrome.tabs.create({ url: searchUrl, active: true });
+        }
+      }
+      if (tabId) {
+        try {
+          await chrome.tabs.remove(tabId);
+        } catch (_e) {
+          /* ignore */
+        }
+      }
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+
   if (msg.action === "stopAllPlatforms") {
     (async () => {
       const tabs = await chrome.tabs.query({});
       for (const tab of tabs) {
         const url = tab.url || "";
         if (!tab.id) continue;
-        if (url.includes("hellowork.com") || url.includes("linkedin.com/jobs") || url.includes("indeed.com") || url.includes("indeed.fr") || url.includes("glassdoor.com") || url.includes("glassdoor.fr")) {
+        if (
+          url.includes("hellowork.com") ||
+          url.includes("linkedin.com/jobs") ||
+          url.includes("indeed.com") ||
+          url.includes("indeed.fr") ||
+          url.includes("smartapply.indeed.com") ||
+          url.includes("glassdoor.com") ||
+          url.includes("glassdoor.fr")
+        ) {
           chrome.tabs.sendMessage(tab.id, { action: "stopAutoApply" }).catch(() => {});
         }
       }
@@ -977,8 +1102,8 @@ function handleMessage(msg, sendResponse) {
   return false;
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  return handleMessage(msg, sendResponse);
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  return handleMessage(msg, sendResponse, sender);
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
