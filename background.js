@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.2.8";
+const EXT_VERSION = "1.2.9";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -277,13 +277,13 @@ let lastSmartApplyKick = 0;
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   const url = changeInfo.url || tab?.url || "";
-  if (!url || changeInfo.status === "loading" && !changeInfo.url) return;
+  if (!url || (changeInfo.status === "loading" && !changeInfo.url)) return;
   if (!/smartapply\.indeed\.com/i.test(url) && !/indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(url)) {
     return;
   }
-  // Debounce duplicate kicks
+  // Debounce duplicate kicks (many Smart Apply URL changes per wizard)
   const now = Date.now();
-  if (now - lastSmartApplyKick < 2000) return;
+  if (now - lastSmartApplyKick < 3500) return;
   lastSmartApplyKick = now;
 
   try {
@@ -291,7 +291,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       "sessionIndeed",
       "sessionGlassdoor",
     ]);
-    if (sessionIndeed?.active) {
+
+    // Existing Indeed session owns Smart Apply — never overwrite its queue
+    if (sessionIndeed?.active && !sessionIndeed.fromGlassdoor) {
       await chrome.storage.local.set({
         sessionIndeed: {
           ...sessionIndeed,
@@ -301,37 +303,38 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       });
       setTimeout(() => {
         chrome.tabs.sendMessage(tabId, { action: "startAutoApply" }).catch(() => {});
-      }, 1500);
-      // Notify other Indeed tabs that Smart Apply opened
+      }, 1200);
       const tabs = await chrome.tabs.query({});
       for (const t of tabs) {
         if (!t.id || t.id === tabId) continue;
-        if (/indeed\.(com|fr)/i.test(t.url || "")) {
+        if (/indeed\.(com|fr)/i.test(t.url || "") && !/smartapply/i.test(t.url || "")) {
           chrome.tabs.sendMessage(t.id, { action: "indeedSmartApplyOpened" }).catch(() => {});
         }
       }
       return;
     }
 
-    if (sessionGlassdoor?.active || watchingIndeedFromGlassdoor) {
+    // Glassdoor Easy Apply → Indeed Smart Apply (or Glassdoor-owned Indeed apply session)
+    if (sessionGlassdoor?.active || watchingIndeedFromGlassdoor || sessionIndeed?.fromGlassdoor) {
       const job = watchingIndeedFromGlassdoor || {};
+      const base = sessionIndeed?.fromGlassdoor ? sessionIndeed : null;
       await chrome.storage.local.set({
         sessionIndeed: {
           active: true,
           platform: "indeed",
-          applied: sessionGlassdoor?.applied || 0,
-          skipped: 0,
-          errors: 0,
-          maxJobs: sessionGlassdoor?.maxJobs || 25,
-          keywords: sessionGlassdoor?.keywords || "",
-          location: sessionGlassdoor?.location || "",
+          applied: base?.applied || sessionGlassdoor?.applied || 0,
+          skipped: base?.skipped || 0,
+          errors: base?.errors || 0,
+          maxJobs: base?.maxJobs || sessionGlassdoor?.maxJobs || 25,
+          keywords: base?.keywords || sessionGlassdoor?.keywords || "",
+          location: base?.location || sessionGlassdoor?.location || "",
           phase: "apply",
-          currentJk: job.jobId || sessionGlassdoor?.currentJk || "",
-          currentTitle: job.title || sessionGlassdoor?.currentTitle || "",
-          currentCompany: job.company || sessionGlassdoor?.currentCompany || "",
-          searchUrl: sessionGlassdoor?.searchUrl || "",
+          currentJk: job.jobId || sessionGlassdoor?.currentJk || base?.currentJk || "",
+          currentTitle: job.title || sessionGlassdoor?.currentTitle || base?.currentTitle || "",
+          currentCompany: job.company || sessionGlassdoor?.currentCompany || base?.currentCompany || "",
+          searchUrl: base?.searchUrl || sessionGlassdoor?.searchUrl || "",
           fromGlassdoor: true,
-          startedAt: new Date().toISOString(),
+          startedAt: base?.startedAt || new Date().toISOString(),
         },
       });
       if (sessionGlassdoor?.active) {
@@ -339,14 +342,15 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
           sessionGlassdoor: {
             ...sessionGlassdoor,
             indeedHandoffDone: true,
-            awaitingIndeed: false,
+            // Keep awaitingIndeed true until Smart Apply tab closes / marks applied
+            awaitingIndeed: true,
           },
         });
       }
       watchingIndeedFromGlassdoor = null;
       setTimeout(() => {
         chrome.tabs.sendMessage(tabId, { action: "startAutoApply" }).catch(() => {});
-      }, 1500);
+      }, 1200);
     }
   } catch (_e) {
     /* ignore */
@@ -418,6 +422,8 @@ async function askMistral(systemPrompt, userPrompt, maxTokens = 300) {
   const apiKey = await getMistralApiKey();
   if (!apiKey) return null;
   try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
     const response = await fetch(MISTRAL_ENDPOINT, {
       method: "POST",
       headers: {
@@ -433,7 +439,9 @@ async function askMistral(systemPrompt, userPrompt, maxTokens = 300) {
         max_tokens: maxTokens,
         temperature: 0.4,
       }),
+      signal: controller.signal,
     });
+    clearTimeout(timer);
     if (!response.ok) return null;
     const data = await response.json();
     return data.choices?.[0]?.message?.content?.trim() || null;
@@ -556,9 +564,49 @@ async function endPlatformSession(platform, reason = "") {
 
   const stillActive = await isAnySessionActive();
   if (!stillActive) {
-    await finalizeMetaSession();
-    await appendLog("Toutes les sessions AmiJobs sont terminées", "success");
+    const startedNext = await startNextPendingPlatform();
+    if (!startedNext) {
+      await finalizeMetaSession();
+      await appendLog("Toutes les sessions AmiJobs sont terminées", "success");
+    }
   }
+}
+
+async function startNextPendingPlatform() {
+  const { amijobsMeta = null } = await chrome.storage.local.get(["amijobsMeta"]);
+  if (!amijobsMeta?.active) return false;
+  const pending = Array.isArray(amijobsMeta.pendingPlatforms) ? [...amijobsMeta.pendingPlatforms] : [];
+  if (!pending.length) return false;
+
+  const next = pending.shift();
+  const pendingUrls = amijobsMeta.pendingUrls || {};
+  const common = {
+    keywords: amijobsMeta.keywords || "",
+    location: amijobsMeta.location || "",
+    locations: amijobsMeta.locations || [amijobsMeta.location || ""],
+    locationIndex: 0,
+    contracts: amijobsMeta.contracts || [],
+    maxJobs: amijobsMeta.maxJobs || 25,
+  };
+  const searchUrl = pendingUrls[next] || buildPlatformSearchUrl(next, common.keywords, common.location, common.contracts);
+  const session = emptyPlatformSession(next, {
+    ...common,
+    searchUrl,
+    ...(next === "hellowork" ? { resumeSearchUrl: searchUrl } : {}),
+  });
+  const key = SESSION_KEYS[next];
+  await chrome.storage.local.set({
+    amijobsMeta: {
+      ...amijobsMeta,
+      pendingPlatforms: pending,
+      currentPlatform: next,
+    },
+    [key]: session,
+    enabled: true,
+  });
+  await appendLog(`Plateforme suivante: ${next}`, "success");
+  await navigatePlatformTab(next, searchUrl);
+  return true;
 }
 
 async function getState() {
@@ -716,9 +764,32 @@ async function startMultiSession(msg) {
   const location = locations[0] || "";
   const locationsOrEmpty = locations.length ? locations : [""];
 
+  // Serialize platforms to avoid Indeed + Glassdoor racing on Smart Apply tabs
+  const order = SUPPORTED_PLATFORMS.filter((p) => platforms.includes(p));
+  const first = order[0];
+  const pending = order.slice(1);
+  const urls = {};
+  const common = { keywords, location, locations: locationsOrEmpty, locationIndex: 0, contracts, maxJobs };
+
+  if (platforms.includes("hellowork")) {
+    urls.hellowork = msg.helloworkUrl || buildHelloworkSearchUrl(keywords, location, contracts);
+  }
+  if (platforms.includes("linkedin")) {
+    urls.linkedin = msg.linkedinUrl || buildLinkedInSearchUrl(keywords, location, contracts);
+  }
+  if (platforms.includes("indeed")) {
+    urls.indeed = msg.indeedUrl || buildIndeedSearchUrl(keywords, location);
+  }
+  if (platforms.includes("glassdoor")) {
+    urls.glassdoor = msg.glassdoorUrl || buildGlassdoorSearchUrl(keywords, location);
+  }
+
   const amijobsMeta = {
     active: true,
-    platforms,
+    platforms: order,
+    pendingPlatforms: pending,
+    pendingUrls: urls,
+    currentPlatform: first,
     keywords,
     location,
     locations: locationsOrEmpty,
@@ -727,57 +798,33 @@ async function startMultiSession(msg) {
     startedAt: new Date().toISOString(),
   };
 
-  const updates = { amijobsMeta, enabled: true };
-  const urls = {};
-  const common = { keywords, location, locations: locationsOrEmpty, locationIndex: 0, contracts, maxJobs };
+  const updates = {
+    amijobsMeta,
+    enabled: true,
+    sessionHellowork: null,
+    sessionLinkedin: null,
+    sessionIndeed: null,
+    sessionGlassdoor: null,
+  };
 
-  if (platforms.includes("hellowork")) {
-    const searchUrl = msg.helloworkUrl || buildHelloworkSearchUrl(keywords, location, contracts);
-    urls.hellowork = searchUrl;
-    updates.sessionHellowork = emptyPlatformSession("hellowork", {
-      ...common,
-      searchUrl,
-      resumeSearchUrl: searchUrl,
-    });
-  }
-
-  if (platforms.includes("linkedin")) {
-    const searchUrl = msg.linkedinUrl || buildLinkedInSearchUrl(keywords, location, contracts);
-    urls.linkedin = searchUrl;
-    updates.sessionLinkedin = emptyPlatformSession("linkedin", {
-      ...common,
-      searchUrl,
-    });
-  }
-
-  if (platforms.includes("indeed")) {
-    const searchUrl = msg.indeedUrl || buildIndeedSearchUrl(keywords, location);
-    urls.indeed = searchUrl;
-    updates.sessionIndeed = emptyPlatformSession("indeed", {
-      ...common,
-      searchUrl,
-    });
-  }
-
-  if (platforms.includes("glassdoor")) {
-    const searchUrl = msg.glassdoorUrl || buildGlassdoorSearchUrl(keywords, location);
-    urls.glassdoor = searchUrl;
-    updates.sessionGlassdoor = emptyPlatformSession("glassdoor", {
-      ...common,
-      searchUrl,
-    });
-  }
+  const firstUrl = urls[first];
+  updates[SESSION_KEYS[first]] = emptyPlatformSession(first, {
+    ...common,
+    searchUrl: firstUrl,
+    ...(first === "hellowork" ? { resumeSearchUrl: firstUrl } : {}),
+  });
 
   await chrome.storage.local.set(updates);
   await appendLog(
-    `Session AmiJobs démarrée (${platforms.join(" + ")}): "${keywords}" @ "${locationsOrEmpty.join(", ")}"` +
-      (contracts.length ? ` [${contracts.join(", ")}]` : ""),
+    `Session AmiJobs démarrée (${order.join(" → ")}): "${keywords}" @ "${locationsOrEmpty.join(", ")}"` +
+      (contracts.length ? ` [${contracts.join(", ")}]` : "") +
+      (pending.length ? ` (séquentiel)` : ""),
     "success"
   );
 
-  if (msg.openTabs) await openPlatformTabs(urls, platforms);
+  if (msg.openTabs) await openPlatformTabs({ [first]: firstUrl }, [first]);
 
-  return { ok: true, urls, platforms };
+  return { ok: true, urls, platforms: order, pending };
 }
 
 function handleMessage(msg, sendResponse, sender = null) {
@@ -1048,7 +1095,26 @@ function handleMessage(msg, sendResponse, sender = null) {
     (async () => {
       const tabId = sender?.tab?.id;
       const searchUrl = msg.searchUrl || "";
-      if (searchUrl) {
+      const { sessionGlassdoor, sessionIndeed } = await chrome.storage.local.get([
+        "sessionGlassdoor",
+        "sessionIndeed",
+      ]);
+      if (sessionGlassdoor?.active) {
+        await chrome.storage.local.set({
+          sessionGlassdoor: {
+            ...sessionGlassdoor,
+            awaitingIndeed: false,
+            indeedHandoffDone: false,
+          },
+        });
+      }
+      // Glassdoor-only apply sessions should not keep an Indeed SERP loop alive
+      if (sessionIndeed?.fromGlassdoor && sessionIndeed.active) {
+        await chrome.storage.local.set({
+          sessionIndeed: { ...sessionIndeed, active: false, phase: "done", lastRunAt: Date.now() },
+        });
+      }
+      if (searchUrl && !sessionIndeed?.fromGlassdoor) {
         const tabs = await chrome.tabs.query({});
         const indeedTab = tabs.find(
           (t) =>

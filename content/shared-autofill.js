@@ -99,6 +99,20 @@
     });
   }
 
+  async function withTimeout(promise, ms, fallback = null) {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(fallback), ms);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   async function fillField(field, jobInfo, platform) {
     const el = field.element;
     const label = field.label;
@@ -115,14 +129,18 @@
       const options = [...el.options].map((o) => o.text.trim()).filter(Boolean);
       let answer = direct;
       if (!answer) {
-        const res = await chrome.runtime.sendMessage({
-          action: "generateAnswer",
-          question: label,
-          fieldType: "select",
-          options,
-          jobInfo,
-        });
-        answer = res?.answer || options[1] || options[0] || "";
+        const res = await withTimeout(
+          chrome.runtime.sendMessage({
+            action: "generateAnswer",
+            question: label,
+            fieldType: "select",
+            options,
+            jobInfo,
+          }),
+          5000,
+          null
+        );
+        answer = res?.answer || options.find((o) => o && !/select|choisir|—|--/i.test(o)) || options[0] || "";
       }
       let idx = options.findIndex((o) => o.toLowerCase() === String(answer).toLowerCase());
       if (idx < 0) {
@@ -132,6 +150,7 @@
             String(answer).toLowerCase().includes(o.toLowerCase())
         );
       }
+      if (idx < 0) idx = options.findIndex((o) => o && !/select|choisir|—|--/i.test(o));
       if (idx >= 0) {
         el.selectedIndex = idx;
         el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -140,33 +159,50 @@
     }
 
     if (field.type === "radio") {
-      const res = await chrome.runtime.sendMessage({
-        action: "generateAnswer",
-        question: label,
-        fieldType: "radio",
-        options: field.options || [],
-        jobInfo,
-      });
-      const answer = (direct || res?.answer || "").toLowerCase();
       const radios = field.elements || [];
-      let target = radios.find((r, i) => (field.options[i] || "").toLowerCase().includes(answer));
-      if (!target) target = radios.find((r, i) => /yes|oui|true|accept/i.test(field.options[i] || ""));
+      // Prefer Oui/Yes without waiting on AI
+      let target =
+        radios.find((r, i) => /yes|oui|true|accept/i.test(field.options[i] || "")) || null;
+      if (!target) {
+        const res = await withTimeout(
+          chrome.runtime.sendMessage({
+            action: "generateAnswer",
+            question: label,
+            fieldType: "radio",
+            options: field.options || [],
+            jobInfo,
+          }),
+          4000,
+          null
+        );
+        const answer = (direct || res?.answer || "").toLowerCase();
+        target = radios.find((r, i) => (field.options[i] || "").toLowerCase().includes(answer));
+      }
+      if (!target) target = radios[0];
       if (target) await humanClick(target);
       return;
     }
 
     let answer = direct;
     if (!answer) {
-      const res = await chrome.runtime.sendMessage({
-        action: "generateAnswer",
-        question: label,
-        fieldType: field.type,
-        options: [],
-        jobInfo,
-      });
+      const res = await withTimeout(
+        chrome.runtime.sendMessage({
+          action: "generateAnswer",
+          question: label,
+          fieldType: field.type,
+          options: [],
+          jobInfo,
+        }),
+        5000,
+        null
+      );
       answer = res?.answer || "";
     }
-    if (!answer) return;
+    if (!answer) {
+      if (field.type === "number" || /année|year|expérience|experience/i.test(label)) answer = "3";
+      else if (/url|link|linkedin/i.test(label)) answer = "https://www.linkedin.com";
+      else answer = "Oui";
+    }
     if (field.type === "number") {
       const num = String(answer).match(/\d+/);
       answer = num ? num[0] : "1";

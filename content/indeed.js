@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.2.8";
+  const VERSION = "1.2.9";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -53,6 +53,18 @@
     return `${host}/jobs?${p.toString()}`;
   }
 
+  function isValidIndeedJobKey(jk) {
+    if (!jk || typeof jk !== "string") return false;
+    const key = jk.trim();
+    // Reject placeholders / too-short tokens from bad DOM matches
+    if (key.length < 10 || key.length > 64) return false;
+    if (/^123456789/i.test(key) || /abcdef0$/i.test(key)) return false;
+    if (/^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|deadbeef)/i.test(key)) return false;
+    if (/^(jk_)?test/i.test(key)) return false;
+    // Real Indeed job keys are alphanumeric (often 16-char hex)
+    return /^[a-z0-9_-]+$/i.test(key);
+  }
+
   function extractJobKey(el) {
     if (!el) return null;
     const direct =
@@ -60,16 +72,19 @@
       el.getAttribute("data-jobkey") ||
       el.closest("[data-jk]")?.getAttribute("data-jk") ||
       el.closest("[data-jobkey]")?.getAttribute("data-jobkey");
-    if (direct) return direct;
+    if (direct && isValidIndeedJobKey(direct)) return direct;
     const link =
       el.querySelector?.('a[href*="jk="], a[href*="viewjob"], a[data-jk]') ||
       (el.matches?.('a[href*="jk="]') ? el : null);
     const href = link?.getAttribute?.("href") || el.getAttribute?.("href") || "";
     const m = href.match(/[?&]jk=([^&]+)/) || href.match(/[?&]vjk=([^&]+)/);
-    if (m) return decodeURIComponent(m[1]);
+    if (m) {
+      const jk = decodeURIComponent(m[1]);
+      if (isValidIndeedJobKey(jk)) return jk;
+    }
     const id = el.getAttribute?.("id") || "";
     const idMatch = id.match(/job_([a-f0-9]+)/i);
-    if (idMatch) return idMatch[1];
+    if (idMatch && isValidIndeedJobKey(idMatch[1])) return idMatch[1];
     return null;
   }
 
@@ -274,12 +289,18 @@
         /postuler sur indeed/i,
         /indeed apply/i,
         /candidature simplifiée/i,
-        /postuler maintenant/i,
-        /^postuler$/i,
-        /apply now/i,
-        /continuer à postuler/i,
+        /apply with indeed/i,
         /continue applying/i,
+        /continuer à postuler/i,
       ]) || null
+    );
+  }
+
+  function isCompanySiteApplyButton(btn) {
+    if (!btn) return false;
+    const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.toLowerCase();
+    return /site (de l['’]entreprise|de l['’]employeur)|company (site|website)|sur le site|externe|external apply/i.test(
+      text
     );
   }
 
@@ -294,6 +315,8 @@
   }
 
   function detectApplySuccess() {
+    const path = window.location.pathname || "";
+    if (/\/post-apply/i.test(path) || /application-submitted/i.test(path)) return true;
     const body = document.body?.innerText?.toLowerCase() || "";
     return (
       body.includes("application submitted") ||
@@ -303,7 +326,8 @@
       body.includes("candidature a été envoyée") ||
       body.includes("we have received your application") ||
       body.includes("nous avons bien reçu") ||
-      !!S().$('[data-testid="apply-success"], .ia-BasePage-heading')
+      body.includes("votre candidature a bien été") ||
+      !!S().$('[data-testid="apply-success"], .ia-BasePage-heading, [data-testid="post-apply"]')
     );
   }
 
@@ -406,11 +430,12 @@
 
     const submitRe = [
       /submit (my )?application/i,
-      /soumettre (ma )?candidature/i,
-      /envoyer (ma )?candidature/i,
+      /soumettre (ma |votre )?candidature/i,
+      /envoyer (ma |votre )?candidature/i,
       /send application/i,
       /déposer ma candidature/i,
       /^soumettre$/i,
+      /finalize/i,
     ];
     const nextRe = [
       /^continue$/i,
@@ -426,13 +451,13 @@
 
     const buttons = S().$$("button, a[role='button'], input[type='submit']");
     for (const btn of buttons) {
-      if (!S().isVisible(btn) || btn.disabled) continue;
+      if (!S().isVisible(btn) || btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
       const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
       if (!text || /signaler|fermer|close|exit|options de cv/i.test(text)) continue;
       if (submitRe.some((p) => p.test(text))) return { el: btn, kind: "submit" };
     }
     for (const btn of buttons) {
-      if (!S().isVisible(btn) || btn.disabled) continue;
+      if (!S().isVisible(btn) || btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
       const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
       if (!text || /signaler|fermer|close|exit|options de cv|passer au contenu/i.test(text)) continue;
       if (nextRe.some((p) => p.test(text))) return { el: btn, kind: "next" };
@@ -440,16 +465,101 @@
     return null;
   }
 
+  async function fillQuestionsStep() {
+    // Radios: prefer Oui / Yes / first option
+    const radioNames = new Set();
+    for (const radio of S().$$('input[type="radio"]')) {
+      if (!S().isVisible(radio) || !radio.name || radioNames.has(radio.name)) continue;
+      radioNames.add(radio.name);
+      const group = S().$$(`input[type="radio"][name="${CSS.escape(radio.name)}"]`).filter((r) =>
+        S().isVisible(r)
+      );
+      if (!group.length || group.some((r) => r.checked)) continue;
+      const preferred =
+        group.find((r) => /oui|yes|true|available|disponible/i.test(r.value || r.id || "")) ||
+        group.find((r) => {
+          const lab = document.querySelector(`label[for="${r.id}"]`);
+          return /oui|yes|disponible/i.test(lab?.textContent || "");
+        }) ||
+        group[0];
+      try {
+        preferred.click();
+      } catch (_e) {
+        preferred.checked = true;
+        preferred.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      await S().sleep(120);
+    }
+
+    // Checkboxes: tick required-looking ones (consent / attestations)
+    for (const box of S().$$('input[type="checkbox"]')) {
+      if (!S().isVisible(box) || box.checked) continue;
+      const lab =
+        (box.id && document.querySelector(`label[for="${box.id}"]`)?.textContent) ||
+        box.closest("label")?.textContent ||
+        box.getAttribute("aria-label") ||
+        "";
+      if (/obligatoire|required|\*/i.test(lab) || /certif|attest|accept|consent|j['’]ai lu/i.test(lab)) {
+        try {
+          box.click();
+        } catch (_e) {
+          box.checked = true;
+          box.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        await S().sleep(100);
+      }
+    }
+
+    // Selects: pick first non-empty option if none selected
+    for (const sel of S().$$("select")) {
+      if (!S().isVisible(sel) || sel.value) continue;
+      const opt = [...sel.options].find((o) => o.value && !/select|choisir|—|--/i.test(o.textContent || ""));
+      if (opt) {
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event("input", { bubbles: true }));
+        sel.dispatchEvent(new Event("change", { bubbles: true }));
+        await S().sleep(100);
+      }
+    }
+
+    // Text / number / textarea
+    for (const el of S().$$("textarea, input[type='text'], input[type='number'], input:not([type])")) {
+      if (!S().isVisible(el)) continue;
+      if (el.value && String(el.value).trim()) continue;
+      const label = (
+        (el.id && document.querySelector(`label[for="${el.id}"]`)?.textContent) ||
+        el.getAttribute("aria-label") ||
+        el.id ||
+        ""
+      ).toLowerCase();
+      if (/url|link|http|linkedin|portfolio|github/i.test(label)) {
+        await S().humanType(el, "https://www.linkedin.com");
+      } else if (/année|year|experience|expérience|ans/i.test(label) || el.type === "number") {
+        await S().humanType(el, "3");
+      } else if (/salaire|salary|prétention|compensation/i.test(label)) {
+        await S().humanType(el, "45000");
+      } else {
+        await S().humanType(el, "Oui, je suis disponible et motivé pour ce poste.");
+      }
+      await S().sleep(120);
+    }
+  }
+
   async function runApplyWizard(jobInfo, settings) {
+    if (!isSmartApplyPage()) {
+      S().log(PLATFORM, "Wizard ignoré (pas une page Smart Apply)", "warn");
+      return { success: false, reason: "not_smartapply" };
+    }
     S().log(PLATFORM, `Assistant Smart Apply — ${smartApplyPath()}`);
-    for (let step = 0; step < 28; step++) {
+    for (let step = 0; step < 36; step++) {
       if (shouldStop) return { success: false, reason: "stopped" };
       if (detectApplySuccess()) return { success: true };
 
       const path = smartApplyPath();
-      // Wait for loading indicator on review
-      if (S().$('[data-testid="loading-indicator"]')) {
-        await S().sleep(1500);
+      // Wait for review preview loader (live test: "Préparation de l'aperçu")
+      const loader = S().$('[data-testid="loading-indicator"]');
+      if (loader && S().isVisible(loader)) {
+        await S().sleep(1800);
         continue;
       }
 
@@ -462,11 +572,26 @@
       if (/relevant-experience/i.test(path)) {
         await fillRelevantExperienceStep();
       }
-
-      await S().fillVisibleFields(jobInfo, PLATFORM);
+      if (/questions/i.test(path)) {
+        await fillQuestionsStep();
+        // Prefer heuristics on employer questions — avoid slow/hanging AI per field
+      } else {
+        await S().fillVisibleFields(jobInfo, PLATFORM);
+      }
 
       const action = findVisibleContinueOrSubmit();
       if (!action) {
+        // On review page, keep waiting for submit CTA after loader
+        if (/review/i.test(path)) {
+          await S().sleep(1200);
+          continue;
+        }
+        // Questions: Continuer may stay disabled until fields settle
+        if (/questions/i.test(path)) {
+          await fillQuestionsStep();
+          await S().sleep(900);
+          continue;
+        }
         await S().sleep(900);
         if (detectApplySuccess()) return { success: true };
         continue;
@@ -476,13 +601,22 @@
         if (settings.autoSubmit !== false) {
           await S().humanClick(action.el);
           await S().sleep(2800);
-          for (let i = 0; i < 8; i++) {
+          for (let i = 0; i < 10; i++) {
             if (detectApplySuccess()) return { success: true };
             await S().sleep(700);
           }
+          // post-apply navigation is success even without banner text
+          if (/post-apply/i.test(smartApplyPath())) return { success: true };
           return { success: true, reason: "submitted" };
         }
         return { success: false, reason: "review" };
+      }
+
+      // Disabled Continuer → refill and retry
+      if (action.el.disabled || action.el.getAttribute("aria-disabled") === "true") {
+        if (/questions/i.test(path)) await fillQuestionsStep();
+        await S().sleep(800);
+        continue;
       }
 
       await S().humanClick(action.el);
@@ -502,6 +636,9 @@
 
     const btn = await waitForApplyButton();
     if (!btn) return { success: false, reason: "no_indeed_apply" };
+    if (isCompanySiteApplyButton(btn)) {
+      return { success: false, reason: "company_site_apply" };
+    }
 
     const popupPromise = new Promise((resolve) => {
       const onMsg = (msg) => {
@@ -514,7 +651,7 @@
       setTimeout(() => {
         chrome.runtime.onMessage.removeListener(onMsg);
         resolve(false);
-      }, 8000);
+      }, 12000);
     });
 
     await S().humanClick(btn);
@@ -524,18 +661,25 @@
       return runApplyWizard(info, settings);
     }
 
+    // Left Indeed entirely (external ATS) — skip
+    if (!/indeed\.(com|fr)|smartapply/i.test(window.location.hostname)) {
+      return { success: false, reason: "external_ats" };
+    }
+
     const opened = await popupPromise;
     if (opened) {
-      // Smart Apply opened in another tab — that tab's content script finishes the apply
       return { success: true, reason: "smartapply_tab" };
     }
 
-    for (let i = 0; i < 16; i++) {
+    // Poll briefly for same-tab Smart Apply navigation
+    for (let i = 0; i < 10; i++) {
       if (isSmartApplyPage()) return runApplyWizard(info, settings);
       if (detectApplySuccess()) return { success: true };
       await S().sleep(500);
     }
-    return runApplyWizard(info, settings);
+
+    // Never run a long empty wizard on the viewjob page
+    return { success: false, reason: "no_smartapply_opened" };
   }
 
   async function handleSearchPage(session, settings) {
@@ -699,16 +843,40 @@
     const result = await applyCurrentJob(settings, jobInfo);
 
     if (result.reason === "smartapply_tab") {
-      // Another tab owns the wizard; keep phase apply until that tab reports back or times out
+      // Another tab owns the wizard; wait for completion instead of abandoning early
       S().log(PLATFORM, "Smart Apply ouvert dans un onglet — attente");
-      await S().sleep(12000);
-      const fresh = await getSession();
-      if (fresh?.phase === "apply") {
-        await setSession({ phase: "search" });
-        window.location.href =
-          session.searchUrl ||
-          buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      const appliedBefore = (await getSession())?.applied || 0;
+      for (let i = 0; i < 55; i++) {
+        if (shouldStop) break;
+        await S().sleep(1000);
+        const fresh = await getSession();
+        if (!fresh?.active) return;
+        if ((fresh.applied || 0) > appliedBefore) break;
+        if (fresh.phase === "search") break;
       }
+      await setSession({ phase: "search" });
+      window.location.href =
+        session.searchUrl ||
+        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      return;
+    }
+
+    if (
+      result.reason === "company_site_apply" ||
+      result.reason === "external_ats" ||
+      result.reason === "no_smartapply_opened"
+    ) {
+      await chrome.runtime.sendMessage({
+        action: "markSkipped",
+        platform: PLATFORM,
+        jobId: jobInfo.jobId,
+        title: jobInfo.title,
+        reason: "Pas de Smart Apply Indeed",
+      });
+      await setSession({ phase: "search" });
+      window.location.href =
+        session.searchUrl ||
+        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
       return;
     }
 

@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.2.8";
+  const VERSION = "1.2.9";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -259,6 +259,7 @@
           currentTitle: info.title,
           currentCompany: info.company,
           awaitingIndeed: true,
+          indeedHandoffDone: false,
           lastRunAt: Date.now(),
         },
       });
@@ -270,7 +271,7 @@
     });
 
     await S().humanClick(btn);
-    await S().sleep(S().randomDelay(2000, 3500));
+    await S().sleep(S().randomDelay(1500, 2500));
 
     // Same-tab redirect to Indeed / partner listing
     if (detectIndeedHandoff()) {
@@ -278,25 +279,38 @@
       return { success: true, reason: "indeed_handoff" };
     }
 
-    // Wait for popup/new tab handoff signal from background
-    for (let i = 0; i < 12; i++) {
+    // Wait for popup/new tab handoff signal from background (live test: opens smartapply tab)
+    for (let i = 0; i < 20; i++) {
       if (detectApplySuccess()) return { success: true };
+      if (detectIndeedHandoff()) return { success: true, reason: "indeed_handoff" };
       const { sessionGlassdoor: s } = await chrome.storage.local.get(["sessionGlassdoor"]);
       if (s?.indeedHandoffDone) {
         await chrome.storage.local.set({
-          sessionGlassdoor: { ...s, indeedHandoffDone: false, awaitingIndeed: false },
+          sessionGlassdoor: { ...s, indeedHandoffDone: false, awaitingIndeed: true },
         });
+        S().log(PLATFORM, "Onglet Indeed Smart Apply ouvert", "success");
         return { success: true, reason: "indeed_tab" };
       }
-      // Modal wizard still on Glassdoor
-      const next = S().findActionButton([/continue|continuer|next|suivant|submit|soumettre|envoyer/i]);
-      if (next) {
+      // Only run on-page Glassdoor wizard if a real modal appeared
+      const modalNext = S().findActionButton([
+        /continue|continuer|next|suivant|submit|soumettre|envoyer/i,
+      ]);
+      const dialog = S().$('[role="dialog"], .modal, [class*="Modal"]');
+      if (modalNext && dialog && S().isVisible(dialog)) {
         return runApplyWizard(info, settings);
       }
-      await S().sleep(700);
+      await S().sleep(600);
     }
 
-    return runApplyWizard(info, settings);
+    // Easy Apply on Glassdoor almost always opens Indeed — do NOT fall into empty wizard_timeout
+    S().log(PLATFORM, "Handoff Indeed assumé (pas de wizard Glassdoor)", "warn");
+    const { sessionGlassdoor: sAssumed } = await chrome.storage.local.get(["sessionGlassdoor"]);
+    if (sAssumed?.active) {
+      await chrome.storage.local.set({
+        sessionGlassdoor: { ...sAssumed, awaitingIndeed: true },
+      });
+    }
+    return { success: true, reason: "indeed_handoff_assumed" };
   }
 
   function alreadyApplied(appliedJobs, jobId) {
@@ -419,8 +433,17 @@
 
         const result = await applyCurrentJob(settings, jobInfo);
         if (result.success) {
-          // For Indeed handoff, Indeed script marks applied; still count if local wizard
-          if (!String(result.reason || "").includes("indeed")) {
+          const isIndeedHandoff = /indeed/i.test(String(result.reason || ""));
+          if (isIndeedHandoff) {
+            S().log(PLATFORM, `Handoff Indeed: ${jobInfo.title} — attente Smart Apply`, "success");
+            // Wait until background clears awaitingIndeed (Smart Apply closed) or timeout
+            for (let w = 0; w < 75; w++) {
+              if (shouldStop) break;
+              const { sessionGlassdoor: sWait } = await chrome.storage.local.get(["sessionGlassdoor"]);
+              if (!sWait?.awaitingIndeed) break;
+              await S().sleep(1000);
+            }
+            // Mark applied after handoff wait (Indeed may also mark — duplicate keys are ok with same job)
             await chrome.runtime.sendMessage({
               action: "markApplied",
               platform: PLATFORM,
@@ -429,9 +452,14 @@
               company: jobInfo.company,
               url: jobInfo.url,
             });
+            // Ensure flag cleared for next card
+            const { sessionGlassdoor: sClear } = await chrome.storage.local.get(["sessionGlassdoor"]);
+            if (sClear?.awaitingIndeed) {
+              await chrome.storage.local.set({
+                sessionGlassdoor: { ...sClear, awaitingIndeed: false, indeedHandoffDone: false },
+              });
+            }
           } else {
-            // Mark skipped-pending? Better: mark applied with note after delay, or leave to Indeed
-            S().log(PLATFORM, `Handoff Indeed: ${jobInfo.title}`, "success");
             await chrome.runtime.sendMessage({
               action: "markApplied",
               platform: PLATFORM,
