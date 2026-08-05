@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.2.9";
+  const VERSION = "1.3.0";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -910,30 +910,70 @@
   }
 
   async function handleApplyPage(session, settings) {
+    const { glassdoorSmartApply = null, sessionGlassdoor = null } = await chrome.storage.local.get([
+      "glassdoorSmartApply",
+      "sessionGlassdoor",
+    ]);
+    const fromGlassdoor =
+      !!(session?.fromGlassdoor) ||
+      !!(glassdoorSmartApply && Date.now() - (glassdoorSmartApply.at || 0) < 180000);
+
     const jobInfo = getJobInfoFromPage(session.currentJk);
-    if (!jobInfo.title) jobInfo.title = session.currentTitle || "";
-    if (!jobInfo.company) jobInfo.company = session.currentCompany || "";
+    if (fromGlassdoor && glassdoorSmartApply) {
+      if (!jobInfo.title) jobInfo.title = glassdoorSmartApply.title || session.currentTitle || "";
+      if (!jobInfo.company) jobInfo.company = glassdoorSmartApply.company || session.currentCompany || "";
+      if (!jobInfo.jobId) jobInfo.jobId = glassdoorSmartApply.jobId || session.currentJk || jkFromUrl();
+    } else {
+      if (!jobInfo.title) jobInfo.title = session.currentTitle || "";
+      if (!jobInfo.company) jobInfo.company = session.currentCompany || "";
+    }
 
     const result = await runApplyWizard(jobInfo, settings);
 
     if (result.success) {
       await chrome.runtime.sendMessage({
         action: "markApplied",
-        platform: PLATFORM,
+        platform: fromGlassdoor ? "glassdoor" : PLATFORM,
         jobId: jobInfo.jobId || session.currentJk,
         title: jobInfo.title,
         company: jobInfo.company,
         url: jobInfo.url,
       });
-      S().log(PLATFORM, `Postulé: ${jobInfo.title || jobInfo.jobId}`, "success");
+      S().log(
+        PLATFORM,
+        `Postulé${fromGlassdoor ? " (via Glassdoor)" : ""}: ${jobInfo.title || jobInfo.jobId}`,
+        "success"
+      );
     } else {
       await chrome.runtime.sendMessage({
         action: "markError",
-        platform: PLATFORM,
+        platform: fromGlassdoor ? "glassdoor" : PLATFORM,
         jobId: jobInfo.jobId || session.currentJk,
         title: jobInfo.title,
         error: result.reason || "error",
       });
+    }
+
+    if (fromGlassdoor) {
+      if (sessionGlassdoor?.active) {
+        await chrome.storage.local.set({
+          sessionGlassdoor: {
+            ...sessionGlassdoor,
+            awaitingIndeed: false,
+            indeedHandoffDone: false,
+          },
+          glassdoorSmartApply: null,
+        });
+      } else {
+        await chrome.storage.local.set({ glassdoorSmartApply: null });
+      }
+      // Close Smart Apply tab without hijacking Indeed's SERP session
+      await chrome.runtime.sendMessage({
+        action: "closeTabAndResumeIndeed",
+        searchUrl: "",
+        fromGlassdoor: true,
+      });
+      return;
     }
 
     await setSession({ phase: "search" });

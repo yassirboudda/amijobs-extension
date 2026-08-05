@@ -197,10 +197,9 @@ $("startBtn").addEventListener("click", async () => {
   }
 
   let first = true;
-  // Platforms run sequentially — only open the first active one
-  const openList = result.platforms?.length ? [result.platforms[0]] : PLATFORM_OPEN_ORDER.filter((p) => platforms.includes(p));
-  for (const p of openList) {
-    if (!result.urls?.[p]) continue;
+  // Open every selected platform at once so they apply simultaneously
+  for (const p of PLATFORM_OPEN_ORDER) {
+    if (!platforms.includes(p) || !result.urls?.[p]) continue;
     await chrome.tabs.create({ url: result.urls[p], active: first });
     first = false;
   }

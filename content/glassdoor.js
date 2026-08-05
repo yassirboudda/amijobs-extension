@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.2.9";
+  const VERSION = "1.3.0";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
