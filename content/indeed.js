@@ -58,11 +58,36 @@
     const key = jk.trim();
     // Reject placeholders / too-short tokens from bad DOM matches
     if (key.length < 10 || key.length > 64) return false;
-    if (/^123456789/i.test(key) || /abcdef0$/i.test(key)) return false;
-    if (/^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|deadbeef)/i.test(key)) return false;
     if (/^(jk_)?test/i.test(key)) return false;
-    // Real Indeed job keys are alphanumeric (often 16-char hex)
-    return /^[a-z0-9_-]+$/i.test(key);
+    if (!/^[a-z0-9_-]+$/i.test(key)) return false;
+
+    const lower = key.toLowerCase();
+    // Known demo / sequential placeholders seen in live mass-apply
+    if (
+      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|deadbeef|123456789abcdef0|0f1e2d3c4b5a6978)$/i.test(
+        lower
+      )
+    ) {
+      return false;
+    }
+    if (/^123456789/i.test(lower) || /abcdef0$/i.test(lower)) return false;
+    if (/^(a1b2c3d4|0f1e2d3c)/i.test(lower)) return false;
+
+    // Reject 16-char hex keys that are arithmetic sequences (0f,1e,2d… or 01,02,03…)
+    if (/^[0-9a-f]{16}$/i.test(lower)) {
+      const pairs = lower.match(/.{2}/g) || [];
+      if (pairs.length === 8) {
+        const vals = pairs.map((p) => parseInt(p, 16));
+        let asc = 0;
+        let desc = 0;
+        for (let i = 1; i < vals.length; i++) {
+          if (vals[i] === vals[i - 1] + 1) asc++;
+          if (vals[i] === vals[i - 1] - 1) desc++;
+        }
+        if (asc >= 5 || desc >= 5) return false;
+      }
+    }
+    return true;
   }
 
   function extractJobKey(el) {
@@ -142,6 +167,22 @@
     );
   }
 
+  function detectMissingJobPage() {
+    const text = (document.body?.innerText || "").toLowerCase();
+    const title = (document.title || "").toLowerCase();
+    const h1 = (S().$("h1")?.textContent || "").toLowerCase();
+    return (
+      text.includes("page introuvable") ||
+      text.includes("we can’t find this page") ||
+      text.includes("we can't find this page") ||
+      text.includes("this job has expired") ||
+      text.includes("cette offre a expiré") ||
+      text.includes("offre n'est plus disponible") ||
+      title.includes("page introuvable") ||
+      /page introuvable|not found|404/.test(h1)
+    );
+  }
+
   function collectJobCards() {
     const selectors = [
       "#mosaic-provider-jobcards li",
@@ -175,10 +216,13 @@
     for (const el of nodes) {
       const jk = extractJobKey(el);
       if (!jk || seen.has(jk)) continue;
-      seen.add(jk);
       const title =
         el.querySelector("h2.jobTitle span, h2.jobTitle a, .jobTitle, [data-testid='job-title'], a.jcs-JobTitle")
           ?.textContent?.trim() || "";
+      // Ghost / ad shells often expose fake jk without a real title
+      if (!title || title.length < 3) continue;
+      if (/page introuvable|not found|job expired/i.test(title)) continue;
+      seen.add(jk);
       const company =
         el.querySelector("[data-testid='company-name'], .companyName, .company, span.companyName")
           ?.textContent?.trim() || "";
@@ -466,6 +510,8 @@
   }
 
   async function fillQuestionsStep() {
+    const profile = await S().getProfile();
+
     // Radios: prefer Oui / Yes / first option
     const radioNames = new Set();
     for (const radio of S().$$('input[type="radio"]')) {
@@ -522,24 +568,39 @@
       }
     }
 
-    // Text / number / textarea
-    for (const el of S().$$("textarea, input[type='text'], input[type='number'], input:not([type])")) {
+    // Text / number / date / textarea
+    for (const el of S().$$(
+      "textarea, input[type='text'], input[type='number'], input[type='date'], input[type='tel'], input:not([type])"
+    )) {
       if (!S().isVisible(el)) continue;
       if (el.value && String(el.value).trim()) continue;
       const label = (
         (el.id && document.querySelector(`label[for="${el.id}"]`)?.textContent) ||
         el.getAttribute("aria-label") ||
+        el.getAttribute("placeholder") ||
         el.id ||
         ""
       ).toLowerCase();
-      if (/url|link|http|linkedin|portfolio|github/i.test(label)) {
+      const hint = `${label} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase();
+
+      if (S().isDateFieldHint?.(hint, el) || el.type === "date" || /date|naissance|birth|dob|jj\/mm|dd\/mm|xx\/xx|disponib|démarrage|début|debut/i.test(hint)) {
+        const dateVal = S().formatDateAnswer?.(profile, el, hint) || "01/09/2026";
+        if (el.type === "date") {
+          S().setNativeValue(el, dateVal);
+        } else {
+          await S().humanType(el, dateVal);
+        }
+      } else if (/url|link|http|linkedin|portfolio|github/i.test(label)) {
         await S().humanType(el, "https://www.linkedin.com");
       } else if (/année|year|experience|expérience|ans/i.test(label) || el.type === "number") {
         await S().humanType(el, "3");
       } else if (/salaire|salary|prétention|compensation/i.test(label)) {
         await S().humanType(el, "45000");
+      } else if (/phone|téléphone|tel/i.test(label)) {
+        await S().humanType(el, profile.phone || "0612345678");
       } else {
-        await S().humanType(el, "Oui, je suis disponible et motivé pour ce poste.");
+        // Short answer — never dump a long sentence into structured fields
+        await S().humanType(el, "Oui");
       }
       await S().sleep(120);
     }
@@ -722,14 +783,26 @@
         return;
       }
 
-      queue = cards.map((c) => ({
-        jobId: c.jobId,
-        title: c.title,
-        company: c.company,
-      }));
+      queue = cards
+        .filter((c) => isValidIndeedJobKey(c.jobId) && c.title && c.title.length >= 3)
+        .map((c) => ({
+          jobId: c.jobId,
+          title: c.title,
+          company: c.company,
+        }));
       qIndex = 0;
       await setSession({ queue, qIndex: 0, noApplyPages: 0 });
       S().log(PLATFORM, `${queue.length} offres trouvées`);
+    }
+
+    // Drop any stale placeholder keys left in a previous queue
+    if (queue.length) {
+      const cleaned = queue.filter((q) => isValidIndeedJobKey(q.jobId));
+      if (cleaned.length !== queue.length) {
+        queue = cleaned;
+        qIndex = Math.min(qIndex, queue.length);
+        await setSession({ queue, qIndex });
+      }
     }
 
     while (qIndex < queue.length) {
@@ -789,6 +862,22 @@
   async function handleViewJobPage(session, settings) {
     const jobId = session.currentJk || jkFromUrl();
     await S().sleep(2200);
+
+    if (detectMissingJobPage() || !isValidIndeedJobKey(jobId)) {
+      await chrome.runtime.sendMessage({
+        action: "markSkipped",
+        platform: PLATFORM,
+        jobId: jobId || "invalid",
+        title: session.currentTitle || "Offre invalide",
+        reason: "Offre introuvable / clé invalide",
+      });
+      await setSession({ phase: "search" });
+      window.location.href =
+        session.searchUrl ||
+        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      return;
+    }
+
     const jobInfo = getJobInfoFromPage(jobId);
     if (!jobInfo.title) {
       jobInfo.title =

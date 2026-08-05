@@ -82,11 +82,54 @@
     if (/linkedin/.test(l)) return profile.linkedin || "";
     if (/title|titre|poste/.test(l)) return profile.title || "";
     if (/salary|salaire/.test(l)) return profile.salaryExpectation || "";
-    if (/availability|disponibilit/.test(l)) return profile.availability || "";
+    if (/naissance|birth\s*date|\bdob\b/.test(l)) {
+      return normalizeBirthDateFr(profile.birthDate || "") || "";
+    }
+    if (/availability|disponibilit/.test(l) && !/date/.test(l)) return profile.availability || "";
     if (/cover|motivation|lettre|message|why|pourquoi/.test(l)) {
       return profile.coverLetterDefault || "";
     }
     return "";
+  }
+
+  function normalizeBirthDateFr(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+    const fr = raw.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+    if (fr) return `${fr[1].padStart(2, "0")}/${fr[2].padStart(2, "0")}/${fr[3]}`;
+    return raw;
+  }
+
+  function isDateFieldHint(hint, el) {
+    if (el?.type === "date") return true;
+    const h = String(hint || "").toLowerCase();
+    return /date|naissance|birth|\bdob\b|disponib|démarrage|debut|début|start\s*date|jj\s*[\/.-]\s*mm|dd\s*[\/.-]\s*mm|mm\s*[\/.-]\s*dd|xx\s*[\/.-]\s*xx\s*[\/.-]\s*xxxx|aaaa|yyyy/.test(
+      h
+    );
+  }
+
+  function formatDateAnswer(profile, el, hint) {
+    const h = String(hint || "").toLowerCase();
+    const wantsIso = el?.type === "date" || /yyyy-mm-dd|aaaa-mm-jj/i.test(h);
+    let fr = "";
+    if (/naissance|birth|\bdob\b/.test(h)) {
+      fr = normalizeBirthDateFr(profile?.birthDate || "") || "01/01/2000";
+    } else {
+      // Availability / start date ~ 14 days ahead (French DD/MM/YYYY)
+      const d = new Date();
+      d.setDate(d.getDate() + 14);
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const yyyy = String(d.getFullYear());
+      fr = `${dd}/${mm}/${yyyy}`;
+    }
+    if (wantsIso) {
+      const m = fr.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+      if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+    }
+    return fr;
   }
 
   async function isCompanyBlacklisted(companyName) {
@@ -118,10 +161,19 @@
     const label = field.label;
     const profile = await getProfile();
     const direct = await profileAnswer(label, profile);
+    const hint = `${label || ""} ${el?.placeholder || ""} ${el?.getAttribute?.("aria-label") || ""}`;
 
     if (field.type === "checkbox") {
       const mandatory = /accept|terms|agree|consent|certif|confirm/i.test(label);
       if ((mandatory || /yes|oui|true/i.test(direct)) && !el.checked) await humanClick(el);
+      return;
+    }
+
+    // Date fields MUST be DD/MM/YYYY (or ISO for input[type=date]) — never a sentence
+    if (field.type === "date" || isDateFieldHint(hint, el)) {
+      const dateVal = formatDateAnswer(profile, el, hint);
+      if (el.type === "date") setNativeValue(el, dateVal);
+      else await humanType(el, dateVal);
       return;
     }
 
@@ -185,23 +237,32 @@
 
     let answer = direct;
     if (!answer) {
-      const res = await withTimeout(
-        chrome.runtime.sendMessage({
-          action: "generateAnswer",
-          question: label,
-          fieldType: field.type,
-          options: [],
-          jobInfo,
-        }),
-        5000,
-        null
-      );
-      answer = res?.answer || "";
-    }
-    if (!answer) {
+      // Avoid AI inventing prose for short structured fields
       if (field.type === "number" || /année|year|expérience|experience/i.test(label)) answer = "3";
       else if (/url|link|linkedin/i.test(label)) answer = "https://www.linkedin.com";
-      else answer = "Oui";
+      else if (/phone|téléphone|tel/i.test(label)) answer = profile.phone || "0612345678";
+      else {
+        const res = await withTimeout(
+          chrome.runtime.sendMessage({
+            action: "generateAnswer",
+            question: label,
+            fieldType: field.type,
+            options: [],
+            jobInfo,
+          }),
+          5000,
+          null
+        );
+        answer = res?.answer || "Oui";
+        // If AI returned a long sentence but the field looks like a short input, keep it short
+        if (el.tagName === "INPUT" && String(answer).length > 40 && !/cover|motivation|message|pourquoi/i.test(label)) {
+          answer = "Oui";
+        }
+        // If AI returned prose for something that looks like a date, force date format
+        if (isDateFieldHint(hint, el) || /^\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}$/.test(el.placeholder || "")) {
+          answer = formatDateAnswer(profile, el, hint);
+        }
+      }
     }
     if (field.type === "number") {
       const num = String(answer).match(/\d+/);
@@ -322,6 +383,9 @@
     collectFields,
     findActionButton,
     findActionButtonDeep,
+    isDateFieldHint,
+    formatDateAnswer,
+    normalizeBirthDateFr,
     log(platform, msg, level = "info") {
       const ts = new Date().toISOString().slice(11, 23);
       console.log(`[AmiJobs ${platform} ${ts}] ${msg}`);
