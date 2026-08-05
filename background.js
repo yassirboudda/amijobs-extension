@@ -278,6 +278,40 @@ let lastSmartApplyKick = 0;
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   const url = changeInfo.url || tab?.url || "";
   if (!url || (changeInfo.status === "loading" && !changeInfo.url)) return;
+
+  // Proactively inject Turnstile clicker on Indeed/Glassdoor when a session is active
+  if (
+    changeInfo.status === "complete" &&
+    /(indeed\.com|indeed\.fr|glassdoor\.(com|fr)|challenges\.cloudflare\.com)/i.test(url)
+  ) {
+    try {
+      const { sessionIndeed, sessionGlassdoor } = await chrome.storage.local.get([
+        "sessionIndeed",
+        "sessionGlassdoor",
+      ]);
+      if (sessionIndeed?.active || sessionGlassdoor?.active) {
+        chrome.scripting
+          .executeScript({
+            target: { tabId, allFrames: true },
+            files: ["content/cloudflare-turnstile.js"],
+          })
+          .catch(() => {});
+        chrome.scripting
+          .executeScript({
+            target: { tabId, allFrames: true },
+            func: () => {
+              try {
+                if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+              } catch (_e) {}
+            },
+          })
+          .catch(() => {});
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+
   if (!/smartapply\.indeed\.com/i.test(url) && !/indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(url)) {
     return;
   }
@@ -510,6 +544,33 @@ async function askMistral(systemPrompt, userPrompt, maxTokens = 300) {
 }
 
 async function generateAnswer(question, fieldType, options, jobInfo, profile, cvText) {
+  const q = String(question || "");
+  const cv = String(cvText || "");
+  const loc = String(profile.location || profile.country || "France").toLowerCase();
+
+  // Structured fallbacks BEFORE calling Mistral — avoid off-topic "Oui"
+  if (/rythme|alternance.*(école|ecole|entreprise)|jours?\s*(école|ecole|entreprise)|school\s*\/\s*company/i.test(q)) {
+    const fromCv =
+      cv.match(/(\d\s*j(?:ours?)?\s*(?:école|ecole|en\s*centre)[^\n,]{0,40}\d\s*j(?:ours?)?\s*(?:entreprise|en\s*entreprise))/i) ||
+      cv.match(/(\d\s*\/\s*\d[^\n]{0,30}(alternance|école|ecole|entreprise))/i);
+    if (fromCv) return fromCv[1].trim();
+    if (/france|paris|lyon|marseille|île-de-france|ile-de-france|bordeaux|lille|toulouse/i.test(loc + " " + cv)) {
+      return "2 jours école / 3 jours entreprise";
+    }
+    return "2 jours école / 3 jours entreprise";
+  }
+  if (/date|xx\s*\/\s*xx|jj\s*\/\s*mm|naissance|disponibilit/i.test(q) && fieldType !== "textarea") {
+    if (/naissance|birth|dob/i.test(q) && profile.birthDate) {
+      const raw = String(profile.birthDate);
+      const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+      return raw;
+    }
+    const d = new Date();
+    d.setDate(d.getDate() + 14);
+    return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
+  }
+
   const contextParts = [];
   if (profile.fullName) contextParts.push(`Nom: ${profile.fullName}`);
   if (profile.email) contextParts.push(`Email: ${profile.email}`);
@@ -520,14 +581,26 @@ async function generateAnswer(question, fieldType, options, jobInfo, profile, cv
   if (profile.stack) contextParts.push(`Compétences: ${profile.stack}`);
   if (profile.languages) contextParts.push(`Langues: ${profile.languages}`);
   const profileContext = contextParts.join("\n");
-  const cvContext = cvText ? `\n\nCV:\n${String(cvText).substring(0, 2000)}` : "";
+  const cvContext = cv ? `\n\nCV:\n${cv.substring(0, 3500)}` : "";
   const systemPrompt = `Tu aides à remplir un formulaire de candidature pour ${profile.fullName || "le candidat"}.
 ${profileContext}${cvContext}
 Poste: ${jobInfo?.title || "?"} @ ${jobInfo?.company || "?"}
-Réponds UNIQUEMENT avec la valeur du champ, sans explication.`;
+
+RÈGLES STRICTES:
+- Réponds UNIQUEMENT avec la valeur du champ, sans explication.
+- Base-toi d'abord sur le CV et le profil. Ne invente pas de faits absents du CV.
+- Si l'info n'est pas dans le CV, utilise une réponse plausible et courte adaptée au contexte (région, type de contrat).
+- Ne réponds JAMAIS juste "Oui" si la question demande un détail (rythme, date, montant, durée, niveau).
+- Dates au format JJ/MM/AAAA sauf si le champ exige ISO.`;
   let userPrompt = `Question: "${question}"\nType: ${fieldType}`;
   if (options?.length) userPrompt += `\nOptions: ${JSON.stringify(options)}`;
-  return askMistral(systemPrompt, userPrompt, 200);
+  const ai = await askMistral(systemPrompt, userPrompt, 200);
+  if (!ai) return null;
+  // Guard against lazy "Oui" on detail questions
+  if (/^oui\.?$/i.test(ai.trim()) && /rythme|date|combien|salaire|expérience|niveau|jours/i.test(q)) {
+    if (/rythme|alternance/i.test(q)) return "2 jours école / 3 jours entreprise";
+  }
+  return ai;
 }
 
 async function appendLog(message, level = "info", platform = "") {
@@ -715,6 +788,49 @@ async function openPlatformTabs(urls, platforms) {
   }
 }
 
+let reopeningPlatformTab = false;
+chrome.tabs.onRemoved.addListener(async () => {
+  if (reopeningPlatformTab) return;
+  try {
+    const data = await chrome.storage.local.get([
+      "amijobsMeta",
+      "sessionHellowork",
+      "sessionLinkedin",
+      "sessionIndeed",
+      "sessionGlassdoor",
+    ]);
+    if (!data.amijobsMeta?.active) return;
+
+    const checks = [
+      ["hellowork", data.sessionHellowork, PLATFORM_URL_MATCH.hellowork],
+      ["linkedin", data.sessionLinkedin, PLATFORM_URL_MATCH.linkedin],
+      ["indeed", data.sessionIndeed, PLATFORM_URL_MATCH.indeed],
+      ["glassdoor", data.sessionGlassdoor, PLATFORM_URL_MATCH.glassdoor],
+    ];
+    const tabs = await chrome.tabs.query({});
+    for (const [platform, session, patterns] of checks) {
+      if (!session?.active) continue;
+      // Glassdoor-only / Indeed fromGlassdoor sessions should not force a SERP reopen race
+      if (platform === "indeed" && session.fromGlassdoor) continue;
+      const searchUrl = session.searchUrl || session.resumeSearchUrl || "";
+      if (!searchUrl) continue;
+      const hasTab = tabs.some(
+        (t) => t.url && patterns.some((p) => String(t.url).includes(p)) && !/smartapply\.indeed\.com/i.test(t.url || "")
+      );
+      if (hasTab) continue;
+      reopeningPlatformTab = true;
+      try {
+        await chrome.tabs.create({ url: searchUrl, active: false });
+        await appendLog(`Onglet ${platform} rouvert (fermé pendant la session)`, "warn", platform);
+      } finally {
+        reopeningPlatformTab = false;
+      }
+    }
+  } catch (_e) {
+    reopeningPlatformTab = false;
+  }
+});
+
 function profileFromAppPayload(msg) {
   const p = msg.profile || {};
   return {
@@ -850,6 +966,63 @@ function handleMessage(msg, sendResponse, sender = null) {
   if (msg.action === "ping") {
     sendResponse({ ok: true, version: EXT_VERSION });
     return false;
+  }
+
+  if (msg.action === "injectTurnstileClicker") {
+    (async () => {
+      // Prefer explicit tabId (e.g. from options) over sender.tab (which is the options page itself)
+      const tabId = msg.tabId || sender?.tab?.id;
+      if (!tabId) {
+        sendResponse({ ok: false, reason: "no_tab" });
+        return;
+      }
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          files: ["content/cloudflare-turnstile.js"],
+        });
+        // Force re-click even if the content script was already loaded
+        const results = await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          func: () => {
+            try {
+              if (typeof window.__AmijobsClickTurnstile === "function") {
+                return { clicked: !!window.__AmijobsClickTurnstile(), href: location.href.slice(0, 120) };
+              }
+            } catch (_e) {
+              /* ignore */
+            }
+            const click = (el) => {
+              if (!el) return;
+              const r = el.getBoundingClientRect();
+              const x = r.left + Math.min(22, Math.max(8, r.width * 0.12));
+              const y = r.top + r.height / 2;
+              const t = document.elementFromPoint(x, y) || el;
+              const o = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window, buttons: 1 };
+              for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                try {
+                  t.dispatchEvent(new MouseEvent(type, o));
+                } catch (_e) {}
+              }
+              try {
+                el.click();
+              } catch (_e) {}
+            };
+            const nodes = [
+              ...document.querySelectorAll(
+                'input[type="checkbox"], [role="checkbox"], label.cb-lb, .cb-lb, .cf-turnstile, #challenge-stage, iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"]'
+              ),
+            ];
+            nodes.forEach(click);
+            return { clicked: nodes.length > 0, href: location.href.slice(0, 120), n: nodes.length };
+          },
+        });
+        sendResponse({ ok: true, frames: (results || []).map((r) => r?.result).filter(Boolean) });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+    })();
+    return true;
   }
 
   if (msg.action === "syncFromApp") {

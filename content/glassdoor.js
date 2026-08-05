@@ -18,13 +18,94 @@
       text.includes("aidez-nous à protéger glassdoor") ||
       text.includes("help us protect glassdoor") ||
       text.includes("réservé aux humains") ||
+      text.includes("vérifiez que vous êtes humain") ||
+      text.includes("verify you are human") ||
       text.includes("bad gateway") ||
       text.includes("ray id:") ||
       title.includes("bad gateway") ||
       title.includes("un instant") ||
       document.body?.innerHTML?.includes("cf-error") ||
-      !!S().$("h1")?.textContent?.match(/502|503|429/i)
+      !!S().$("h1")?.textContent?.match(/502|503|429/i) ||
+      !!S().$('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, #challenge-stage')
     );
+  }
+
+  async function tryPassCloudflareChallenge() {
+    const needsCaptcha = () => {
+      const text = (document.body?.innerText || "").toLowerCase();
+      return (
+        text.includes("vérifiez que vous êtes humain") ||
+        text.includes("verify you are human") ||
+        text.includes("je ne suis pas un robot") ||
+        text.includes("checking your browser") ||
+        text.includes("just a moment") ||
+        text.includes("un instant…") ||
+        text.includes("un instant...")
+      );
+    };
+    if (!needsCaptcha() && !S().$('iframe[src*="challenges.cloudflare.com"], .cf-turnstile')) {
+      return false;
+    }
+
+    S().log(PLATFORM, "Challenge Cloudflare Glassdoor — clic case", "warn");
+    try {
+      await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
+    } catch (_e) {
+      /* ignore */
+    }
+    try {
+      if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+    } catch (_e) {
+      /* ignore */
+    }
+    for (let i = 0; i < 12; i++) {
+      for (const frame of S().$$(
+        'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[title*="Widget"], iframe[title*="Cloudflare"]'
+      )) {
+        if (!S().isVisible(frame)) continue;
+        const r = frame.getBoundingClientRect();
+        const x = r.left + 22;
+        const y = r.top + r.height / 2;
+        const t = document.elementFromPoint(x, y) || frame;
+        const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window, buttons: 1 };
+        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+          try {
+            t.dispatchEvent(new MouseEvent(type, opts));
+          } catch (_e) {
+            /* ignore */
+          }
+        }
+        try {
+          frame.click();
+        } catch (_e) {
+          /* ignore */
+        }
+      }
+      for (const el of S().$$('input[type="checkbox"], [role="checkbox"], label.cb-lb')) {
+        if (S().isVisible(el)) {
+          try {
+            await S().humanClick(el);
+          } catch (_e) {
+            try {
+              el.click();
+            } catch (_e2) {
+              /* ignore */
+            }
+          }
+        }
+      }
+      await S().sleep(1500);
+      if (!needsCaptcha() && !S().$('iframe[src*="challenges.cloudflare.com"], .cf-turnstile')) {
+        S().log(PLATFORM, "Challenge Cloudflare passé", "success");
+        return true;
+      }
+      try {
+        await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+    return !needsCaptcha();
   }
 
   function isSearchPage(url = window.location.href) {
@@ -314,7 +395,13 @@
   }
 
   function alreadyApplied(appliedJobs, jobId) {
-    return !!(appliedJobs[jobId] || appliedJobs[`gd_${jobId}`]);
+    if (!jobId) return false;
+    return !!(
+      appliedJobs[jobId] ||
+      appliedJobs[`gd_${jobId}`] ||
+      appliedJobs[`ind_${jobId}`] ||
+      Object.keys(appliedJobs || {}).some((k) => k.endsWith(`_${jobId}`) || k === jobId)
+    );
   }
 
   async function runAutoApplySession() {
@@ -329,14 +416,14 @@
     shouldStop = false;
 
     if (isBlockedPage()) {
-      S().log(PLATFORM, "Glassdoor bloque temporairement (protection anti-bot) — pause", "warn");
-      await chrome.runtime.sendMessage({
-        action: "endPlatformSession",
-        platform: PLATFORM,
-        reason: "Arrêt: protection Glassdoor (Cloudflare)",
-      });
-      isRunning = false;
-      return;
+      S().log(PLATFORM, "Glassdoor protection / Cloudflare — tentative de clic", "warn");
+      const ok = await tryPassCloudflareChallenge();
+      if (!ok && isBlockedPage()) {
+        // Don't kill the whole session — wait and let resume retry
+        S().log(PLATFORM, "Cloudflare non résolu — pause (session conservée)", "warn");
+        isRunning = false;
+        return;
+      }
     }
 
     const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
@@ -436,28 +523,75 @@
           const isIndeedHandoff = /indeed/i.test(String(result.reason || ""));
           if (isIndeedHandoff) {
             S().log(PLATFORM, `Handoff Indeed: ${jobInfo.title} — attente Smart Apply`, "success");
-            // Wait until background clears awaitingIndeed (Smart Apply closed) or timeout
-            for (let w = 0; w < 75; w++) {
+            let handoffDone = false;
+            const appliedBefore = session.applied || 0;
+            for (let w = 0; w < 90; w++) {
               if (shouldStop) break;
-              const { sessionGlassdoor: sWait } = await chrome.storage.local.get(["sessionGlassdoor"]);
-              if (!sWait?.awaitingIndeed) break;
+              const { sessionGlassdoor: sWait, appliedJobs = {} } = await chrome.storage.local.get([
+                "sessionGlassdoor",
+                "appliedJobs",
+              ]);
+              if (
+                alreadyApplied(appliedJobs, jobInfo.jobId) ||
+                alreadyApplied(appliedJobs, sWait?.currentJk)
+              ) {
+                handoffDone = true;
+                break;
+              }
+              if (sWait && (sWait.applied || 0) > appliedBefore) {
+                handoffDone = true;
+                break;
+              }
+              if (sWait && !sWait.awaitingIndeed) {
+                // Released by a successful Smart Apply finish
+                await S().sleep(800);
+                const { appliedJobs: jobs2 = {}, sessionGlassdoor: s2 } = await chrome.storage.local.get([
+                  "appliedJobs",
+                  "sessionGlassdoor",
+                ]);
+                handoffDone =
+                  alreadyApplied(jobs2, jobInfo.jobId) ||
+                  alreadyApplied(jobs2, s2?.currentJk) ||
+                  !!s2?.indeedHandoffDone ||
+                  (s2 && (s2.applied || 0) > appliedBefore);
+                if (handoffDone) break;
+                // Not applied yet — keep waiting (another Smart Apply attempt may still be running)
+              }
               await S().sleep(1000);
             }
-            // Mark applied after handoff wait (Indeed may also mark — duplicate keys are ok with same job)
-            await chrome.runtime.sendMessage({
-              action: "markApplied",
-              platform: PLATFORM,
-              jobId: jobInfo.jobId,
-              title: jobInfo.title,
-              company: jobInfo.company,
-              url: jobInfo.url,
-            });
-            // Ensure flag cleared for next card
-            const { sessionGlassdoor: sClear } = await chrome.storage.local.get(["sessionGlassdoor"]);
-            if (sClear?.awaitingIndeed) {
+            // Fresh read right before deciding success/timeout (avoid race with markApplied)
+            await S().sleep(500);
+            const { sessionGlassdoor: sClear, appliedJobs: jobsNow = {} } = await chrome.storage.local.get([
+              "sessionGlassdoor",
+              "appliedJobs",
+            ]);
+            const matched =
+              alreadyApplied(jobsNow, jobInfo.jobId) ||
+              alreadyApplied(jobsNow, sClear?.currentJk) ||
+              handoffDone ||
+              !!sClear?.indeedHandoffDone ||
+              (sClear && (sClear.applied || 0) > appliedBefore);
+            if (sClear?.awaitingIndeed && matched) {
+              await chrome.storage.local.set({
+                sessionGlassdoor: { ...sClear, awaitingIndeed: false, indeedHandoffDone: true },
+              });
+            } else if (sClear?.awaitingIndeed && !matched) {
               await chrome.storage.local.set({
                 sessionGlassdoor: { ...sClear, awaitingIndeed: false, indeedHandoffDone: false },
               });
+            }
+            if (matched) {
+              appliedThisRun++;
+              S().log(PLATFORM, `Postulé (via Indeed): ${jobInfo.title}`, "success");
+            } else {
+              await chrome.runtime.sendMessage({
+                action: "markError",
+                platform: PLATFORM,
+                jobId: jobInfo.jobId,
+                title: jobInfo.title,
+                error: "indeed_handoff_timeout",
+              });
+              S().log(PLATFORM, `Smart Apply Indeed non terminé: ${jobInfo.title}`, "warn");
             }
           } else {
             await chrome.runtime.sendMessage({
@@ -468,9 +602,9 @@
               company: jobInfo.company,
               url: jobInfo.url,
             });
+            appliedThisRun++;
+            S().log(PLATFORM, `Postulé: ${jobInfo.title}`, "success");
           }
-          appliedThisRun++;
-          S().log(PLATFORM, `Postulé: ${jobInfo.title}`, "success");
         } else {
           await chrome.runtime.sendMessage({
             action: "markError",
@@ -527,21 +661,25 @@
 
   async function checkAndResumeSession() {
     if (!isSearchPage() && !isJobDetailPage()) return;
-    if (isBlockedPage()) return;
+    if (isBlockedPage()) {
+      await tryPassCloudflareChallenge();
+      if (isBlockedPage()) return;
+    }
     const start = Date.now();
-    while (Date.now() - start < 45000) {
+    while (Date.now() - start < 60000) {
       const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
       if (session?.active && !isRunning) {
-        if (session.lastRunAt && Date.now() - session.lastRunAt < 20000) {
-          await S().sleep(4000);
+        // Only skip if another run finished very recently on THIS tab cycle
+        if (session.lastRunAt && Date.now() - session.lastRunAt < 8000) {
+          await S().sleep(2500);
           continue;
         }
-        await S().sleep(2500);
+        await S().sleep(1500);
         await runAutoApplySession();
         return;
       }
       if (isRunning) return;
-      await S().sleep(3000);
+      await S().sleep(2000);
     }
   }
 

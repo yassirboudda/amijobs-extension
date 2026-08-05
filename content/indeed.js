@@ -64,16 +64,18 @@
     const lower = key.toLowerCase();
     // Known demo / sequential placeholders seen in live mass-apply
     if (
-      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|deadbeef|123456789abcdef0|0f1e2d3c4b5a6978)$/i.test(
+      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|deadbeef|123456789abcdef0|0f1e2d3c4b5a6978|fedcba9876543210|f1e2d3c4b5a67890|456789abcdef0123)$/i.test(
         lower
       )
     ) {
       return false;
     }
-    if (/^123456789/i.test(lower) || /abcdef0$/i.test(lower)) return false;
-    if (/^(a1b2c3d4|0f1e2d3c)/i.test(lower)) return false;
+    if (/^(123456789|456789abc|abcdef012)/i.test(lower)) return false;
+    if (/abcdef0$/i.test(lower) || /[0-9]{5,}abcdef/i.test(lower)) return false;
+    if (/^(a1b2c3d4|0f1e2d3c|fedcba98|f1e2d3c4|e2d3c4b5|456789ab)/i.test(lower)) return false;
+    if (/f1e2d3c4|e2d3c4b5|d3c4b5a6|c4b5a678/i.test(lower)) return false;
 
-    // Reject 16-char hex keys that are arithmetic sequences (0f,1e,2d… or 01,02,03…)
+    // Reject 16-char hex keys that are arithmetic / constant-step sequences
     if (/^[0-9a-f]{16}$/i.test(lower)) {
       const pairs = lower.match(/.{2}/g) || [];
       if (pairs.length === 8) {
@@ -85,6 +87,27 @@
           if (vals[i] === vals[i - 1] - 1) desc++;
         }
         if (asc >= 5 || desc >= 5) return false;
+        const steps = [];
+        for (let i = 1; i < vals.length; i++) steps.push(vals[i] - vals[i - 1]);
+        // Long run of identical non-zero steps (even if later steps break)
+        let run = 1;
+        for (let i = 1; i < steps.length; i++) {
+          if (steps[i] === steps[i - 1] && steps[i] !== 0) run++;
+          else run = 1;
+          if (run >= 4) return false;
+        }
+        if (steps.length >= 5 && steps.every((s) => s === steps[0] && s !== 0)) return false;
+
+        // Interleaved first/second nibble monotonic (f1 e2 d3 c4 b5 a6)
+        const hi = pairs.map((p) => parseInt(p[0], 16));
+        const lo = pairs.map((p) => parseInt(p[1], 16));
+        let hiDesc = 0;
+        let loAsc = 0;
+        for (let i = 1; i < Math.min(6, hi.length); i++) {
+          if (hi[i] === hi[i - 1] - 1) hiDesc++;
+          if (lo[i] === lo[i - 1] + 1) loAsc++;
+        }
+        if (hiDesc >= 4 && loAsc >= 4) return false;
       }
     }
     return true;
@@ -131,6 +154,120 @@
     if (reason) S().log(PLATFORM, `Session terminée: ${reason}`, "warn");
   }
 
+  function detectCloudflareChallenge() {
+    const text = (document.body?.innerText || "").toLowerCase();
+    return (
+      text.includes("verify you are human") ||
+      text.includes("vérifiez que vous êtes humain") ||
+      text.includes("je ne suis pas un robot") ||
+      text.includes("i'm not a robot") ||
+      text.includes("checking your browser") ||
+      text.includes("just a moment") ||
+      !!document.querySelector(
+        '#challenge-stage, .cf-turnstile, iframe[src*="challenges.cloudflare.com"], #cf-challenge-running'
+      )
+    );
+  }
+
+  async function tryPassCloudflareChallenge() {
+    const text = (document.body?.innerText || "").toLowerCase();
+    const hasWidget =
+      detectCloudflareChallenge() ||
+      text.includes("vérifiez que vous êtes humain") ||
+      text.includes("verify you are human") ||
+      !!S().$('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile');
+    if (!hasWidget) return false;
+
+    S().log(PLATFORM, "Challenge Cloudflare détecté — clic sur la case", "warn");
+
+    const clickPoint = (el, xRatio = 0.12) => {
+      if (!el) return;
+      try {
+        el.scrollIntoView({ block: "center", inline: "nearest" });
+      } catch (_e) {
+        /* ignore */
+      }
+      const r = el.getBoundingClientRect();
+      const x = r.left + Math.max(12, Math.min(r.width * xRatio, r.width - 12));
+      const y = r.top + r.height / 2;
+      const target = document.elementFromPoint(x, y) || el;
+      const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, buttons: 1 };
+      for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+        try {
+          target.dispatchEvent(new MouseEvent(type, opts));
+        } catch (_e) {
+          /* ignore */
+        }
+      }
+      try {
+        el.click();
+      } catch (_e) {
+        /* ignore */
+      }
+    };
+
+    // Ask background to inject turnstile script into all frames of this tab
+    try {
+      await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
+    } catch (_e) {
+      /* ignore */
+    }
+    try {
+      if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+    } catch (_e) {
+      /* ignore */
+    }
+
+    for (let i = 0; i < 12; i++) {
+      // Click left side of Turnstile iframe (checkbox area)
+      const frames = S().$$(
+        'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[title*="Widget"], iframe[title*="Cloudflare"]'
+      );
+      for (const frame of frames) {
+        if (!S().isVisible(frame)) continue;
+        clickPoint(frame, 0.1);
+        clickPoint(frame, 0.15);
+        await S().sleep(400);
+      }
+
+      const widget = S().$(".cf-turnstile, #challenge-stage, [data-sitekey]");
+      if (widget) clickPoint(widget, 0.1);
+
+      for (const el of S().$$('input[type="checkbox"], [role="checkbox"]')) {
+        if (S().isVisible(el)) {
+          try {
+            await S().humanClick(el);
+          } catch (_e) {
+            clickPoint(el, 0.5);
+          }
+        }
+      }
+
+      const cta = S().findActionButton([
+        /vérifiez que vous êtes humain/i,
+        /verify you are human/i,
+        /je ne suis pas un robot/i,
+        /i'?m not a robot/i,
+      ]);
+      if (cta) {
+        await S().humanClick(cta);
+        clickPoint(cta, 0.08);
+      }
+
+      await S().sleep(1800);
+      const still =
+        detectCloudflareChallenge() ||
+        (document.body?.innerText || "").toLowerCase().includes("vérifiez que vous êtes humain");
+      if (!still && !detectBlockedPage()) {
+        S().log(PLATFORM, "Challenge Cloudflare passé", "success");
+        return true;
+      }
+    }
+    // Don't kill the session immediately — leave page for manual click if needed
+    S().log(PLATFORM, "Challenge Cloudflare toujours présent — nouvelle tentative plus tard", "warn");
+    return false;
+  }
+
   function detectBlockedPage() {
     const text = document.body?.innerText?.toLowerCase() || "";
     const title = document.title?.toLowerCase() || "";
@@ -146,12 +283,22 @@
 
   function detectLoginWall() {
     const text = document.body?.innerText?.toLowerCase() || "";
-    return (
+    // Header "Se connecter" links exist even when logged in — require a real gate
+    const hardGate =
       text.includes("connectez-vous pour continuer") ||
       text.includes("sign in to continue") ||
       text.includes("create an account to continue") ||
-      !!document.querySelector('form[action*="login"], a[href*="/account/login"], button[data-tn-element="login"]')
-    );
+      text.includes("créez un compte pour continuer") ||
+      !!document.querySelector(
+        'form[action*="login"] input[type="password"], #login-email-input, input[name="__email"]'
+      );
+    if (!hardGate) return false;
+    // If job cards are visible, we are not on a login wall
+    if (collectJobCards().length > 0) return false;
+    if (isSearchPage() && S().$("#mosaic-provider-jobcards, .jobsearch-ResultsList, ul#job-results-list")) {
+      return false;
+    }
+    return true;
   }
 
   function detectNoResultsPage() {
@@ -592,6 +739,8 @@
         }
       } else if (/url|link|http|linkedin|portfolio|github/i.test(label)) {
         await S().humanType(el, "https://www.linkedin.com");
+      } else if (/rythme|alternance.*(école|ecole|entreprise)|jours?\s*(école|ecole)/i.test(label)) {
+        await S().humanType(el, "2 jours école / 3 jours entreprise");
       } else if (/année|year|experience|expérience|ans/i.test(label) || el.type === "number") {
         await S().humanType(el, "3");
       } else if (/salaire|salary|prétention|compensation/i.test(label)) {
@@ -752,11 +901,13 @@
       return;
     }
 
-    if (detectBlockedPage()) {
-      await endSession("Indeed a bloqué la requête (anti-bot)");
-      return;
+    if (detectBlockedPage() || detectCloudflareChallenge()) {
+      const ok = await tryPassCloudflareChallenge();
+      if (!ok && detectBlockedPage()) {
+        await endSession("Indeed a bloqué la requête (anti-bot)");
+        return;
+      }
     }
-
     let queue = session.queue || [];
     let qIndex = session.qIndex || 0;
 
@@ -818,6 +969,11 @@
       }
 
       const item = queue[qIndex];
+      if (!isValidIndeedJobKey(item.jobId)) {
+        qIndex++;
+        await setSession({ qIndex });
+        continue;
+      }
       if (await alreadyApplied(appliedJobs, item.jobId)) {
         qIndex++;
         await setSession({ qIndex });
@@ -850,7 +1006,7 @@
       });
 
       const host = getIndeedHost(session);
-      window.location.href = `${host}/viewjob?jk=${encodeURIComponent(item.jobId)}&from=amijobs`;
+      window.location.href = `${host}/viewjob?jk=${encodeURIComponent(item.jobId)}`;
       return;
     }
 
@@ -888,9 +1044,12 @@
         session.currentCompany || session.queue?.find((q) => q.jobId === jobId)?.company || "";
     }
 
-    if (detectBlockedPage()) {
-      await endSession("Indeed a bloqué la requête (anti-bot)");
-      return;
+    if (detectBlockedPage() || detectCloudflareChallenge()) {
+      const ok = await tryPassCloudflareChallenge();
+      if (!ok && detectBlockedPage()) {
+        await endSession("Indeed a bloqué la requête (anti-bot)");
+        return;
+      }
     }
 
     const skipReason = await shouldSkipCompany(jobInfo.company);
@@ -1009,9 +1168,16 @@
 
     const jobInfo = getJobInfoFromPage(session.currentJk);
     if (fromGlassdoor && glassdoorSmartApply) {
-      if (!jobInfo.title) jobInfo.title = glassdoorSmartApply.title || session.currentTitle || "";
-      if (!jobInfo.company) jobInfo.company = glassdoorSmartApply.company || session.currentCompany || "";
-      if (!jobInfo.jobId) jobInfo.jobId = glassdoorSmartApply.jobId || session.currentJk || jkFromUrl();
+      // Prefer Glassdoor listing id so the Glassdoor wait loop can match appliedJobs
+      jobInfo.jobId =
+        glassdoorSmartApply.jobId ||
+        sessionGlassdoor?.currentJk ||
+        jobInfo.jobId ||
+        session.currentJk ||
+        jkFromUrl();
+      if (!jobInfo.title) jobInfo.title = glassdoorSmartApply.title || session.currentTitle || sessionGlassdoor?.currentTitle || "";
+      if (!jobInfo.company)
+        jobInfo.company = glassdoorSmartApply.company || session.currentCompany || sessionGlassdoor?.currentCompany || "";
     } else {
       if (!jobInfo.title) jobInfo.title = session.currentTitle || "";
       if (!jobInfo.company) jobInfo.company = session.currentCompany || "";
@@ -1033,35 +1199,66 @@
         `Postulé${fromGlassdoor ? " (via Glassdoor)" : ""}: ${jobInfo.title || jobInfo.jobId}`,
         "success"
       );
-    } else {
+    } else if (!fromGlassdoor) {
       await chrome.runtime.sendMessage({
         action: "markError",
-        platform: fromGlassdoor ? "glassdoor" : PLATFORM,
+        platform: PLATFORM,
         jobId: jobInfo.jobId || session.currentJk,
         title: jobInfo.title,
         error: result.reason || "error",
       });
+    } else {
+      // Glassdoor owns the waiter — log only; do not clear awaitingIndeed / mark glassdoor error yet
+      S().log(
+        PLATFORM,
+        `Smart Apply (Glassdoor) en cours / retry: ${result.reason || "error"}`,
+        "warn"
+      );
+      try {
+        // One soft retry while Glassdoor is still waiting
+        await S().sleep(1500);
+        const retry = await runApplyWizard(jobInfo, settings);
+        if (retry.success) {
+          await chrome.runtime.sendMessage({
+            action: "markApplied",
+            platform: "glassdoor",
+            jobId: jobInfo.jobId || session.currentJk,
+            title: jobInfo.title,
+            company: jobInfo.company,
+            url: jobInfo.url,
+          });
+          S().log(PLATFORM, `Postulé (via Glassdoor): ${jobInfo.title || jobInfo.jobId}`, "success");
+          result.success = true;
+        }
+      } catch (_e) {
+        /* ignore */
+      }
     }
 
     if (fromGlassdoor) {
-      if (sessionGlassdoor?.active) {
-        await chrome.storage.local.set({
-          sessionGlassdoor: {
-            ...sessionGlassdoor,
-            awaitingIndeed: false,
-            indeedHandoffDone: false,
-          },
-          glassdoorSmartApply: null,
+      // Only release the Glassdoor waiter + close tab on success.
+      // On failure, keep awaitingIndeed so Glassdoor does not false-timeout while Smart Apply retries.
+      if (result.success) {
+        const { sessionGlassdoor: sNow = null } = await chrome.storage.local.get(["sessionGlassdoor"]);
+        if (sNow?.active) {
+          await chrome.storage.local.set({
+            sessionGlassdoor: {
+              ...sNow,
+              awaitingIndeed: false,
+              indeedHandoffDone: true,
+              applied: (sNow.applied || 0) + 1,
+            },
+            glassdoorSmartApply: null,
+          });
+        } else {
+          await chrome.storage.local.set({ glassdoorSmartApply: null });
+        }
+        await chrome.runtime.sendMessage({
+          action: "closeTabAndResumeIndeed",
+          searchUrl: "",
+          fromGlassdoor: true,
         });
-      } else {
-        await chrome.storage.local.set({ glassdoorSmartApply: null });
       }
-      // Close Smart Apply tab without hijacking Indeed's SERP session
-      await chrome.runtime.sendMessage({
-        action: "closeTabAndResumeIndeed",
-        searchUrl: "",
-        fromGlassdoor: true,
-      });
       return;
     }
 
@@ -1114,13 +1311,32 @@
       }
       if (!session?.active) return;
 
-      if (detectBlockedPage()) {
-        await endSession("Indeed a bloqué la requête (anti-bot)");
-        return;
+      if (detectCloudflareChallenge() || detectBlockedPage()) {
+        const ok = await tryPassCloudflareChallenge();
+        if (!ok && detectBlockedPage() && !detectCloudflareChallenge()) {
+          await endSession("Indeed a bloqué la requête (anti-bot)");
+          return;
+        }
+        if (!ok && detectCloudflareChallenge()) {
+          // Keep session alive — wait and retry instead of stopping
+          S().log(PLATFORM, "Attente validation Cloudflare (ne pas arrêter la session)", "warn");
+          await S().sleep(5000);
+          await tryPassCloudflareChallenge();
+          if (detectCloudflareChallenge() && !collectJobCards().length && !isSmartApplyPage()) {
+            // Still stuck with no jobs — pause briefly then continue trying
+            await S().sleep(4000);
+          }
+        }
       }
       if (detectLoginWall() && !isSmartApplyPage()) {
-        await endSession("Connexion Indeed requise");
-        return;
+        // Sometimes Cloudflare/login interstitial looks like a login wall — try challenge first
+        if (detectCloudflareChallenge()) {
+          await tryPassCloudflareChallenge();
+        }
+        if (detectLoginWall() && !isSmartApplyPage()) {
+          await endSession("Connexion Indeed requise");
+          return;
+        }
       }
       if (shouldStop) {
         await endSession("Arrêt demandé");

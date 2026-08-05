@@ -11,7 +11,8 @@
   "permissions": [
     "storage",
     "tabs",
-    "downloads"
+    "downloads",
+    "scripting"
   ],
   "host_permissions": [
     "https://www.hellowork.com/*",
@@ -23,6 +24,8 @@
     "https://www.glassdoor.com/*",
     "https://www.glassdoor.fr/*",
     "https://*.glassdoor.com/*",
+    "https://challenges.cloudflare.com/*",
+    "https://*.cloudflare.com/*",
     "https://api.mistral.ai/*",
     "https://autocomplete.indeed.com/*"
   ],
@@ -32,12 +35,25 @@
   "content_scripts": [
     {
       "matches": [
+        "https://challenges.cloudflare.com/*",
+        "https://*.cloudflare.com/*"
+      ],
+      "js": [
+        "content/cloudflare-turnstile.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
+    },
+    {
+      "matches": [
         "https://www.hellowork.com/fr-fr/*"
       ],
       "js": [
         "content/hellowork.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     },
     {
       "matches": [
@@ -56,9 +72,11 @@
       ],
       "js": [
         "content/shared-autofill.js",
-        "content/indeed.js"
+        "content/indeed.js",
+        "content/cloudflare-turnstile.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     },
     {
       "matches": [
@@ -66,9 +84,11 @@
       ],
       "js": [
         "content/shared-autofill.js",
-        "content/indeed.js"
+        "content/indeed.js",
+        "content/cloudflare-turnstile.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     },
     {
       "matches": [
@@ -78,9 +98,11 @@
       ],
       "js": [
         "content/shared-autofill.js",
-        "content/glassdoor.js"
+        "content/glassdoor.js",
+        "content/cloudflare-turnstile.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "action": {
