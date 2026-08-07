@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.1";
+  const VERSION = "1.3.2";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -151,7 +151,7 @@
     );
   }
 
-  function buildSearchUrl(keywords, location) {
+  function buildSearchUrl(keywords, location, page = 0) {
     const host = window.location.hostname.includes("glassdoor.fr")
       ? "https://www.glassdoor.fr"
       : "https://www.glassdoor.com";
@@ -160,7 +160,62 @@
     if (location) p.set("locT", "N");
     if (location) p.set("locId", "");
     if (location) p.set("sc.location", location);
+    if (page > 0) p.set("p", String(page + 1)); // Glassdoor pages are 1-based in ?p=
     return `${host}/Job/jobs.htm?${p.toString()}`;
+  }
+
+  function findNextPageUrl(session) {
+    const selectors = [
+      'button[data-test="pagination-next"]',
+      'a[data-test="pagination-next"]',
+      'button[aria-label*="Next" i]',
+      'button[aria-label*="Suivant" i]',
+      'a[aria-label*="Next" i]',
+      'a[aria-label*="Suivant" i]',
+      'a[rel="next"]',
+      '[class*="Pagination"] button:last-child',
+      '[class*="pagination"] a[aria-label*="next" i]',
+    ];
+    for (const sel of selectors) {
+      const el = S().$(sel);
+      if (!el || !S().isVisible(el)) continue;
+      if (el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+      const href = el.getAttribute("href");
+      if (href && !href.startsWith("#") && !/^javascript:/i.test(href)) {
+        try {
+          return new URL(href, window.location.origin).toString();
+        } catch (_e) {
+          /* ignore */
+        }
+      }
+      // Button-only pagination: derive next URL
+    }
+
+    // Classic Glassdoor path: ...SRCH_....htm → ...SRCH_...._IP2.htm
+    try {
+      const u = new URL(window.location.href);
+      const path = u.pathname;
+      const ip = path.match(/_IP(\d+)\.htm/i);
+      const nextNum = ip ? parseInt(ip[1], 10) + 1 : 2;
+      let nextPath;
+      if (ip) nextPath = path.replace(/_IP\d+\.htm/i, `_IP${nextNum}.htm`);
+      else if (/\.htm$/i.test(path)) nextPath = path.replace(/\.htm$/i, `_IP${nextNum}.htm`);
+      else nextPath = "";
+      if (nextPath) {
+        u.pathname = nextPath;
+        return u.toString();
+      }
+      const page = parseInt(u.searchParams.get("p") || "1", 10);
+      u.searchParams.set("p", String(page + 1));
+      return u.toString();
+    } catch (_e) {
+      /* ignore */
+    }
+
+    if (session?.keywords != null) {
+      return buildSearchUrl(session.keywords, session.location, (session.currentPage || 0) + 1);
+    }
+    return "";
   }
 
   function collectJobCards() {
@@ -437,7 +492,7 @@
   async function runAutoApplySession() {
     if (isRunning) return;
     const now = Date.now();
-    if (now - lastGlassdoorRunAt < 15000) {
+    if (now - lastGlassdoorRunAt < 5000) {
       S().log(PLATFORM, "Cooldown Glassdoor — skip (anti boucle)", "warn");
       return;
     }
@@ -645,13 +700,38 @@
           });
         }
 
-        const jobDelay = Math.max(settings.delayBetweenJobs?.min || 500, 8000);
+        const jobDelay = Math.max(settings.delayBetweenJobs?.min || 500, 2500);
         const jobDelayMax = Math.max(settings.delayBetweenJobs?.max || jobDelay, jobDelay);
         await S().sleep(S().randomDelay(jobDelay, jobDelayMax));
       }
 
       const { sessionGlassdoor: updated } = await chrome.storage.local.get(["sessionGlassdoor"]);
-      if (updated?.active) {
+      if (!updated?.active || shouldStop) {
+        /* stop */
+      } else if ((updated.applied || 0) >= maxJobs) {
+        await chrome.runtime.sendMessage({
+          action: "endPlatformSession",
+          platform: PLATFORM,
+          reason: "Objectif session atteint",
+        });
+      } else {
+        // Continue to next results page (finish page 1 → start page 2, etc.)
+        const nextUrl = findNextPageUrl(updated);
+        const nextPage = (updated.currentPage || 0) + 1;
+        if (nextUrl && nextPage <= 8) {
+          await chrome.storage.local.set({
+            sessionGlassdoor: {
+              ...updated,
+              currentPage: nextPage,
+              lastRunAt: Date.now(),
+            },
+          });
+          S().log(PLATFORM, `Page suivante Glassdoor (${nextPage + 1})`, "info");
+          isRunning = false;
+          lastGlassdoorRunAt = 0; // allow immediate resume on next page
+          window.location.href = nextUrl;
+          return;
+        }
         await chrome.runtime.sendMessage({
           action: "endPlatformSession",
           platform: PLATFORM,

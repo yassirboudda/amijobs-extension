@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.3.1";
+const EXT_VERSION = "1.3.2";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -207,12 +207,26 @@ function asArray(v) {
   return [];
 }
 
+function freelanceAwareKeywords(keywords, contracts) {
+  const kw = String(keywords || "").trim();
+  const list = asArray(contracts).map((c) => String(c).toLowerCase());
+  const wantsFreelance = list.some((c) => /freelance|independant|indépendant|contract/i.test(c));
+  if (!wantsFreelance) return kw;
+  if (/freelance/i.test(kw)) return kw;
+  return kw ? `${kw} freelance` : "freelance";
+}
+
 function buildHelloworkSearchUrl(keywords, location, contracts) {
   const list = asArray(contracts);
   const qs = [];
-  qs.push(`k=${encodeURIComponent(keywords || "")}`);
+  qs.push(`k=${encodeURIComponent(freelanceAwareKeywords(keywords, contracts) || "")}`);
   if (location) qs.push(`l=${encodeURIComponent(location)}`);
-  for (const c of list) qs.push(`c=${encodeURIComponent(c)}`);
+  for (const c of list) {
+    const v = String(c);
+    // HelloWork expects coded contract params; keep raw + common aliases
+    if (/freelance/i.test(v)) qs.push(`c=${encodeURIComponent("Freelance")}`);
+    else qs.push(`c=${encodeURIComponent(v)}`);
+  }
   return `https://www.hellowork.com/fr-fr/emploi/recherche.html?${qs.join("&")}`;
 }
 
@@ -231,7 +245,8 @@ const LINKEDIN_JT = {
 
 function buildLinkedInSearchUrl(keywords, location, contracts) {
   const params = new URLSearchParams();
-  if (keywords) params.set("keywords", keywords);
+  const kw = freelanceAwareKeywords(keywords, contracts);
+  if (kw) params.set("keywords", kw);
   if (location) params.set("location", location);
   params.set("f_AL", "true");
   params.set("f_TPR", "r86400");
@@ -240,19 +255,26 @@ function buildLinkedInSearchUrl(keywords, location, contracts) {
   return `https://www.linkedin.com/jobs/search/?${params.toString()}`;
 }
 
-function buildIndeedSearchUrl(keywords, location, page = 0) {
+function buildIndeedSearchUrl(keywords, location, page = 0, contracts = []) {
   const p = new URLSearchParams();
-  if (keywords) p.set("q", keywords);
+  const kw = freelanceAwareKeywords(keywords, contracts);
+  if (kw) p.set("q", kw);
   if (location) p.set("l", location);
   p.set("iafilter", "1");
+  // Contract / freelance-oriented results on fr.indeed
+  const list = asArray(contracts).map((c) => String(c).toLowerCase());
+  if (list.some((c) => /freelance|independant|indépendant|contract/i.test(c))) {
+    p.set("sc", "0kf:attr(DSQF7);");
+  }
   if (page > 0) p.set("start", String(page * 10));
   return `https://fr.indeed.com/jobs?${p.toString()}`;
 }
 
-function buildGlassdoorSearchUrl(keywords, location) {
+function buildGlassdoorSearchUrl(keywords, location, contracts = []) {
   // Prefer classic Job/jobs.htm search (live browser: Job/index.htm also lists Easy Apply cards)
   const p = new URLSearchParams();
-  if (keywords) p.set("sc.keyword", keywords);
+  const kw = freelanceAwareKeywords(keywords, contracts);
+  if (kw) p.set("sc.keyword", kw);
   if (location) p.set("sc.location", location);
   return `https://www.glassdoor.fr/Job/jobs.htm?${p.toString()}`;
 }
@@ -260,14 +282,14 @@ function buildGlassdoorSearchUrl(keywords, location) {
 function buildPlatformSearchUrl(platform, keywords, location, contracts, page = 0) {
   if (platform === "hellowork") return buildHelloworkSearchUrl(keywords, location, contracts);
   if (platform === "linkedin") return buildLinkedInSearchUrl(keywords, location, contracts);
-  if (platform === "indeed") return buildIndeedSearchUrl(keywords, location, page);
-  if (platform === "glassdoor") return buildGlassdoorSearchUrl(keywords, location);
+  if (platform === "indeed") return buildIndeedSearchUrl(keywords, location, page, contracts);
+  if (platform === "glassdoor") return buildGlassdoorSearchUrl(keywords, location, contracts);
   return "";
 }
 
 const PLATFORM_URL_MATCH = {
   hellowork: ["hellowork.com"],
-  linkedin: ["linkedin.com/jobs"],
+  linkedin: ["linkedin.com"],
   indeed: ["indeed.com", "indeed.fr", "smartapply.indeed.com"],
   glassdoor: ["glassdoor.com", "glassdoor.fr"],
 };
@@ -282,7 +304,7 @@ function detectPlatformFromUrl(url = "") {
   const u = String(url || "");
   if (!u || u.startsWith("chrome") || u.startsWith("about:")) return null;
   if (/hellowork\.com/i.test(u)) return "hellowork";
-  if (/linkedin\.com\/jobs/i.test(u)) return "linkedin";
+  if (/linkedin\.com/i.test(u)) return "linkedin";
   if (/smartapply\.indeed\.com|indeed\.(com|fr)/i.test(u)) return "indeed";
   if (/glassdoor\.(com|fr)/i.test(u)) return "glassdoor";
   return null;
@@ -990,6 +1012,53 @@ async function updatePlatformSessionFromMessage(platform, mutator) {
   return session;
 }
 
+async function ensureActiveSessionTabs() {
+  try {
+    const data = await chrome.storage.local.get([
+      "amijobsMeta",
+      "sessionHellowork",
+      "sessionLinkedin",
+      "sessionIndeed",
+      "sessionGlassdoor",
+    ]);
+    if (!data.amijobsMeta?.active) return;
+    const checks = [
+      ["hellowork", data.sessionHellowork],
+      ["linkedin", data.sessionLinkedin],
+      ["indeed", data.sessionIndeed],
+      ["glassdoor", data.sessionGlassdoor],
+    ];
+    for (const [platform, session] of checks) {
+      if (!session?.active) continue;
+      if (platform === "indeed" && session.fromGlassdoor) continue;
+      const searchUrl = session.searchUrl || session.resumeSearchUrl || "";
+      if (!searchUrl) continue;
+      const existing = await listPlatformTabs(platform);
+      if (existing.length > 1) {
+        await enforceOneTabPerPlatform("watchdog");
+        continue;
+      }
+      if (existing.length === 1) continue;
+      const now = Date.now();
+      const last = lastPlatformReopenAt[platform] || 0;
+      if (now - last < 15000) continue;
+      const count = platformReopenCount[platform] || 0;
+      if (count >= 5) continue;
+      lastPlatformReopenAt[platform] = now;
+      platformReopenCount[platform] = count + 1;
+      await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
+      await appendLog(`Onglet ${platform} restauré (manquant)`, "warn", platform);
+    }
+  } catch (_e) {
+    /* ignore */
+  }
+}
+
+// Restore missing platform tabs while a session is active (e.g. LinkedIn auth redirect)
+setInterval(() => {
+  ensureActiveSessionTabs().catch(() => {});
+}, 12000);
+
 // Hard cap: never more than 1 tab per job board
 chrome.tabs.onCreated.addListener(() => {
   setTimeout(() => enforceOneTabPerPlatform("nouvel onglet").catch(() => {}), 400);
@@ -1166,7 +1235,7 @@ async function startMultiSession(msg) {
   }
 
   if (platforms.includes("indeed")) {
-    const searchUrl = msg.indeedUrl || buildIndeedSearchUrl(keywords, location);
+    const searchUrl = msg.indeedUrl || buildIndeedSearchUrl(keywords, location, 0, contracts);
     urls.indeed = searchUrl;
     updates.sessionIndeed = emptyPlatformSession("indeed", {
       ...common,
@@ -1175,7 +1244,7 @@ async function startMultiSession(msg) {
   }
 
   if (platforms.includes("glassdoor")) {
-    const searchUrl = msg.glassdoorUrl || buildGlassdoorSearchUrl(keywords, location);
+    const searchUrl = msg.glassdoorUrl || buildGlassdoorSearchUrl(keywords, location, contracts);
     urls.glassdoor = searchUrl;
     updates.sessionGlassdoor = emptyPlatformSession("glassdoor", {
       ...common,
@@ -1377,9 +1446,9 @@ function handleMessage(msg, sendResponse, sender = null) {
             ? resumed.currentOfferUrl
             : resumed.resumeSearchUrl || resumed.searchUrl;
       } else if (platform === "indeed") {
-        targetUrl = resumed.searchUrl || buildIndeedSearchUrl(resumed.keywords, resumed.location, resumed.currentPage || 0);
+        targetUrl = resumed.searchUrl || buildIndeedSearchUrl(resumed.keywords, resumed.location, resumed.currentPage || 0, resumed.contracts);
       } else if (platform === "glassdoor") {
-        targetUrl = resumed.searchUrl || buildGlassdoorSearchUrl(resumed.keywords, resumed.location);
+        targetUrl = resumed.searchUrl || buildGlassdoorSearchUrl(resumed.keywords, resumed.location, resumed.contracts);
       } else {
         targetUrl = buildLinkedInSearchUrl(resumed.keywords, resumed.location, resumed.contracts);
       }

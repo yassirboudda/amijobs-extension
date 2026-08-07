@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.3.1";
+  const VERSION = "1.3.2";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -61,10 +61,18 @@
   function buildSearchUrl(keywords, location, page = 0, session = null) {
     const host = getIndeedHost(session);
     const p = new URLSearchParams();
-    if (keywords) p.set("q", keywords);
+    let kw = keywords || "";
+    const contracts = session?.contracts || [];
+    const wantsFreelance = (contracts || []).some((c) =>
+      /freelance|independant|indépendant|contract/i.test(String(c))
+    );
+    if (wantsFreelance && kw && !/freelance/i.test(kw)) kw = `${kw} freelance`;
+    if (wantsFreelance && !kw) kw = "freelance";
+    if (kw) p.set("q", kw);
     if (location) p.set("l", location);
     p.set("iafilter", "1");
     p.set("fromage", "14");
+    if (wantsFreelance) p.set("sc", "0kf:attr(DSQF7);");
     if (page > 0) p.set("start", String(page * 10));
     return `${host}/jobs?${p.toString()}`;
   }
@@ -925,6 +933,20 @@
   async function handleSearchPage(session, settings) {
     const maxJobs = session.maxJobs || settings.maxJobsPerSession || 25;
     const appliedJobs = (await chrome.runtime.sendMessage({ action: "getState" }))?.appliedJobs || {};
+
+    // Yield Indeed SERP while Glassdoor owns the single Indeed tab for Smart Apply
+    const { sessionGlassdoor = null, glassdoorSmartApply = null } = await chrome.storage.local.get([
+      "sessionGlassdoor",
+      "glassdoorSmartApply",
+    ]);
+    if (
+      (sessionGlassdoor?.active && sessionGlassdoor?.awaitingIndeed) ||
+      (glassdoorSmartApply && Date.now() - (glassdoorSmartApply.at || 0) < 180000)
+    ) {
+      S().log(PLATFORM, "Pause SERP — Smart Apply Glassdoor en cours sur cet onglet", "warn");
+      await S().sleep(4000);
+      return;
+    }
 
     if ((session.applied || 0) >= maxJobs) {
       await endSession("Objectif session atteint");

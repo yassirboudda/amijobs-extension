@@ -1274,7 +1274,16 @@
               value = postalCodeValue;
               shouldFill = true;
             }
-          } else if (cityValue && !isSalaryField(fieldHint)) {
+          } else if (
+            cityValue &&
+            !isSalaryField(fieldHint) &&
+            !isEmailField(fieldHint) &&
+            !isPhoneField(fieldHint) &&
+            !isNameField(fieldHint) &&
+            !/cv|c\.v|résumé|resume|curriculum|fichier|file|upload|mot\s*de\s*passe|password|url|linkedin|github|portfolio/i.test(
+              fieldHint
+            )
+          ) {
             value = cityValue;
             shouldFill = true;
           }
