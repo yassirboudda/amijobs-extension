@@ -464,18 +464,17 @@ chrome.tabs.onCreated.addListener((tab) => {
 async function injectExternalApplyScripts(tabId) {
   try {
     await chrome.scripting.executeScript({
-      target: { tabId, allFrames: false },
+      target: { tabId, allFrames: true },
       files: ["content/shared-autofill.js", "content/google-recaptcha.js", "content/external-apply.js"],
     });
   } catch (_e) {
-    /* may already be injected */
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: false },
+        files: ["content/shared-autofill.js", "content/google-recaptcha.js", "content/external-apply.js"],
+      });
+    } catch (_e2) {}
   }
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      files: ["content/google-recaptcha.js"],
-    });
-  } catch (_e) {}
 }
 
 async function openExternalApply(msg = {}) {
@@ -565,7 +564,10 @@ async function openExternalApply(msg = {}) {
   await new Promise((r) => setTimeout(r, 1200));
 
   try {
-    await chrome.tabs.sendMessage(tabId, { action: "startExternalApply", jobInfo });
+    const kick = await chrome.tabs.sendMessage(tabId, { action: "startExternalApply", jobInfo });
+    if (kick?.reason === "navigating_to_ats") {
+      await appendLog("Navigation vers formulaire ATS…", "info", "external");
+    }
   } catch (_e) {
     await injectExternalApplyScripts(tabId);
     try {
@@ -575,7 +577,9 @@ async function openExternalApply(msg = {}) {
     }
   }
 
-  const deadline = Date.now() + 90000;
+  // Poll for result up to ~2.5 min (includes Station F → WelcomeKit navigation)
+  const deadline = Date.now() + 150000;
+  let lastInjectUrl = "";
   while (Date.now() < deadline) {
     const { sessionExternalApply = null } = await chrome.storage.local.get(["sessionExternalApply"]);
     if (sessionExternalApply?.done) {
@@ -587,7 +591,39 @@ async function openExternalApply(msg = {}) {
         url: sessionExternalApply.url || url,
       };
     }
-    await new Promise((r) => setTimeout(r, 1500));
+    try {
+      const t = await chrome.tabs.get(tabId);
+      const cur = t?.url || "";
+      if (
+        t?.status === "complete" &&
+        cur &&
+        cur !== lastInjectUrl &&
+        !/google\.com\/recaptcha|about:blank/i.test(cur)
+      ) {
+        lastInjectUrl = cur;
+        await injectExternalApplyScripts(tabId);
+        if (/welcomekit|greenhouse|lever|workable|ashby/i.test(cur)) {
+          chrome.tabs.sendMessage(tabId, { action: "startExternalApply", jobInfo }).catch(() => {});
+        }
+        // WelcomeKit post-submit page
+        if (/welcomekit\.co\/candidates(\?|$)/i.test(cur) && !/\/candidates\/new/i.test(cur)) {
+          await chrome.storage.local.set({
+            sessionExternalApply: {
+              ...(sessionExternalApply || {}),
+              active: false,
+              done: true,
+              ok: true,
+              reason: "welcomekit_submitted",
+              url: cur,
+              finishedAt: Date.now(),
+            },
+          });
+          await appendLog("Site entreprise: OK — WelcomeKit soumis", "success", "external");
+          continue;
+        }
+      }
+    } catch (_e) {}
+    await new Promise((r) => setTimeout(r, 2000));
   }
   await chrome.storage.local.set({
     sessionExternalApply: {

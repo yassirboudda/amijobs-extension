@@ -2,6 +2,15 @@
 // Runs on external career sites opened from LinkedIn (or other boards).
 (function () {
   if (window.__AmijobsExternalApplyLoaded) return;
+  // Never run the apply orchestrator inside reCAPTCHA / blank frames
+  const href = String(location.href || "");
+  if (/google\.com\/recaptcha|recaptcha\.net|about:blank/i.test(href)) return;
+  const isAtsFrame =
+    /welcomekit\.co|greenhouse\.io|lever\.co|workable\.com|ashbyhq\.com|bamboohr|jobvite|smartrecruiters|recruitee|personio|teamtailor/i.test(
+      location.hostname || ""
+    );
+  if (window.top !== window && !isAtsFrame) return;
+
   window.__AmijobsExternalApplyLoaded = true;
 
   const PLATFORM = "external";
@@ -22,22 +31,25 @@
   function isVisible(el) {
     if (!el) return false;
     const s = getComputedStyle(el);
-    if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") return false;
+    if (s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0) return false;
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   }
 
   function fieldHint(el) {
-    const id = el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`)?.textContent || "" : "";
+    const idLabel = el.id
+      ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`)?.textContent || ""
+      : "";
     return [
-      id,
+      idLabel,
       el.getAttribute("aria-label") || "",
       el.getAttribute("placeholder") || "",
       el.name || "",
       el.id || "",
       el.closest("label")?.textContent || "",
-      el.closest(".field, .form-group, [class*='form'], [class*='Field']")?.querySelector("label")
-        ?.textContent || "",
+      el.closest(".field, .form-group, [class*='form'], [class*='Field'], .input")?.querySelector(
+        "label"
+      )?.textContent || "",
     ]
       .join(" ")
       .toLowerCase();
@@ -86,6 +98,51 @@
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  function findEmbeddedAtsUrl() {
+    for (const frame of document.querySelectorAll("iframe")) {
+      const src = frame.src || "";
+      if (
+        /welcomekit\.co|greenhouse\.io|lever\.co|workable\.com|ashbyhq\.com|bamboohr\.com|jobvite\.com|smartrecruiters\.com|recruitee\.com|personio\.|teamtailor\.com/i.test(
+          src
+        )
+      ) {
+        return src;
+      }
+    }
+    return "";
+  }
+
+  async function openApplySurface() {
+    // Station F / many ATS: click APPLY NOW to reveal modal/iframe
+    const patterns = [
+      /apply now|postuler|je postule|candidater|postuler maintenant|apply for this job|soumettre/i,
+    ];
+    const blocked = /login|connexion|annuler|cancel|see other|autres offres/i;
+    for (const el of document.querySelectorAll("a, button")) {
+      if (!isVisible(el)) continue;
+      const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.trim();
+      if (!text || blocked.test(text)) continue;
+      if (!patterns.some((p) => p.test(text))) continue;
+      if (/btn-job-apply|job-apply|apply/i.test(el.className || "") || patterns[0].test(text)) {
+        log(`Clic ouverture formulaire: "${text.slice(0, 40)}"`);
+        try {
+          el.click();
+        } catch (_e) {}
+        await sleep(1800);
+        break;
+      }
+    }
+
+    const ats = findEmbeddedAtsUrl();
+    if (ats && !location.href.includes(ats.slice(0, 40))) {
+      log(`ATS iframe détecté — navigation: ${ats.slice(0, 100)}`);
+      // Navigate top page to the real form (iframe fill is flaky cross-origin)
+      window.location.href = ats;
+      return "navigating";
+    }
+    return "ready";
+  }
+
   async function fillTextFields(profile) {
     const fields = [...document.querySelectorAll("input, textarea, select")].filter(isVisible);
     let filled = 0;
@@ -101,26 +158,30 @@
       const hint = fieldHint(el);
       let value = "";
       if (/email|mail|courriel/i.test(hint) || type === "email") value = profile.email || "";
-      else if (/prénom|first\s*name|firstname/i.test(hint)) value = profile.firstName || profile.fullName?.split(" ")[0] || "";
-      else if (/nom|last\s*name|lastname|family/i.test(hint) && !/prénom|first/i.test(hint))
+      else if (/first\s*name|firstname|prénom|prenom/i.test(hint))
+        value = profile.firstName || profile.fullName?.split(" ")[0] || "";
+      else if (/last\s*name|lastname|nom de famille|family/i.test(hint) || (/lastname|last_name|\[lastname\]/i.test(hint)))
         value = profile.lastName || profile.fullName?.split(" ").slice(1).join(" ") || "";
-      else if (/full\s*name|nom complet|name/i.test(hint)) value = profile.fullName || "";
+      else if (/subtitle|current position|poste|title|titre/i.test(hint))
+        value = profile.title || "Freelance";
+      else if (/full\s*name|nom complet/i.test(hint)) value = profile.fullName || "";
       else if (/téléphone|telephone|phone|mobile|portable/i.test(hint) || type === "tel")
         value = profile.phone || "";
-      else if (/ville|city|localisation|location|adresse|address/i.test(hint))
-        value = profile.location || profile.city || "Paris";
-      else if (/code\s*postal|zip|postal/i.test(hint)) value = profile.postalCode || "75001";
+      else if (/zip|postal|code postal/i.test(hint)) value = profile.postalCode || "75001";
+      else if (/city|ville/i.test(hint)) value = profile.city || profile.location?.split(",")[0] || "Paris";
+      else if (/street|adresse|address/i.test(hint)) value = profile.location || "Paris";
       else if (/linkedin/i.test(hint)) value = profile.linkedin || "";
-      else if (/linkedin|github|portfolio|website|url|site/i.test(hint) && type === "url")
-        value = profile.linkedin || "";
-      else if (/lettre|cover|message|motivation|comment|about|pourquoi/i.test(hint) || el.tagName === "TEXTAREA")
+      else if (/cover|lettre|motivation|message|comment|pourquoi|about/i.test(hint) || el.tagName === "TEXTAREA")
         value =
           profile.coverLetterDefault ||
-          `Bonjour,\n\nJe suis ${profile.fullName || "intéressé(e)"} et disponible en freelance. Mon profil correspond à votre besoin.\n\nCordialement,\n${profile.fullName || ""}`;
+          `Bonjour,\n\nJe suis ${profile.fullName || "intéressé(e)"}, disponible en freelance, et motivé(e) par cette opportunité.\n\nCordialement,\n${profile.fullName || ""}`;
       else if (el.tagName === "SELECT") {
-        const opts = [...el.options].filter((o) => o.value && !/select|choisir|choose|--/i.test(o.text));
-        if (opts.length) {
-          el.value = opts[0].value;
+        const opts = [...el.options];
+        const fr =
+          opts.find((o) => /france|fr\b/i.test(`${o.text} ${o.value}`)) ||
+          opts.find((o) => o.value && !/select|choisir|choose|--|country/i.test(o.text));
+        if (fr) {
+          el.value = fr.value;
           el.dispatchEvent(new Event("change", { bubbles: true }));
           filled++;
         }
@@ -130,7 +191,7 @@
       if (value) {
         setNativeValue(el, value);
         filled++;
-        await sleep(jitter(120, 280));
+        await sleep(jitter(80, 200));
       }
     }
     return filled;
@@ -144,7 +205,7 @@
       if (/cgu|cgv|privacy|politique|accepte|consent|gdpr|rgpd|terms|condition/i.test(hint) || el.required) {
         el.click();
         n++;
-        await sleep(200);
+        await sleep(150);
       }
     }
     return n;
@@ -152,37 +213,34 @@
 
   async function clickRecaptcha() {
     try {
-      if (typeof window.__AmijobsClickRecaptcha === "function") {
-        window.__AmijobsClickRecaptcha();
-      }
+      if (typeof window.__AmijobsClickRecaptcha === "function") window.__AmijobsClickRecaptcha();
     } catch (_e) {}
     try {
       await chrome.runtime.sendMessage({ action: "clickRecaptcha" });
     } catch (_e) {}
     for (const frame of document.querySelectorAll('iframe[src*="recaptcha"]')) {
       try {
-        frame.click();
         const r = frame.getBoundingClientRect();
-        const ev = (type) =>
-          frame.dispatchEvent(
-            new MouseEvent(type, {
-              bubbles: true,
-              cancelable: true,
-              clientX: r.left + 28,
-              clientY: r.top + r.height / 2,
-              view: window,
-              buttons: 1,
-            })
-          );
-        for (const t of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) ev(t);
+        const o = {
+          bubbles: true,
+          cancelable: true,
+          clientX: r.left + 28,
+          clientY: r.top + r.height / 2,
+          view: window,
+          buttons: 1,
+        };
+        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+          frame.dispatchEvent(new MouseEvent(type, o));
+        }
+        frame.click();
       } catch (_e) {}
     }
-    await sleep(1200);
+    await sleep(1500);
   }
 
   function findSubmit() {
     const patterns = [
-      /envoyer|submit|postuler|apply|candidater|send application|je postule|envoyer ma candidature|submit application|apply now|envoyer le formulaire/i,
+      /envoyer|submit|postuler|apply|candidater|send application|je postule|envoyer ma candidature|submit application|apply now|apply ›|apply >/i,
     ];
     const blocked = /annuler|cancel|retour|back|login|connexion|sauvegarder|save draft/i;
     let best = null;
@@ -193,7 +251,7 @@
       if (!text || blocked.test(text)) continue;
       if (!patterns.some((p) => p.test(text))) continue;
       let score = 1;
-      if (/postuler|apply now|envoyer ma candidature|submit application/i.test(text)) score += 5;
+      if (/postuler|apply|envoyer ma candidature|submit/i.test(text)) score += 5;
       if (el.tagName === "BUTTON" || el.type === "submit") score += 2;
       if (score > bestScore) {
         bestScore = score;
@@ -205,8 +263,16 @@
 
   function successDetected() {
     const t = (document.body?.innerText || "").toLowerCase();
-    return /merci|thank you|candidature envoyée|application (submitted|received|sent)|nous avons bien reçu|successfully submitted/i.test(
+    const u = location.href.toLowerCase();
+    if (/welcomekit\.co\/candidates(\?|$)/i.test(u) && !/\/candidates\/new/i.test(u)) return true;
+    return /merci|thank you|candidature envoyée|application (submitted|received|sent)|nous avons bien reçu|successfully submitted|application sent|your application has been|candidature a bien été/i.test(
       t
+    );
+  }
+
+  function hasFormFields() {
+    return [...document.querySelectorAll("input, textarea, select")].some(
+      (el) => isVisible(el) && !["hidden", "submit", "button"].includes((el.type || "").toLowerCase())
     );
   }
 
@@ -219,8 +285,21 @@
       const cv = await getCvFile();
       if (!cv?.base64) log("Aucun fichier CV configuré — upload fichier impossible", "warn");
 
-      await sleep(jitter(800, 1400));
-      for (let step = 0; step < 6; step++) {
+      await sleep(jitter(600, 1100));
+      const openState = await openApplySurface();
+      if (openState === "navigating") {
+        // Page will reload into ATS; sessionExternalApply.active keeps auto-start
+        running = false;
+        return { ok: false, reason: "navigating_to_ats" };
+      }
+
+      // Wait for form fields (WelcomeKit etc.)
+      for (let w = 0; w < 15 && !hasFormFields(); w++) {
+        await openApplySurface();
+        await sleep(800);
+      }
+
+      for (let step = 0; step < 8; step++) {
         if (successDetected()) {
           log("Succès détecté sur la page", "success");
           await chrome.runtime.sendMessage({
@@ -247,7 +326,7 @@
         const label = (btn.textContent || btn.value || "submit").trim().slice(0, 60);
         log(`Clic submit: "${label}"`);
         btn.click();
-        await sleep(jitter(1800, 3200));
+        await sleep(jitter(2000, 3500));
 
         if (successDetected()) {
           await chrome.runtime.sendMessage({
@@ -263,15 +342,17 @@
       }
 
       const maybeOk = successDetected();
+      // If we filled fields + clicked apply, treat as soft success when autoSubmit pages don't confirm
+      const softOk = maybeOk || (document.querySelector('input[type="file"]')?.files?.length > 0);
       await chrome.runtime.sendMessage({
         action: "externalApplyResult",
-        ok: maybeOk,
-        reason: maybeOk ? "success_page" : "timeout_or_incomplete",
+        ok: !!maybeOk,
+        reason: maybeOk ? "success_page" : softOk ? "filled_submitted_unconfirmed" : "timeout_or_incomplete",
         jobInfo,
         url: location.href,
       });
       running = false;
-      return { ok: maybeOk, reason: maybeOk ? "success_page" : "timeout_or_incomplete" };
+      return { ok: !!maybeOk, reason: maybeOk ? "success_page" : "timeout_or_incomplete" };
     } catch (e) {
       log(`Erreur: ${e.message}`, "error");
       await chrome.runtime.sendMessage({
@@ -297,17 +378,11 @@
     }
   });
 
-  // Auto-start when session flag is set for this tab's URL
   (async () => {
     const { sessionExternalApply = null } = await chrome.storage.local.get(["sessionExternalApply"]);
-    if (!sessionExternalApply?.active) return;
-    const target = sessionExternalApply.url || "";
-    if (target && location.href.startsWith(target.split("?")[0].slice(0, 60))) {
-      await sleep(1500);
-      await runExternalApply(sessionExternalApply.jobInfo || {});
-    } else if (sessionExternalApply.active && !/linkedin\.com|indeed\.|glassdoor\.|hellowork\.com/i.test(location.href)) {
-      await sleep(2000);
-      await runExternalApply(sessionExternalApply.jobInfo || {});
-    }
+    if (!sessionExternalApply?.active || sessionExternalApply?.done) return;
+    if (/linkedin\.com|indeed\.|glassdoor\.|hellowork\.com/i.test(location.href)) return;
+    await sleep(1500);
+    await runExternalApply(sessionExternalApply.jobInfo || {});
   })();
 })();
