@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.5";
+  const VERSION = "1.3.6";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -324,6 +324,37 @@
     return { jobId, title, company, location, url: window.location.href };
   }
 
+  function isCompanySiteApplyButton(btn) {
+    if (!btn) return false;
+    const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.toLowerCase();
+    return /site (de l['’]entreprise|de l['’]employeur)|company (site|website)|sur le site|externe|external apply|employer site|site du recruteur/i.test(
+      text
+    );
+  }
+
+  function findCompanySiteButton() {
+    const selectors = [
+      'a[data-test*="apply" i]',
+      'button[data-test*="apply" i]',
+      'a[href*="partner"]',
+      'a[href*="external"]',
+      'a[target="_blank"]',
+    ];
+    for (const sel of selectors) {
+      const nodes = document.querySelectorAll(sel);
+      for (const el of nodes) {
+        if (S().isVisible(el) && isCompanySiteApplyButton(el)) return el;
+      }
+    }
+    return S().findActionButton([
+      /site (de l['’]entreprise|de l['’]employeur|du recruteur)/i,
+      /company (site|website)/i,
+      /postuler sur le site/i,
+      /apply on (company|employer)/i,
+      /external apply/i,
+    ]);
+  }
+
   function findApplyButton() {
     // Live headed Chrome (HAR cookies): button[data-test="easyApply"] text "Candidature facile"
     // → opens smartapply.indeed.com/beta/indeedapply/applybyapplyablejobid?...
@@ -352,6 +383,32 @@
       /apply now/i,
       /quick apply/i,
     ]);
+  }
+
+  async function tryCompanySiteApply(settings, jobInfo, clickEl = null) {
+    if (settings?.allowExternalApply === false) {
+      return { success: false, reason: "external_disabled" };
+    }
+    if (!window.AmiJobsCompanySite) {
+      return { success: false, reason: "company_site_bridge_missing" };
+    }
+    const btn = clickEl || findCompanySiteButton();
+    if (!btn) return { success: false, reason: "no_company_site" };
+    S().log(PLATFORM, `Site entreprise détecté — candidature externe: ${jobInfo.title || jobInfo.jobId}`);
+    const extRes = await window.AmiJobsCompanySite.apply({
+      clickEl: btn,
+      jobInfo: {
+        jobId: jobInfo.jobId,
+        title: jobInfo.title,
+        company: jobInfo.company,
+        url: jobInfo.url || window.location.href,
+      },
+      sourcePlatform: "glassdoor",
+    });
+    if (extRes?.ok || extRes?.success) {
+      return { success: true, reason: "company_site_applied", url: extRes.url };
+    }
+    return { success: false, reason: extRes?.reason || "company_site_apply" };
   }
 
   function detectApplySuccess() {
@@ -420,7 +477,15 @@
   async function applyCurrentJob(settings, jobInfo) {
     const info = jobInfo || getJobInfo("current");
     const btn = await waitForApplyButton();
-    if (!btn) return { success: false, reason: "no_easy_apply" };
+    if (!btn) {
+      const companyRes = await tryCompanySiteApply(settings, info);
+      if (companyRes.success || companyRes.reason !== "no_company_site") return companyRes;
+      return { success: false, reason: "no_easy_apply" };
+    }
+
+    if (isCompanySiteApplyButton(btn)) {
+      return tryCompanySiteApply(settings, info, btn);
+    }
 
     // Persist context so Indeed Smart Apply tab can resume
     const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
@@ -633,7 +698,8 @@
         }
 
         const btn = await waitForApplyButton(8000);
-        if (!btn) {
+        const companyBtn = !btn ? findCompanySiteButton() : null;
+        if (!btn && !companyBtn) {
           await chrome.runtime.sendMessage({
             action: "markSkipped",
             platform: PLATFORM,
@@ -646,6 +712,22 @@
 
         const result = await applyCurrentJob(settings, jobInfo);
         if (result.success) {
+          if (/company_site/i.test(String(result.reason || ""))) {
+            await chrome.runtime.sendMessage({
+              action: "markApplied",
+              platform: PLATFORM,
+              jobId: jobInfo.jobId,
+              title: jobInfo.title,
+              company: jobInfo.company,
+              url: result.url || jobInfo.url,
+            });
+            appliedThisRun++;
+            S().log(PLATFORM, `Postulé (site entreprise): ${jobInfo.title}`, "success");
+            const jobDelayCs = Math.max(settings.delayBetweenJobs?.min || 500, 2500);
+            const jobDelayCsMax = Math.max(settings.delayBetweenJobs?.max || jobDelayCs, jobDelayCs);
+            await S().sleep(S().randomDelay(jobDelayCs, jobDelayCsMax));
+            continue;
+          }
           const isIndeedHandoff = /indeed/i.test(String(result.reason || ""));
           if (isIndeedHandoff) {
             S().log(PLATFORM, `Handoff Indeed: ${jobInfo.title} — attente Smart Apply`, "success");

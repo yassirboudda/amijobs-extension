@@ -14,7 +14,7 @@
   if (window.__AmijobsLinkedinLoaded) return;
   window.__AmijobsLinkedinLoaded = true;
 
-  const VERSION = "1.3.5";
+  const VERSION = "1.3.6";
   let isRunning = false;
   let shouldStop = false;
   const sessionStats = { applied: 0, skipped: 0, errors: 0 };
@@ -465,60 +465,19 @@
   }
 
   async function requestExternalApply(jobInfo) {
-    let externalUrl = getExternalApplyUrl();
-    const externalBtn = findExternalApplyButton();
-
-    // If no direct URL, click the button and capture the opened company-site tab
-    if (!externalUrl && externalBtn?.element) {
-      log(`[External] Clic bouton site entreprise…`, "info");
-      await chrome.runtime.sendMessage({ action: "watchNextExternalTab", timeoutMs: 15000 }).catch(() => {});
-      try {
-        externalBtn.element.setAttribute("target", "_blank");
-      } catch (_e) {}
-      try {
-        externalBtn.element.click();
-      } catch (_e) {}
-      for (let i = 0; i < 12; i++) {
-        await sleep(1000);
-        const watched = await chrome.runtime.sendMessage({ action: "getWatchedExternalTab" }).catch(() => null);
-        const u = watched?.url || "";
-        if (u && !/linkedin\.com/i.test(u) && u.startsWith("http")) {
-          externalUrl = u;
-          break;
-        }
-        // Sometimes LinkedIn navigates current tab briefly — ignore
-      }
-    }
-
-    if (!externalUrl) {
-      // Last resort: open the LinkedIn job view apply redirect if present
-      const viewLink = $$('a[href*="externalApply"], a[href*="offsite"]')
-        .map((a) => a.href)
-        .find((h) => h && h.startsWith("http"));
-      if (viewLink) externalUrl = viewLink;
-    }
-
-    if (!externalUrl) {
-      log(`[External] Pas d'URL externe trouvée pour: ${jobInfo.title}`, "warn");
-      return { success: false, reason: "no_external_url" };
-    }
-
-    log(`[External] Candidature sur site entreprise: ${externalUrl}`, "info");
-    try {
-      const resp = await chrome.runtime.sendMessage({
-        action: "openExternalApply",
-        url: externalUrl,
+    if (window.AmiJobsCompanySite) {
+      const externalBtn = findExternalApplyButton();
+      const url = getExternalApplyUrl() || externalBtn?.url || "";
+      log(`[External] Candidature sur site entreprise…`, "info");
+      return window.AmiJobsCompanySite.apply({
+        url,
+        clickEl: externalBtn?.element || null,
         jobInfo,
         sourcePlatform: "linkedin",
-        platform: "linkedin",
       });
-      if (resp?.ok || resp?.success) {
-        return { success: true, reason: resp.reason || "ok" };
-      }
-      return { success: false, reason: resp?.reason || "external_failed" };
-    } catch (err) {
-      return { success: false, reason: err.message };
     }
+    // Fallback (should not happen if company-site.js is injected)
+    return { success: false, reason: "company_site_bridge_missing" };
   }
 
   function isModalOpen() {

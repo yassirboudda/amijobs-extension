@@ -3,7 +3,7 @@
   window.__AmijobsHelloworkLoaded = true;
 
   // v1.0.26 — Blacklisted companies (profil candidat)
-  const VERSION = "1.3.5";
+  const VERSION = "1.3.6";
   let isRunning = false;
   let shouldStop = false;
 
@@ -1781,24 +1781,64 @@
       return;
     }
 
-    // External flow: "Postuler sur le site du recruteur" should be skipped to avoid leaving Hellowork.
+    // External flow: "Postuler sur le site du recruteur / partenaire" → company website apply
     const recruiterBtn = findRecruiterSiteButton();
     if (recruiterBtn) {
-      const refreshedBeforeSkip = await getSession();
-      const externalSiteOffers = refreshedBeforeSkip?.externalSiteOffers || {};
-      await setSession({
-        phase: "search",
-        currentOfferUrl: "",
-        externalSiteOffers: { ...externalSiteOffers, [offerKey]: true },
-      });
-      await chrome.runtime.sendMessage({
-        action: "markSkipped", platform: "hellowork",
-        jobId,
-        title,
-        url: window.location.href,
-        reason: "Postuler sur le site du recruteur",
-      });
-      log("Offre ignorée (site du recruteur): " + title, "warn");
+      const refreshedBefore = await getSession();
+      const allowExternal = (await chrome.storage.local.get(["autoApplySettings"])).autoApplySettings
+        ?.allowExternalApply !== false;
+      const externalSiteOffers = refreshedBefore?.externalSiteOffers || {};
+
+      if (allowExternal && window.AmiJobsCompanySite) {
+        log("Site recruteur/partenaire — candidature externe: " + title, "info");
+        const extRes = await window.AmiJobsCompanySite.apply({
+          clickEl: recruiterBtn,
+          url: recruiterBtn.href || recruiterBtn.getAttribute?.("href") || "",
+          jobInfo: { jobId, title, company, url: window.location.href },
+          sourcePlatform: "hellowork",
+        });
+        await setSession({
+          phase: "search",
+          currentOfferUrl: "",
+          externalSiteOffers: { ...externalSiteOffers, [offerKey]: true },
+        });
+        if (extRes?.ok || extRes?.success) {
+          await chrome.runtime.sendMessage({
+            action: "markApplied",
+            platform: "hellowork",
+            jobId,
+            title,
+            company,
+            url: extRes.url || window.location.href,
+          });
+          log("Postulé (site entreprise): " + title, "success");
+        } else {
+          await chrome.runtime.sendMessage({
+            action: "markSkipped",
+            platform: "hellowork",
+            jobId,
+            title,
+            url: window.location.href,
+            reason: `Site entreprise: ${extRes?.reason || "échec"}`,
+          });
+          log("Échec site entreprise: " + (extRes?.reason || "inconnu"), "warn");
+        }
+      } else {
+        await setSession({
+          phase: "search",
+          currentOfferUrl: "",
+          externalSiteOffers: { ...externalSiteOffers, [offerKey]: true },
+        });
+        await chrome.runtime.sendMessage({
+          action: "markSkipped",
+          platform: "hellowork",
+          jobId,
+          title,
+          url: window.location.href,
+          reason: "Postuler sur le site du recruteur",
+        });
+        log("Offre ignorée (site du recruteur): " + title, "warn");
+      }
       const refreshed = await getSession();
       const backUrl = sessionSearchReturnUrl(refreshed, refreshed?.resumeSearchUrl || "");
       if (backUrl) {

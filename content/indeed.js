@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.3.5";
+  const VERSION = "1.3.6";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -885,7 +885,27 @@
     const btn = await waitForApplyButton();
     if (!btn) return { success: false, reason: "no_indeed_apply" };
     if (isCompanySiteApplyButton(btn)) {
-      return { success: false, reason: "company_site_apply" };
+      if (settings?.allowExternalApply === false) {
+        return { success: false, reason: "company_site_apply" };
+      }
+      if (!window.AmiJobsCompanySite) {
+        return { success: false, reason: "company_site_apply" };
+      }
+      S().log(PLATFORM, `Site entreprise détecté — candidature externe: ${info.title || info.jobId}`);
+      const extRes = await window.AmiJobsCompanySite.apply({
+        clickEl: btn,
+        jobInfo: {
+          jobId: info.jobId,
+          title: info.title,
+          company: info.company,
+          url: info.url || window.location.href,
+        },
+        sourcePlatform: "indeed",
+      });
+      if (extRes?.ok || extRes?.success) {
+        return { success: true, reason: "company_site_applied", url: extRes.url };
+      }
+      return { success: false, reason: extRes?.reason || "company_site_apply" };
     }
 
     const popupPromise = new Promise((resolve) => {
@@ -909,9 +929,27 @@
       return runApplyWizard(info, settings);
     }
 
-    // Left Indeed entirely (external ATS) — skip
+    // Left Indeed entirely (external ATS) — hand off to company-site apply worker
     if (!/indeed\.(com|fr)|smartapply/i.test(window.location.hostname)) {
-      return { success: false, reason: "external_ats" };
+      if (settings?.allowExternalApply === false || !window.AmiJobsCompanySite) {
+        return { success: false, reason: "external_ats" };
+      }
+      const externalUrl = window.location.href;
+      S().log(PLATFORM, `ATS externe détecté — candidature: ${externalUrl.slice(0, 100)}`);
+      const extRes = await window.AmiJobsCompanySite.apply({
+        url: externalUrl,
+        jobInfo: {
+          jobId: info.jobId,
+          title: info.title,
+          company: info.company,
+          url: info.url || externalUrl,
+        },
+        sourcePlatform: "indeed",
+      });
+      if (extRes?.ok || extRes?.success) {
+        return { success: true, reason: "company_site_applied", url: extRes.url || externalUrl };
+      }
+      return { success: false, reason: extRes?.reason || "external_ats" };
     }
 
     const opened = await popupPromise;
@@ -1161,6 +1199,23 @@
       return;
     }
 
+    if (result.reason === "company_site_applied" || (result.success && /company_site/i.test(result.reason || ""))) {
+      await chrome.runtime.sendMessage({
+        action: "markApplied",
+        platform: PLATFORM,
+        jobId: jobInfo.jobId,
+        title: jobInfo.title,
+        company: jobInfo.company,
+        url: result.url || jobInfo.url,
+      });
+      S().log(PLATFORM, `Postulé (site entreprise): ${jobInfo.title}`, "success");
+      await setSession({ phase: "search" });
+      window.location.href =
+        session.searchUrl ||
+        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      return;
+    }
+
     if (
       result.reason === "company_site_apply" ||
       result.reason === "external_ats" ||
@@ -1171,7 +1226,7 @@
         platform: PLATFORM,
         jobId: jobInfo.jobId,
         title: jobInfo.title,
-        reason: "Pas de Smart Apply Indeed",
+        reason: result.reason === "company_site_apply" ? "Site entreprise (échec/indisponible)" : "Pas de Smart Apply Indeed",
       });
       await setSession({ phase: "search" });
       window.location.href =
