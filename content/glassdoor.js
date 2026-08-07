@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.6";
+  const VERSION = "1.3.7";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -395,16 +395,19 @@
     const btn = clickEl || findCompanySiteButton();
     if (!btn) return { success: false, reason: "no_company_site" };
     S().log(PLATFORM, `Site entreprise détecté — candidature externe: ${jobInfo.title || jobInfo.jobId}`);
-    const extRes = await window.AmiJobsCompanySite.apply({
-      clickEl: btn,
-      jobInfo: {
-        jobId: jobInfo.jobId,
-        title: jobInfo.title,
-        company: jobInfo.company,
-        url: jobInfo.url || window.location.href,
-      },
-      sourcePlatform: "glassdoor",
-    });
+    const extRes = await Promise.race([
+      window.AmiJobsCompanySite.apply({
+        clickEl: btn,
+        jobInfo: {
+          jobId: jobInfo.jobId,
+          title: jobInfo.title,
+          company: jobInfo.company,
+          url: jobInfo.url || window.location.href,
+        },
+        sourcePlatform: "glassdoor",
+      }),
+      S().sleep(55000).then(() => ({ ok: false, success: false, reason: "timeout" })),
+    ]);
     if (extRes?.ok || extRes?.success) {
       return { success: true, reason: "company_site_applied", url: extRes.url };
     }

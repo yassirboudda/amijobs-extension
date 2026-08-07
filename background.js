@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.3.6";
+const EXT_VERSION = "1.3.7";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -308,20 +308,27 @@ const lastPlatformReopenAt = Object.create(null);
 const platformReopenCount = Object.create(null);
 
 function detectPlatformFromUrl(url = "") {
-  const u = String(url || "");
-  if (!u || u.startsWith("chrome") || u.startsWith("about:")) return null;
-  if (/hellowork\.com/i.test(u)) return "hellowork";
-  if (/linkedin\.com/i.test(u)) return "linkedin";
-  if (/smartapply\.indeed\.com|indeed\.(com|fr)/i.test(u)) return "indeed";
-  if (/glassdoor\.(com|fr)/i.test(u)) return "glassdoor";
+  const raw = String(url || "");
+  if (!raw || raw.startsWith("chrome") || raw.startsWith("about:")) return null;
+  try {
+    const host = new URL(raw).hostname.replace(/^www\./i, "").toLowerCase();
+    if (host === "hellowork.com" || host.endsWith(".hellowork.com")) return "hellowork";
+    if (host === "linkedin.com" || host.endsWith(".linkedin.com")) return "linkedin";
+    if (host === "smartapply.indeed.com" || host === "indeed.com" || host === "indeed.fr" || host.endsWith(".indeed.com"))
+      return "indeed";
+    if (host === "glassdoor.com" || host === "glassdoor.fr" || host.endsWith(".glassdoor.com")) return "glassdoor";
+  } catch (_e) {
+    // Fallback for incomplete URLs
+    if (/^https?:\/\/([^/]*\.)?hellowork\.com(\/|$)/i.test(raw)) return "hellowork";
+    if (/^https?:\/\/([^/]*\.)?linkedin\.com(\/|$)/i.test(raw)) return "linkedin";
+    if (/^https?:\/\/([^/]*\.)?(smartapply\.)?indeed\.(com|fr)(\/|$)/i.test(raw)) return "indeed";
+    if (/^https?:\/\/([^/]*\.)?glassdoor\.(com|fr)(\/|$)/i.test(raw)) return "glassdoor";
+  }
   return null;
 }
 
 function tabMatchesPlatform(tab, platform) {
-  const url = tab?.url || "";
-  if (!url) return false;
-  const patterns = PLATFORM_URL_MATCH[platform] || [];
-  return patterns.some((p) => url.includes(p));
+  return detectPlatformFromUrl(tab?.url || "") === platform;
 }
 
 async function listPlatformTabs(platform) {
@@ -496,6 +503,15 @@ async function openExternalApply(msg = {}) {
     return { ok: false, success: false, reason: "no_url" };
   }
 
+  // Never open job-board pages as "company site" — causes HelloWork #postuler open/close loops
+  const isBoard =
+    /hellowork\.com|indeed\.(com|fr)|smartapply\.indeed|glassdoor\.(com|fr)/i.test(url) ||
+    (/linkedin\.com/i.test(url) && !/externalApply|offsite|\/jobs\/view\/external/i.test(url));
+  if (isBoard) {
+    await appendLog(`Refus site entreprise (URL job board): ${url.slice(0, 100)}`, "warn", "external");
+    return { ok: false, success: false, reason: "job_board_url", url };
+  }
+
   await chrome.storage.local.set({
     sessionExternalApply: {
       active: true,
@@ -523,6 +539,19 @@ async function openExternalApply(msg = {}) {
       await chrome.tabs.update(tabId, { url, active: false });
     }
   } else {
+    // Close stale Free-Work / Google-login leftovers from previous attempts
+    try {
+      const all = await chrome.tabs.query({});
+      for (const t of all) {
+        const u = t.url || "";
+        if (
+          /free-work\.com|accounts\.google\.com|welcomekit\.co|greenhouse\.io|lever\.co/i.test(u) &&
+          !detectPlatformFromUrl(u)
+        ) {
+          await chrome.tabs.remove(t.id).catch(() => {});
+        }
+      }
+    } catch (_e) {}
     const created = await chrome.tabs.create({ url, active: false });
     tabId = created?.id || null;
     externalApplyTabId = tabId;
@@ -577,8 +606,8 @@ async function openExternalApply(msg = {}) {
     }
   }
 
-  // Poll for result up to ~2.5 min (includes Station F → WelcomeKit navigation)
-  const deadline = Date.now() + 150000;
+  // Poll for result — fail fast on login walls; keep ~75s for real ATS (WelcomeKit)
+  const deadline = Date.now() + 75000;
   let lastInjectUrl = "";
   while (Date.now() < deadline) {
     const { sessionExternalApply = null } = await chrome.storage.local.get(["sessionExternalApply"]);
@@ -594,6 +623,22 @@ async function openExternalApply(msg = {}) {
     try {
       const t = await chrome.tabs.get(tabId);
       const cur = t?.url || "";
+      if (/accounts\.google\.com|\/signin|\/login|auth0\.com|okta\.com|microsoftonline\.com/i.test(cur)) {
+        await chrome.storage.local.set({
+          sessionExternalApply: {
+            ...(sessionExternalApply || {}),
+            active: false,
+            done: true,
+            ok: false,
+            reason: "login_wall",
+            url: cur,
+            finishedAt: Date.now(),
+          },
+        });
+        await appendLog(`Site entreprise: login requis — skip (${cur.slice(0, 80)})`, "warn", "external");
+        pendingExternalTabWatch = null;
+        return { ok: false, success: false, reason: "login_wall", url: cur };
+      }
       if (
         t?.status === "complete" &&
         cur &&
@@ -1258,16 +1303,45 @@ async function ensureActiveSessionTabs() {
         continue;
       }
       if (existing.length === 1) {
+        const tabUrl = existing[0].url || "";
         // LinkedIn often lands on /feed after auth — nudge back to jobs search.
         if (platform === "linkedin") {
-          const url = existing[0].url || "";
-          if (!/\/jobs/i.test(url) && !/checkpoint|login|authwall|uas\//i.test(url)) {
+          if (!/\/jobs/i.test(tabUrl) && !/checkpoint|login|authwall|uas\//i.test(tabUrl)) {
             const now = Date.now();
             const last = lastPlatformReopenAt[platform] || 0;
             if (now - last >= 20000) {
               lastPlatformReopenAt[platform] = now;
               await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
               await appendLog("Onglet LinkedIn ramené vers la recherche", "warn", platform);
+            }
+          }
+        }
+        // HelloWork hijacked by Free-Work / Google OAuth in the same tab
+        if (platform === "hellowork") {
+          if (/accounts\.google\.com|free-work\.com|\/signin|\/login/i.test(tabUrl)) {
+            const now = Date.now();
+            const last = lastPlatformReopenAt[platform] || 0;
+            if (now - last >= 12000) {
+              lastPlatformReopenAt[platform] = now;
+              await chrome.storage.local.set({
+                sessionHellowork: {
+                  ...session,
+                  phase: "search",
+                  currentOfferUrl: "",
+                },
+              });
+              // Close orphan Google/Free-Work tabs left behind
+              try {
+                const all = await chrome.tabs.query({});
+                for (const t of all) {
+                  const u = t.url || "";
+                  if (/accounts\.google\.com|free-work\.com/i.test(u) && t.id !== existing[0].id) {
+                    await chrome.tabs.remove(t.id).catch(() => {});
+                  }
+                }
+              } catch (_e) {}
+              await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
+              await appendLog("Onglet HelloWork ramené (login partenaire)", "warn", platform);
             }
           }
         }
@@ -1284,6 +1358,20 @@ async function ensureActiveSessionTabs() {
       if (count >= maxReopens) continue;
       lastPlatformReopenAt[platform] = now;
       platformReopenCount[platform] = count + 1;
+      if (platform === "hellowork") {
+        try {
+          const all = await chrome.tabs.query({});
+          for (const t of all) {
+            const u = t.url || "";
+            if (/accounts\.google\.com|free-work\.com/i.test(u)) {
+              await chrome.tabs.remove(t.id).catch(() => {});
+            }
+          }
+        } catch (_e) {}
+        await chrome.storage.local.set({
+          sessionHellowork: { ...session, phase: "search", currentOfferUrl: "" },
+        });
+      }
       await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
       await appendLog(`Onglet ${platform} restauré (manquant)`, "warn", platform);
     }

@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.3.6";
+  const VERSION = "1.3.7";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -892,16 +892,19 @@
         return { success: false, reason: "company_site_apply" };
       }
       S().log(PLATFORM, `Site entreprise détecté — candidature externe: ${info.title || info.jobId}`);
-      const extRes = await window.AmiJobsCompanySite.apply({
-        clickEl: btn,
-        jobInfo: {
-          jobId: info.jobId,
-          title: info.title,
-          company: info.company,
-          url: info.url || window.location.href,
-        },
-        sourcePlatform: "indeed",
-      });
+      const extRes = await Promise.race([
+        window.AmiJobsCompanySite.apply({
+          clickEl: btn,
+          jobInfo: {
+            jobId: info.jobId,
+            title: info.title,
+            company: info.company,
+            url: info.url || window.location.href,
+          },
+          sourcePlatform: "indeed",
+        }),
+        S().sleep(55000).then(() => ({ ok: false, success: false, reason: "timeout" })),
+      ]);
       if (extRes?.ok || extRes?.success) {
         return { success: true, reason: "company_site_applied", url: extRes.url };
       }
@@ -936,16 +939,19 @@
       }
       const externalUrl = window.location.href;
       S().log(PLATFORM, `ATS externe détecté — candidature: ${externalUrl.slice(0, 100)}`);
-      const extRes = await window.AmiJobsCompanySite.apply({
-        url: externalUrl,
-        jobInfo: {
-          jobId: info.jobId,
-          title: info.title,
-          company: info.company,
-          url: info.url || externalUrl,
-        },
-        sourcePlatform: "indeed",
-      });
+      const extRes = await Promise.race([
+        window.AmiJobsCompanySite.apply({
+          url: externalUrl,
+          jobInfo: {
+            jobId: info.jobId,
+            title: info.title,
+            company: info.company,
+            url: info.url || externalUrl,
+          },
+          sourcePlatform: "indeed",
+        }),
+        S().sleep(55000).then(() => ({ ok: false, success: false, reason: "timeout" })),
+      ]);
       if (extRes?.ok || extRes?.success) {
         return { success: true, reason: "company_site_applied", url: extRes.url || externalUrl };
       }
@@ -977,10 +983,18 @@
       "sessionGlassdoor",
       "glassdoorSmartApply",
     ]);
-    if (
-      (sessionGlassdoor?.active && sessionGlassdoor?.awaitingIndeed) ||
-      (glassdoorSmartApply && Date.now() - (glassdoorSmartApply.at || 0) < 180000)
-    ) {
+    const gdAwaiting = !!(sessionGlassdoor?.active && sessionGlassdoor?.awaitingIndeed);
+    const gdSmartAge = glassdoorSmartApply ? Date.now() - (glassdoorSmartApply.at || 0) : 999999;
+    const gdAwaitAge = gdAwaiting
+      ? Date.now() - (sessionGlassdoor.lastRunAt || sessionGlassdoor.startedAt || Date.now())
+      : 999999;
+    // Stale Glassdoor handoff must not freeze Indeed forever
+    if (gdAwaiting && gdAwaitAge > 75000) {
+      S().log(PLATFORM, "Libération Pause SERP — handoff Glassdoor expiré", "warn");
+      await chrome.storage.local.set({
+        sessionGlassdoor: { ...sessionGlassdoor, awaitingIndeed: false, indeedHandoffDone: false },
+      });
+    } else if (gdAwaiting || gdSmartAge < 90000) {
       S().log(PLATFORM, "Pause SERP — Smart Apply Glassdoor en cours sur cet onglet", "warn");
       await S().sleep(4000);
       return;
