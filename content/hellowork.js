@@ -3,7 +3,7 @@
   window.__AmijobsHelloworkLoaded = true;
 
   // v1.0.26 — Blacklisted companies (profil candidat)
-  const VERSION = "1.3.4";
+  const VERSION = "1.3.5";
   let isRunning = false;
   let shouldStop = false;
 

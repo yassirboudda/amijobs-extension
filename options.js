@@ -1,5 +1,7 @@
 const $ = (id) => document.getElementById(id);
 
+let pendingCvFile = null; // { name, mime, base64, size, savedAt } waiting to save
+
 function updateBlacklistCount(count) {
   const badge = $("blacklistCount");
   if (!badge) return;
@@ -9,6 +11,44 @@ function updateBlacklistCount(count) {
   } else {
     badge.style.display = "none";
   }
+}
+
+function updateCvStatus(cvFile) {
+  const el = $("cvFileStatus");
+  if (!el) return;
+  if (cvFile?.name) {
+    const kb = Math.round((cvFile.size || 0) / 1024);
+    el.textContent = `CV enregistré: ${cvFile.name} (${kb} Ko) — prêt pour les uploads sur sites entreprise.`;
+    el.style.color = "#059669";
+  } else {
+    el.textContent =
+      "Aucun fichier. Chrome ne peut pas lire un chemin disque : choisissez le fichier ici, AmiJobs en enregistre une copie localement pour les uploads.";
+    el.style.color = "";
+  }
+}
+
+function readFileAsCv(file) {
+  return new Promise((resolve, reject) => {
+    if (!file) return resolve(null);
+    if (file.size > 4.5 * 1024 * 1024) {
+      reject(new Error("CV trop volumineux (max ~4,5 Mo)"));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || "");
+      const base64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
+      resolve({
+        name: file.name,
+        mime: file.type || "application/pdf",
+        base64,
+        size: file.size,
+        savedAt: new Date().toISOString(),
+      });
+    };
+    reader.onerror = () => reject(reader.error || new Error("Lecture CV impossible"));
+    reader.readAsDataURL(file);
+  });
 }
 
 async function applyI18n() {
@@ -35,6 +75,7 @@ async function load() {
     "blacklistedCompanies",
     "uiSettings",
     "cvText",
+    "cvFile",
   ]);
   const profile = data.profile || {};
   const settings = data.autoApplySettings || {};
@@ -56,6 +97,7 @@ async function load() {
   $("availability").value = profile.availability || "";
   $("salaryExpectation").value = profile.salaryExpectation || "";
   $("cvText").value = profile.cvText || data.cvText || "";
+  updateCvStatus(data.cvFile || null);
 
   const blacklist = data.blacklistedCompanies || [];
   $("blacklistedCompanies").value = blacklist.join("\n");
@@ -71,6 +113,7 @@ async function load() {
   $("delayStepMax").value = settings.delayBetweenSteps?.max || 100;
   $("autoSubmit").checked = settings.autoSubmit !== false;
   $("onlyEasyApply").checked = settings.onlyEasyApply !== false;
+  $("allowExternalApply").checked = settings.allowExternalApply !== false;
 }
 
 async function save() {
@@ -103,6 +146,8 @@ async function save() {
     .filter(Boolean);
   updateBlacklistCount(blacklistedCompanies.length);
 
+  const onlyEasy = $("onlyEasyApply").checked;
+  const allowExternal = $("allowExternalApply").checked;
   const autoApplySettings = {
     maxJobsPerSession: Math.min(Math.max(parseInt($("maxJobsPerSession").value, 10) || 25, 1), 10000),
     delayBetweenJobs: {
@@ -114,7 +159,8 @@ async function save() {
       max: parseInt($("delayStepMax").value, 10) || 100,
     },
     autoSubmit: $("autoSubmit").checked,
-    onlyEasyApply: $("onlyEasyApply").checked,
+    onlyEasyApply: onlyEasy,
+    allowExternalApply: allowExternal,
     maxConsecutiveNoApplyPages: Math.min(Math.max(parseInt($("maxNoApplyPages").value, 10) || 20, 1), 50),
     maxApplicationsPerCompany: Math.max(parseInt($("maxApplicationsPerCompany").value, 10) || 0, 0),
   };
@@ -122,18 +168,26 @@ async function save() {
   const mistralApiKey = $("mistralApiKey").value.trim();
   const uiSettings = { language: $("uiLanguage").value || "auto" };
 
-  await chrome.storage.local.set({
+  const payload = {
     profile,
     cvText: profile.cvText,
     autoApplySettings,
     blacklistedCompanies,
     uiSettings,
     mistralApiKey: mistralApiKey || undefined,
-  });
+  };
+  if (pendingCvFile) {
+    payload.cvFile = pendingCvFile;
+    updateCvStatus(pendingCvFile);
+  }
+
+  await chrome.storage.local.set(payload);
 
   $("toast").textContent = t("saved", lang);
   await applyI18n();
-  setTimeout(() => { $("toast").textContent = ""; }, 2500);
+  setTimeout(() => {
+    $("toast").textContent = "";
+  }, 2500);
 }
 
 $("saveBtn").addEventListener("click", save);
@@ -142,7 +196,33 @@ $("uiLanguage").addEventListener("change", async () => {
   await applyI18n();
 });
 $("blacklistedCompanies").addEventListener("input", () => {
-  updateBlacklistCount($("blacklistedCompanies").value.split("\n").filter((l) => l.trim()).length);
+  updateBlacklistCount(
+    $("blacklistedCompanies").value.split("\n").filter((l) => l.trim()).length
+  );
+});
+
+$("cvFileInput")?.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    pendingCvFile = await readFileAsCv(file);
+    updateCvStatus(pendingCvFile);
+    await chrome.storage.local.set({ cvFile: pendingCvFile });
+    $("toast").textContent = "CV chargé";
+    setTimeout(() => {
+      $("toast").textContent = "";
+    }, 2000);
+  } catch (err) {
+    pendingCvFile = null;
+    $("toast").textContent = err.message || "Erreur CV";
+  }
+});
+
+$("cvFileClear")?.addEventListener("click", async () => {
+  pendingCvFile = null;
+  if ($("cvFileInput")) $("cvFileInput").value = "";
+  await chrome.storage.local.remove(["cvFile"]);
+  updateCvStatus(null);
 });
 
 load();

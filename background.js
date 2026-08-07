@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.3.4";
+const EXT_VERSION = "1.3.5";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -36,6 +36,7 @@ const DEFAULT_SETTINGS = {
   delayBetweenSteps: { min: 100, max: 100 },
   autoSubmit: true,
   onlyEasyApply: true,
+  allowExternalApply: true,
   maxConsecutiveNoApplyPages: 20,
   maxApplicationsPerCompany: 0,
 };
@@ -67,6 +68,7 @@ function sanitizeSettings(settings = {}) {
   if (s.delayBetweenSteps.max < s.delayBetweenSteps.min) s.delayBetweenSteps.max = s.delayBetweenSteps.min;
   s.autoSubmit = s.autoSubmit !== false;
   s.onlyEasyApply = s.onlyEasyApply !== false;
+  s.allowExternalApply = s.allowExternalApply !== false;
   return s;
 }
 
@@ -243,12 +245,17 @@ const LINKEDIN_JT = {
   internship: "I",
 };
 
-function buildLinkedInSearchUrl(keywords, location, contracts) {
+function buildLinkedInSearchUrl(keywords, location, contracts, opts = {}) {
   const params = new URLSearchParams();
   const kw = freelanceAwareKeywords(keywords, contracts);
   if (kw) params.set("keywords", kw);
   if (location) params.set("location", location);
-  params.set("f_AL", "true");
+  // Easy Apply SERP filter only when company-website apply is disabled
+  const allowExternal = opts.allowExternalApply === true;
+  const onlyEasy = opts.onlyEasyApply !== false;
+  if (onlyEasy && !allowExternal) {
+    params.set("f_AL", "true");
+  }
   params.set("f_TPR", "r86400");
   const codes = [...new Set(asArray(contracts).map((c) => LINKEDIN_JT[c.toLowerCase()]).filter(Boolean))];
   if (codes.length) params.set("f_JT", codes.join(","));
@@ -279,9 +286,9 @@ function buildGlassdoorSearchUrl(keywords, location, contracts = []) {
   return `https://www.glassdoor.fr/Job/jobs.htm?${p.toString()}`;
 }
 
-function buildPlatformSearchUrl(platform, keywords, location, contracts, page = 0) {
+function buildPlatformSearchUrl(platform, keywords, location, contracts, page = 0, opts = {}) {
   if (platform === "hellowork") return buildHelloworkSearchUrl(keywords, location, contracts);
-  if (platform === "linkedin") return buildLinkedInSearchUrl(keywords, location, contracts);
+  if (platform === "linkedin") return buildLinkedInSearchUrl(keywords, location, contracts, opts);
   if (platform === "indeed") return buildIndeedSearchUrl(keywords, location, page, contracts);
   if (platform === "glassdoor") return buildGlassdoorSearchUrl(keywords, location, contracts);
   return "";
@@ -418,6 +425,182 @@ async function openPlatformTabs(urls, platforms) {
 
 async function navigatePlatformTab(platform, url) {
   return ensureSinglePlatformTab(platform, url, { active: false, forceNavigate: true });
+}
+
+let externalApplyTabId = null;
+let pendingExternalTabWatch = null;
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (!pendingExternalTabWatch) return;
+  if (Date.now() - (pendingExternalTabWatch.at || 0) > (pendingExternalTabWatch.timeoutMs || 12000)) {
+    pendingExternalTabWatch = null;
+    return;
+  }
+  const url = tab.pendingUrl || tab.url || "";
+  if (url && !url.startsWith("chrome") && !/linkedin\.com/i.test(url)) {
+    pendingExternalTabWatch.url = url;
+    pendingExternalTabWatch.tabId = tab.id;
+    externalApplyTabId = tab.id;
+  } else if (tab.id) {
+    // URL may fill in later
+    pendingExternalTabWatch.tabId = tab.id;
+    externalApplyTabId = tab.id;
+    const watchId = tab.id;
+    const check = (id, info, t) => {
+      if (id !== watchId || !info.url) return;
+      if (!/linkedin\.com/i.test(info.url) && !info.url.startsWith("chrome")) {
+        if (pendingExternalTabWatch) {
+          pendingExternalTabWatch.url = info.url;
+          pendingExternalTabWatch.tabId = id;
+        }
+        chrome.tabs.onUpdated.removeListener(check);
+      }
+    };
+    chrome.tabs.onUpdated.addListener(check);
+    setTimeout(() => chrome.tabs.onUpdated.removeListener(check), 15000);
+  }
+});
+
+async function injectExternalApplyScripts(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      files: ["content/shared-autofill.js", "content/google-recaptcha.js", "content/external-apply.js"],
+    });
+  } catch (_e) {
+    /* may already be injected */
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ["content/google-recaptcha.js"],
+    });
+  } catch (_e) {}
+}
+
+async function openExternalApply(msg = {}) {
+  let url = String(msg.url || "").trim();
+  const jobInfo = msg.jobInfo || {};
+
+  // Prefer a tab captured from LinkedIn window.open / target=_blank
+  if (pendingExternalTabWatch?.tabId) {
+    try {
+      const t = await chrome.tabs.get(pendingExternalTabWatch.tabId);
+      externalApplyTabId = t.id;
+      if (!url && (pendingExternalTabWatch.url || t.url) && !/linkedin\.com/i.test(pendingExternalTabWatch.url || t.url || "")) {
+        url = pendingExternalTabWatch.url || t.url;
+      }
+    } catch (_e) {}
+  }
+
+  if (!url) {
+    return { ok: false, success: false, reason: "no_url" };
+  }
+
+  await chrome.storage.local.set({
+    sessionExternalApply: {
+      active: true,
+      done: false,
+      ok: false,
+      url,
+      jobInfo,
+      sourcePlatform: msg.sourcePlatform || msg.platform || "linkedin",
+      startedAt: Date.now(),
+    },
+  });
+  await appendLog(`Ouverture site entreprise: ${jobInfo.title || url.slice(0, 80)}`, "info", "external");
+
+  let tabId = externalApplyTabId;
+  try {
+    if (tabId) await chrome.tabs.get(tabId);
+  } catch (_e) {
+    tabId = null;
+  }
+
+  if (tabId) {
+    const cur = await chrome.tabs.get(tabId).catch(() => null);
+    const curUrl = cur?.url || "";
+    if (!curUrl.includes(url.slice(0, 40)) && !/linkedin\.com/i.test(url)) {
+      await chrome.tabs.update(tabId, { url, active: false });
+    }
+  } else {
+    const created = await chrome.tabs.create({ url, active: false });
+    tabId = created?.id || null;
+    externalApplyTabId = tabId;
+  }
+  if (!tabId) return { ok: false, success: false, reason: "tab_create_failed" };
+
+  const waitLoad = () =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve("timeout");
+      }, 25000);
+      function listener(id, info) {
+        if (id === tabId && info.status === "complete") {
+          clearTimeout(timer);
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve("complete");
+        }
+      }
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+  await waitLoad();
+
+  // Follow LinkedIn redirect wrappers to the real ATS URL
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.url && !/linkedin\.com/i.test(tab.url)) {
+      url = tab.url;
+      await chrome.storage.local.set({
+        sessionExternalApply: {
+          ...(await chrome.storage.local.get(["sessionExternalApply"])).sessionExternalApply,
+          url,
+        },
+      });
+    }
+  } catch (_e) {}
+
+  await injectExternalApplyScripts(tabId);
+  await new Promise((r) => setTimeout(r, 1200));
+
+  try {
+    await chrome.tabs.sendMessage(tabId, { action: "startExternalApply", jobInfo });
+  } catch (_e) {
+    await injectExternalApplyScripts(tabId);
+    try {
+      await chrome.tabs.sendMessage(tabId, { action: "startExternalApply", jobInfo });
+    } catch (e2) {
+      await appendLog(`Injection site entreprise échouée: ${e2.message}`, "error", "external");
+    }
+  }
+
+  const deadline = Date.now() + 90000;
+  while (Date.now() < deadline) {
+    const { sessionExternalApply = null } = await chrome.storage.local.get(["sessionExternalApply"]);
+    if (sessionExternalApply?.done) {
+      pendingExternalTabWatch = null;
+      return {
+        ok: !!sessionExternalApply.ok,
+        success: !!sessionExternalApply.ok,
+        reason: sessionExternalApply.reason || "",
+        url: sessionExternalApply.url || url,
+      };
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  await chrome.storage.local.set({
+    sessionExternalApply: {
+      active: false,
+      done: true,
+      ok: false,
+      reason: "timeout",
+      url,
+      jobInfo,
+    },
+  });
+  pendingExternalTabWatch = null;
+  return { ok: false, success: false, reason: "timeout", url };
 }
 
 /** Trusted mouse click via CDP (needed for Cloudflare Turnstile checkbox). */
@@ -1248,7 +1431,12 @@ async function startMultiSession(msg) {
   }
 
   if (platforms.includes("linkedin")) {
-    const searchUrl = msg.linkedinUrl || buildLinkedInSearchUrl(keywords, location, contracts);
+    const searchUrl =
+      msg.linkedinUrl ||
+      buildLinkedInSearchUrl(keywords, location, contracts, {
+        onlyEasyApply: settings.onlyEasyApply,
+        allowExternalApply: settings.allowExternalApply,
+      });
     urls.linkedin = searchUrl;
     updates.sessionLinkedin = emptyPlatformSession("linkedin", {
       ...common,
@@ -1555,12 +1743,98 @@ function handleMessage(msg, sendResponse, sender = null) {
   }
 
   if (msg.action === "checkBackend") {
-    sendResponse({ available: false });
+    // External apply is handled in-extension (no remote backend)
+    sendResponse({ available: true, ok: true, mode: "in_extension" });
     return false;
   }
 
-  if (msg.action === "addToPipeline" || msg.action === "requestExternalApply") {
-    sendResponse({ ok: false, reason: "not_available" });
+  if (msg.action === "addToPipeline") {
+    sendResponse({ ok: true, queued: true });
+    return false;
+  }
+
+  if (msg.action === "requestExternalApply" || msg.action === "openExternalApply") {
+    openExternalApply(msg)
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, success: false, reason: e.message }));
+    return true;
+  }
+
+  if (msg.action === "externalApplyResult") {
+    (async () => {
+      const { sessionExternalApply = null } = await chrome.storage.local.get(["sessionExternalApply"]);
+      if (sessionExternalApply?.active) {
+        await chrome.storage.local.set({
+          sessionExternalApply: {
+            ...sessionExternalApply,
+            active: false,
+            done: true,
+            ok: !!msg.ok,
+            reason: msg.reason || "",
+            finishedAt: Date.now(),
+          },
+        });
+      }
+      await appendLog(
+        `Site entreprise: ${msg.ok ? "OK" : "échec"} — ${msg.reason || ""}`,
+        msg.ok ? "success" : "warn",
+        "external"
+      );
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+
+  if (msg.action === "clickRecaptcha") {
+    (async () => {
+      const tabId = msg.tabId || sender?.tab?.id;
+      if (!tabId) {
+        sendResponse({ ok: false });
+        return;
+      }
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          files: ["content/google-recaptcha.js"],
+        });
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          func: () => {
+            try {
+              return typeof window.__AmijobsClickRecaptcha === "function"
+                ? !!window.__AmijobsClickRecaptcha()
+                : false;
+            } catch (_e) {
+              return false;
+            }
+          },
+        });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, reason: e.message });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.action === "watchNextExternalTab") {
+    const timeoutMs = msg.timeoutMs || 12000;
+    pendingExternalTabWatch = {
+      at: Date.now(),
+      timeoutMs,
+      url: "",
+      tabId: null,
+    };
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (msg.action === "getWatchedExternalTab") {
+    sendResponse({
+      ok: true,
+      url: pendingExternalTabWatch?.url || "",
+      tabId: pendingExternalTabWatch?.tabId || null,
+    });
     return false;
   }
 

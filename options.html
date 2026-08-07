@@ -119,6 +119,12 @@
         <label data-i18n="cvText">Contenu texte du CV (Mistral)</label>
         <textarea id="cvText" data-i18n-ph="cvTextPh" placeholder="Collez ici le texte de votre CV…"></textarea>
       </div>
+      <div style="margin-top:14px;">
+        <label>Fichier CV (PDF / DOC) — candidatures sites entreprise</label>
+        <input id="cvFileInput" type="file" accept=".pdf,.doc,.docx,application/pdf" style="padding:8px;" />
+        <p class="hint" id="cvFileStatus">Aucun fichier. Chrome ne peut pas lire un chemin disque : choisissez le fichier ici, AmiJobs en enregistre une copie chiffrée localement pour les uploads.</p>
+        <button type="button" id="cvFileClear" style="margin-top:8px;background:#fff;border:1px solid #e2e8f0;color:#64748b;padding:6px 12px;border-radius:8px;cursor:pointer;font-size:12px;">Retirer le CV</button>
+      </div>
       <div style="margin-top:16px; padding-top:14px; border-top:1px solid #e2e8f0;">
         <h2 style="border:none; padding:0; margin-bottom:10px;">
           <span data-i18n="blacklistTitle">Entreprises blacklistées</span>
@@ -155,6 +161,9 @@
         </label>
         <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;color:#334155;">
           <input type="checkbox" id="onlyEasyApply" style="width:auto;" /> <span data-i18n="easyApplyOnly">LinkedIn Easy Apply uniquement</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;color:#334155;">
+          <input type="checkbox" id="allowExternalApply" style="width:auto;" /> <span>Postuler aussi sur le site de l'entreprise</span>
         </label>
       </div>
     </div>

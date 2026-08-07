@@ -14,7 +14,7 @@
   if (window.__AmijobsLinkedinLoaded) return;
   window.__AmijobsLinkedinLoaded = true;
 
-  const VERSION = "1.3.4";
+  const VERSION = "1.3.5";
   let isRunning = false;
   let shouldStop = false;
   const sessionStats = { applied: 0, skipped: 0, errors: 0 };
@@ -366,34 +366,41 @@
 
   // ── External Apply Detection ──────────────────────────────────────────
   function findExternalApplyButton() {
-    // Look for "Apply on company website" / "Postuler sur le site" buttons/links
+    // Look for "Apply on company website" / "Postuler sur le site" / plain Postuler (offsite)
     const applyTexts = [
-      "postuler sur le site", "apply on company website", "apply on",
-      "postuler", "apply now", "apply", "candidater",
+      "postuler sur le site",
+      "apply on company website",
+      "apply on company",
+      "company website",
+      "site de l'entreprise",
+      "site de l’entreprise",
+      "apply on",
+      "postuler",
+      "apply now",
+      "apply",
+      "candidater",
     ];
-    // These are typically <a> links or buttons that open external sites
     const candidates = [...$$("a"), ...$$("button")];
     for (const el of candidates) {
       if (el.offsetParent === null || el.disabled) continue;
-      const text = el.textContent.trim().toLowerCase();
-      // Skip Easy Apply buttons
-      if (text.includes("easy apply") || text.includes("candidature simplifiée")) continue;
+      const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.trim().toLowerCase();
+      if (!text) continue;
+      if (text.includes("easy apply") || text.includes("candidature simplifiée") || text.includes("postuler simplement"))
+        continue;
       for (const applyText of applyTexts) {
-        if (text.includes(applyText)) {
-          const href = el.getAttribute("href") || "";
-          // Must be external link or have external intent
-          if (href && !href.includes("linkedin.com")) {
-            log(`[DEBUG] External apply trouvé: "${text}" → ${href}`, "info");
-            return { element: el, url: href };
-          }
-          // Sometimes the external URL is encoded in onclick/data attributes
-          if (el.dataset.applyUrl || el.dataset.externalUrl) {
-            return { element: el, url: el.dataset.applyUrl || el.dataset.externalUrl };
-          }
-          // Button with no href but with "external" context
-          if (el.tagName === "BUTTON" && !text.includes("easy")) {
-            return { element: el, url: "" };
-          }
+        if (!text.includes(applyText)) continue;
+        const href = el.getAttribute("href") || "";
+        if (href && !href.includes("linkedin.com") && href.startsWith("http")) {
+          log(`[DEBUG] External apply trouvé: "${text.slice(0, 40)}" → ${href}`, "info");
+          return { element: el, url: href };
+        }
+        if (el.dataset.applyUrl || el.dataset.externalUrl) {
+          return { element: el, url: el.dataset.applyUrl || el.dataset.externalUrl };
+        }
+        // LinkedIn offsite: jobs-apply-button without easy-apply wording
+        if (el.classList?.contains("jobs-apply-button") || /postuler|apply/i.test(text)) {
+          log(`[DEBUG] External apply bouton (offsite): "${text.slice(0, 40)}"`, "info");
+          return { element: el, url: href.startsWith("http") ? href : "" };
         }
       }
     }
@@ -458,24 +465,57 @@
   }
 
   async function requestExternalApply(jobInfo) {
-    const externalUrl = getExternalApplyUrl();
+    let externalUrl = getExternalApplyUrl();
+    const externalBtn = findExternalApplyButton();
+
+    // If no direct URL, click the button and capture the opened company-site tab
+    if (!externalUrl && externalBtn?.element) {
+      log(`[External] Clic bouton site entreprise…`, "info");
+      await chrome.runtime.sendMessage({ action: "watchNextExternalTab", timeoutMs: 15000 }).catch(() => {});
+      try {
+        externalBtn.element.setAttribute("target", "_blank");
+      } catch (_e) {}
+      try {
+        externalBtn.element.click();
+      } catch (_e) {}
+      for (let i = 0; i < 12; i++) {
+        await sleep(1000);
+        const watched = await chrome.runtime.sendMessage({ action: "getWatchedExternalTab" }).catch(() => null);
+        const u = watched?.url || "";
+        if (u && !/linkedin\.com/i.test(u) && u.startsWith("http")) {
+          externalUrl = u;
+          break;
+        }
+        // Sometimes LinkedIn navigates current tab briefly — ignore
+      }
+    }
+
+    if (!externalUrl) {
+      // Last resort: open the LinkedIn job view apply redirect if present
+      const viewLink = $$('a[href*="externalApply"], a[href*="offsite"]')
+        .map((a) => a.href)
+        .find((h) => h && h.startsWith("http"));
+      if (viewLink) externalUrl = viewLink;
+    }
+
     if (!externalUrl) {
       log(`[External] Pas d'URL externe trouvée pour: ${jobInfo.title}`, "warn");
       return { success: false, reason: "no_external_url" };
     }
 
-    log(`[External] Candidature externe via backend: ${externalUrl}`, "info");
+    log(`[External] Candidature sur site entreprise: ${externalUrl}`, "info");
     try {
       const resp = await chrome.runtime.sendMessage({
-        action: "requestExternalApply",
+        action: "openExternalApply",
         url: externalUrl,
-        answers: {},
-        job_id: null,
+        jobInfo,
+        sourcePlatform: "linkedin",
+        platform: "linkedin",
       });
-      if (resp?.ok && resp.data?.success) {
-        return { success: true };
+      if (resp?.ok || resp?.success) {
+        return { success: true, reason: resp.reason || "ok" };
       }
-      return { success: false, reason: resp?.data?.error || "backend_failed" };
+      return { success: false, reason: resp?.reason || "external_failed" };
     } catch (err) {
       return { success: false, reason: err.message };
     }
@@ -1677,11 +1717,13 @@
     listEl.scrollTop = 0; await sleep(500);
   }
 
-  function buildSearchUrl(keywords, location, page = 0, jobTypes = "") {
+  function buildSearchUrl(keywords, location, page = 0, jobTypes = "", opts = {}) {
     const params = new URLSearchParams();
     if (keywords) params.set("keywords", keywords);
     if (location) params.set("location", location);
-    params.set("f_AL", "true");
+    const allowExternal = opts.allowExternalApply === true;
+    const onlyEasy = opts.onlyEasyApply !== false;
+    if (onlyEasy && !allowExternal) params.set("f_AL", "true");
     if (jobTypes) params.set("f_JT", jobTypes);
     if (page > 0) params.set("start", String(page * 25));
     return `https://www.linkedin.com/jobs/search/?${params.toString()}`;
@@ -1771,7 +1813,13 @@
           continue;
         }
 
-        if (settings.onlyEasyApply !== false && !hasEasyApplyBadge(card.element)) {
+        // When company-site apply is enabled, also process non-Easy cards
+        const allowExternalCards = settings.allowExternalApply !== false;
+        if (
+          settings.onlyEasyApply !== false &&
+          !allowExternalCards &&
+          !hasEasyApplyBadge(card.element)
+        ) {
           log(`[DEBUG] Carte ${i + 1}: pas Easy Apply — ignorée`, "info");
           continue;
         }
@@ -1826,42 +1874,48 @@
           easyApplyBtn = findEasyApplyButton();
         }
         if (!easyApplyBtn) {
-          // ── External Apply path: send to backend pipeline ──────
-          if (!isEasyApply && settings.onlyEasyApply === false) {
-            const backendOk = await checkBackendAvailable();
-            if (backendOk) {
-              log(`[External] Ajout au pipeline: ${jobInfo.title} @ ${jobInfo.company}`, "info");
-              const pipelineOk = await sendToBackendPipeline(jobInfo);
-              if (pipelineOk) {
-                log(`[External] Ajouté au pipeline backend ✓`, "success");
-                // Try auto-apply if external URL available
-                const externalResult = await requestExternalApply(jobInfo);
-                if (externalResult.success) {
-                  pageApplied++;
-                  await chrome.runtime.sendMessage({
-                    action: "markApplied", platform: "linkedin", jobId: jobInfo.jobId,
-                    title: jobInfo.title, company: jobInfo.company, url: jobInfo.url,
-                  }).catch(() => {});
-                  log(`[External] Candidature externe envoyée: ${jobInfo.title}`, "success");
-                } else {
-                  log(`[External] Candidature externe en attente: ${externalResult.reason}`, "warn");
-                }
-              } else {
-                log(`[External] Échec ajout pipeline`, "warn");
-              }
+          // ── External Apply path: company website (Station F, Greenhouse, etc.) ──
+          const allowExternal = settings.allowExternalApply !== false;
+          const onlyEasy = settings.onlyEasyApply !== false;
+          if (allowExternal && (!onlyEasy || !isEasyApply)) {
+            log(`[External] Tentative site entreprise: ${jobInfo.title} @ ${jobInfo.company}`, "info");
+            const externalResult = await requestExternalApply(jobInfo);
+            if (externalResult.success) {
+              pageApplied++;
+              await chrome.runtime
+                .sendMessage({
+                  action: "markApplied",
+                  platform: "linkedin",
+                  jobId: jobInfo.jobId,
+                  title: jobInfo.title,
+                  company: jobInfo.company,
+                  url: jobInfo.url,
+                })
+                .catch(() => {});
+              log(`[External] Candidature site entreprise envoyée: ${jobInfo.title}`, "success");
             } else {
-              log(`[External] Backend non disponible — ignoré: ${jobInfo.title}`, "warn");
-              await chrome.runtime.sendMessage({
-                action: "markSkipped", platform: "linkedin", jobId: jobInfo.jobId,
-                title: jobInfo.title, reason: "Externe (backend indisponible)",
-              }).catch(() => {});
+              await chrome.runtime
+                .sendMessage({
+                  action: "markSkipped",
+                  platform: "linkedin",
+                  jobId: jobInfo.jobId,
+                  title: jobInfo.title,
+                  reason: `Externe: ${externalResult.reason || "échec"}`,
+                })
+                .catch(() => {});
+              log(`[External] Échec: ${externalResult.reason}`, "warn");
             }
           } else {
             log(`Pas de bouton Easy Apply: ${jobInfo.title}`, "info");
-            await chrome.runtime.sendMessage({
-              action: "markSkipped", platform: "linkedin", jobId: jobInfo.jobId,
-              title: jobInfo.title, reason: "Pas de candidature simplifiée",
-            }).catch(() => {});
+            await chrome.runtime
+              .sendMessage({
+                action: "markSkipped",
+                platform: "linkedin",
+                jobId: jobInfo.jobId,
+                title: jobInfo.title,
+                reason: "Pas de candidature simplifiée",
+              })
+              .catch(() => {});
           }
           continue;
         }

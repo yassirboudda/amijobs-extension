@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.3.4";
+  const VERSION = "1.3.5";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;

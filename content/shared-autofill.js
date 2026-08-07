@@ -283,6 +283,34 @@
     return false;
   }
 
+  async function getCvFile() {
+    const { cvFile = null } = await chrome.storage.local.get(["cvFile"]);
+    return cvFile;
+  }
+
+  async function uploadCvToFileInput(input) {
+    if (!input) return false;
+    const cv = await getCvFile();
+    if (!cv?.base64) return false;
+    try {
+      const bin = atob(cv.base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const file = new File([bytes], cv.name || "cv.pdf", {
+        type: cv.mime || "application/pdf",
+        lastModified: Date.now(),
+      });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
   function collectFields(root = document) {
     const fields = [];
     const roots = [root];
@@ -300,7 +328,11 @@
       for (const el of $$("input, textarea, select", r)) {
         if (!isVisible(el)) continue;
         const type = (el.getAttribute("type") || el.tagName.toLowerCase()).toLowerCase();
-        if (["hidden", "submit", "button", "file", "image", "reset"].includes(type)) continue;
+        if (["hidden", "submit", "button", "image", "reset"].includes(type)) continue;
+        if (type === "file") {
+          fields.push({ type: "file", label: getFieldLabel(el), element: el });
+          continue;
+        }
         if (type === "radio") {
           const name = el.name;
           if (!name || fields.some((f) => f.type === "radio" && f.name === name)) continue;
@@ -329,6 +361,11 @@
     const fields = collectFields();
     for (const field of fields) {
       try {
+        if (field.type === "file") {
+          await uploadCvToFileInput(field.element);
+          await sleep(150 + Math.random() * 250);
+          continue;
+        }
         await fillField(field, jobInfo, platform);
         await sleep(150 + Math.random() * 250);
       } catch (e) {
@@ -379,6 +416,8 @@
     getProfile,
     isCompanyBlacklisted,
     shouldSkipCompany,
+    uploadCvToFileInput,
+    getCvFile,
     fillVisibleFields,
     collectFields,
     findActionButton,
