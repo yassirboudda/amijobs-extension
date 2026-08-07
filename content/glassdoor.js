@@ -555,11 +555,15 @@
           break;
         }
 
-        const { sessionGlassdoor: current } = await chrome.storage.local.get(["sessionGlassdoor"]);
+        const { sessionGlassdoor: current, appliedJobs: liveApplied = {} } = await chrome.storage.local.get([
+          "sessionGlassdoor",
+          "appliedJobs",
+        ]);
         if (!current?.active || (current?.applied || 0) >= maxJobs) break;
 
         const card = cards[i];
-        if (alreadyApplied(appliedJobs, card.jobId)) continue;
+        if (alreadyApplied(liveApplied, card.jobId) || alreadyApplied(appliedJobs, card.jobId)) continue;
+        Object.assign(appliedJobs, liveApplied);
 
         await clickJobCard(card);
         const jobInfo = {
