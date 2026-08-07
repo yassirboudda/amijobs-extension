@@ -196,14 +196,7 @@ $("startBtn").addEventListener("click", async () => {
     return;
   }
 
-  let first = true;
-  // Open every selected platform at once so they apply simultaneously
-  for (const p of PLATFORM_OPEN_ORDER) {
-    if (!platforms.includes(p) || !result.urls?.[p]) continue;
-    await chrome.tabs.create({ url: result.urls[p], active: first });
-    first = false;
-  }
-
+  // Tabs are opened by background (exactly 1 per platform) — do not create more here
   window.close();
 });
 
@@ -217,20 +210,16 @@ $("resumeBtn").addEventListener("click", async () => {
   const platforms = saved.lastPlatforms?.length
     ? saved.lastPlatforms
     : ["hellowork", "linkedin", "indeed", "glassdoor"];
-  let first = true;
+  const urls = {};
   for (const platform of platforms) {
     const resumed = await sendBg({ action: "resumeLastSession", platform });
     if (!resumed?.ok || !resumed.targetUrl) continue;
-    if (first) {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.id) await chrome.tabs.update(tab.id, { url: resumed.targetUrl });
-      else await chrome.tabs.create({ url: resumed.targetUrl });
-      first = false;
-    } else {
-      await chrome.tabs.create({ url: resumed.targetUrl, active: false });
-    }
+    urls[platform] = resumed.targetUrl;
   }
-  if (!first) window.close();
+  const opened = Object.keys(urls);
+  if (!opened.length) return;
+  await sendBg({ action: "openPlatformTabs", urls, platforms: opened });
+  window.close();
 });
 
 $("singleBtn").addEventListener("click", async () => {

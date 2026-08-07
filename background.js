@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.3.0";
+const EXT_VERSION = "1.3.1";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -274,6 +274,232 @@ const PLATFORM_URL_MATCH = {
 
 let watchingIndeedFromGlassdoor = null;
 let lastSmartApplyKick = 0;
+let tabEnforceLock = false;
+const lastPlatformReopenAt = Object.create(null);
+const platformReopenCount = Object.create(null);
+
+function detectPlatformFromUrl(url = "") {
+  const u = String(url || "");
+  if (!u || u.startsWith("chrome") || u.startsWith("about:")) return null;
+  if (/hellowork\.com/i.test(u)) return "hellowork";
+  if (/linkedin\.com\/jobs/i.test(u)) return "linkedin";
+  if (/smartapply\.indeed\.com|indeed\.(com|fr)/i.test(u)) return "indeed";
+  if (/glassdoor\.(com|fr)/i.test(u)) return "glassdoor";
+  return null;
+}
+
+function tabMatchesPlatform(tab, platform) {
+  const url = tab?.url || "";
+  if (!url) return false;
+  const patterns = PLATFORM_URL_MATCH[platform] || [];
+  return patterns.some((p) => url.includes(p));
+}
+
+async function listPlatformTabs(platform) {
+  const tabs = await chrome.tabs.query({});
+  return tabs.filter((t) => t.id && tabMatchesPlatform(t, platform));
+}
+
+function pickTabToKeep(tabs, preferredUrl = "") {
+  if (!tabs.length) return null;
+  const pref = String(preferredUrl || "");
+  if (/smartapply|indeedapply/i.test(pref)) {
+    const sa = tabs.find((t) => /smartapply|indeedapply/i.test(t.url || ""));
+    if (sa) return sa;
+  }
+  // If an apply wizard is open, keep THAT tab (never kill Smart Apply to keep SERP)
+  const applying = tabs.find((t) => /smartapply\.indeed\.com|indeedapply|\/easy-apply|EasyApplyModal/i.test(t.url || ""));
+  if (applying) return applying;
+
+  const active = tabs.find((t) => t.active);
+  if (active) return active;
+  // Prefer existing search SERP over a blank/new tab
+  const serp = tabs.find((t) =>
+    /\/jobs|Job\/jobs|hellowork\.com\/fr-fr\/emplois|linkedin\.com\/jobs/i.test(t.url || "")
+  );
+  if (serp) return serp;
+  return tabs[0];
+}
+
+/** HARD RULE: at most one browser tab per job board. Never create a second. */
+async function ensureSinglePlatformTab(platform, url, { active = false, forceNavigate = true } = {}) {
+  const tabs = await listPlatformTabs(platform);
+  const keep = pickTabToKeep(tabs, url);
+  const extras = tabs.filter((t) => keep && t.id !== keep.id);
+
+  // Close duplicates first (cap to avoid runaway remove storms)
+  for (const t of extras.slice(0, 12)) {
+    try {
+      await chrome.tabs.remove(t.id);
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+
+  if (keep?.id) {
+    const patch = {};
+    if (active) patch.active = true;
+    if (forceNavigate && url && keep.url !== url) patch.url = url;
+    if (Object.keys(patch).length) {
+      try {
+        await chrome.tabs.update(keep.id, patch);
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+    return keep.id;
+  }
+
+  if (!url) return null;
+  try {
+    const created = await chrome.tabs.create({ url, active: !!active });
+    return created?.id || null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+async function enforceOneTabPerPlatform(reason = "") {
+  if (tabEnforceLock) return;
+  tabEnforceLock = true;
+  try {
+    for (const platform of SUPPORTED_PLATFORMS) {
+      const tabs = await listPlatformTabs(platform);
+      if (tabs.length <= 1) continue;
+      const keep = pickTabToKeep(tabs);
+      for (const t of tabs) {
+        if (!keep || t.id === keep.id) continue;
+        try {
+          await chrome.tabs.remove(t.id);
+        } catch (_e) {
+          /* ignore */
+        }
+      }
+      if (reason) {
+        await appendLog(`Onglets ${platform} fusionnés (max 1) — ${reason}`, "warn", platform);
+      }
+    }
+  } finally {
+    tabEnforceLock = false;
+  }
+}
+
+async function openPlatformTabs(urls, platforms) {
+  let first = true;
+  for (const p of SUPPORTED_PLATFORMS) {
+    if (!platforms.includes(p) || !urls[p]) continue;
+    await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
+    first = false;
+  }
+  await enforceOneTabPerPlatform("démarrage session");
+}
+
+async function navigatePlatformTab(platform, url) {
+  return ensureSinglePlatformTab(platform, url, { active: false, forceNavigate: true });
+}
+
+/** Trusted mouse click via CDP (needed for Cloudflare Turnstile checkbox). */
+async function clickTurnstileWithDebugger(tabId) {
+  if (!tabId || !chrome.debugger) return { ok: false, reason: "no_debugger" };
+  const target = { tabId };
+  let attached = false;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+  } catch (_e) {
+    // Already attached or unavailable
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      attached = true;
+    } catch (e2) {
+      return { ok: false, reason: String(e2?.message || e2) };
+    }
+  }
+
+  try {
+    // Bring tab forward so coordinates map to the visible viewport
+    try {
+      await chrome.tabs.update(tabId, { active: true });
+    } catch (_e) {
+      /* ignore */
+    }
+
+    const boxes = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const out = [];
+        const pushBox = (el, label) => {
+          if (!el) return;
+          const r = el.getBoundingClientRect();
+          if (r.width < 8 || r.height < 8) return;
+          out.push({
+            label,
+            x: r.left + Math.min(28, Math.max(12, r.width * 0.1)),
+            y: r.top + r.height / 2,
+            w: r.width,
+            h: r.height,
+            href: location.href.slice(0, 100),
+          });
+        };
+        const host = location.hostname || "";
+        if (/challenges\.cloudflare\.com|turnstile/i.test(host)) {
+          pushBox(document.querySelector('input[type="checkbox"], [role="checkbox"], label.cb-lb, .cb-lb, body'), "frame");
+        }
+        for (const f of document.querySelectorAll(
+          'iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"], iframe[title*="Widget"], iframe[title*="Cloudflare"], .cf-turnstile, #challenge-stage'
+        )) {
+          pushBox(f, "host-iframe");
+        }
+        const text = (document.body?.innerText || "").toLowerCase();
+        if (/vérifiez que vous êtes humain|verify you are human/.test(text)) {
+          pushBox(document.querySelector(".cf-turnstile, #challenge-stage, body"), "host-text");
+        }
+        return out;
+      },
+    });
+
+    const points = [];
+    for (const r of boxes || []) {
+      for (const b of r?.result || []) points.push(b);
+    }
+    if (!points.length) return { ok: false, reason: "no_points" };
+
+    const dispatch = async (x, y) => {
+      const base = { x: Math.round(x), y: Math.round(y), button: "left", clickCount: 1 };
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        ...base,
+      });
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        ...base,
+      });
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        ...base,
+      });
+    };
+
+    for (const p of points.slice(0, 6)) {
+      await dispatch(p.x, p.y);
+      await new Promise((r) => setTimeout(r, 250));
+      // Also try slightly left (checkbox)
+      await dispatch(Math.max(8, p.x - 10), p.y);
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return { ok: true, points: points.length };
+  } catch (err) {
+    return { ok: false, reason: String(err?.message || err) };
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+  }
+}
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   const url = changeInfo.url || tab?.url || "";
@@ -448,17 +674,6 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     /* ignore */
   }
 });
-
-async function navigatePlatformTab(platform, url) {
-  const patterns = PLATFORM_URL_MATCH[platform] || [];
-  const tabs = await chrome.tabs.query({});
-  const tab = tabs.find((t) => t.url && patterns.some((p) => t.url.includes(p)));
-  if (tab?.id) {
-    await chrome.tabs.update(tab.id, { url });
-  } else {
-    await chrome.tabs.create({ url, active: false });
-  }
-}
 
 function resetSessionForLocation(platform, session, nextLocation, nextIndex, nextUrl) {
   const next = {
@@ -775,22 +990,21 @@ async function updatePlatformSessionFromMessage(platform, mutator) {
   return session;
 }
 
-async function openPlatformTabs(urls, platforms) {
-  let first = true;
-  for (const p of SUPPORTED_PLATFORMS) {
-    if (!platforms.includes(p) || !urls[p]) continue;
-    if (first) {
-      await chrome.tabs.create({ url: urls[p], active: true });
-      first = false;
-    } else {
-      await chrome.tabs.create({ url: urls[p], active: false });
-    }
-  }
-}
+// Hard cap: never more than 1 tab per job board
+chrome.tabs.onCreated.addListener(() => {
+  setTimeout(() => enforceOneTabPerPlatform("nouvel onglet").catch(() => {}), 400);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo.url) return;
+  const platform = detectPlatformFromUrl(changeInfo.url || tab?.url || "");
+  if (!platform) return;
+  setTimeout(() => enforceOneTabPerPlatform("navigation").catch(() => {}), 500);
+});
 
 let reopeningPlatformTab = false;
 chrome.tabs.onRemoved.addListener(async () => {
-  if (reopeningPlatformTab) return;
+  if (reopeningPlatformTab || tabEnforceLock) return;
   try {
     const data = await chrome.storage.local.get([
       "amijobsMeta",
@@ -802,25 +1016,44 @@ chrome.tabs.onRemoved.addListener(async () => {
     if (!data.amijobsMeta?.active) return;
 
     const checks = [
-      ["hellowork", data.sessionHellowork, PLATFORM_URL_MATCH.hellowork],
-      ["linkedin", data.sessionLinkedin, PLATFORM_URL_MATCH.linkedin],
-      ["indeed", data.sessionIndeed, PLATFORM_URL_MATCH.indeed],
-      ["glassdoor", data.sessionGlassdoor, PLATFORM_URL_MATCH.glassdoor],
+      ["hellowork", data.sessionHellowork],
+      ["linkedin", data.sessionLinkedin],
+      ["indeed", data.sessionIndeed],
+      ["glassdoor", data.sessionGlassdoor],
     ];
-    const tabs = await chrome.tabs.query({});
-    for (const [platform, session, patterns] of checks) {
+
+    for (const [platform, session] of checks) {
       if (!session?.active) continue;
-      // Glassdoor-only / Indeed fromGlassdoor sessions should not force a SERP reopen race
       if (platform === "indeed" && session.fromGlassdoor) continue;
+
       const searchUrl = session.searchUrl || session.resumeSearchUrl || "";
       if (!searchUrl) continue;
-      const hasTab = tabs.some(
-        (t) => t.url && patterns.some((p) => String(t.url).includes(p)) && !/smartapply\.indeed\.com/i.test(t.url || "")
-      );
-      if (hasTab) continue;
+
+      // Count ANY platform tab (including Smart Apply) — do not reopen while applying
+      const existing = await listPlatformTabs(platform);
+      if (existing.length > 0) {
+        if (existing.length > 1) await enforceOneTabPerPlatform("après fermeture");
+        continue;
+      }
+
+      const now = Date.now();
+      const last = lastPlatformReopenAt[platform] || 0;
+      if (now - last < 20000) continue; // hard debounce 20s
+      const count = platformReopenCount[platform] || 0;
+      if (count >= 3) {
+        await appendLog(
+          `Réouverture ${platform} bloquée (max 3) — évite crash PC`,
+          "warn",
+          platform
+        );
+        continue;
+      }
+
       reopeningPlatformTab = true;
+      lastPlatformReopenAt[platform] = now;
+      platformReopenCount[platform] = count + 1;
       try {
-        await chrome.tabs.create({ url: searchUrl, active: false });
+        await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
         await appendLog(`Onglet ${platform} rouvert (fermé pendant la session)`, "warn", platform);
       } finally {
         reopeningPlatformTab = false;
@@ -951,13 +1184,19 @@ async function startMultiSession(msg) {
   }
 
   await chrome.storage.local.set(updates);
+  // Reset reopen storm counters for this run
+  for (const p of platforms) {
+    platformReopenCount[p] = 0;
+    lastPlatformReopenAt[p] = 0;
+  }
   await appendLog(
     `Session AmiJobs démarrée (${platforms.join(" + ")}): "${keywords}" @ "${locationsOrEmpty.join(", ")}"` +
       (contracts.length ? ` [${contracts.join(", ")}]` : ""),
     "success"
   );
 
-  if (msg.openTabs) await openPlatformTabs(urls, platforms);
+  // Always open/reuse exactly one tab per selected platform
+  await openPlatformTabs(urls, platforms);
 
   return { ok: true, urls, platforms };
 }
@@ -1017,11 +1256,41 @@ function handleMessage(msg, sendResponse, sender = null) {
             return { clicked: nodes.length > 0, href: location.href.slice(0, 120), n: nodes.length };
           },
         });
-        sendResponse({ ok: true, frames: (results || []).map((r) => r?.result).filter(Boolean) });
+        // Trusted CDP click — synthetic events are often ignored by Turnstile
+        const trusted = await clickTurnstileWithDebugger(tabId);
+        sendResponse({
+          ok: true,
+          frames: (results || []).map((r) => r?.result).filter(Boolean),
+          trusted,
+        });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message || err) });
       }
     })();
+    return true;
+  }
+
+  if (msg.action === "openPlatformTabs") {
+    openPlatformTabs(msg.urls || {}, msg.platforms || [])
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
+
+  if (msg.action === "ensurePlatformTab") {
+    ensureSinglePlatformTab(msg.platform, msg.url, {
+      active: !!msg.active,
+      forceNavigate: msg.forceNavigate !== false,
+    })
+      .then((tabId) => sendResponse({ ok: true, tabId }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
+
+  if (msg.action === "enforceOneTabPerPlatform") {
+    enforceOneTabPerPlatform(msg.reason || "request")
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
     return true;
   }
 
@@ -1308,28 +1577,40 @@ function handleMessage(msg, sendResponse, sender = null) {
           sessionIndeed: { ...sessionIndeed, active: false, phase: "done", lastRunAt: Date.now() },
         });
       }
-      // Only navigate Indeed SERP when this was Indeed's own Smart Apply
-      if (searchUrl && !fromGlassdoor && !sessionIndeed?.fromGlassdoor) {
-        const tabs = await chrome.tabs.query({});
-        const indeedTab = tabs.find(
-          (t) =>
-            t.url &&
-            (t.url.includes("indeed.com/jobs") || t.url.includes("indeed.fr/jobs")) &&
-            t.id !== tabId
-        );
-        if (indeedTab?.id) {
-          await chrome.tabs.update(indeedTab.id, { url: searchUrl, active: true });
-        } else {
-          await chrome.tabs.create({ url: searchUrl, active: true });
-        }
-      }
-      if (tabId) {
+
+      const resumeUrl =
+        searchUrl ||
+        (!fromGlassdoor && !sessionIndeed?.fromGlassdoor ? sessionIndeed?.searchUrl || "" : "");
+
+      // Reuse the SAME Indeed tab — never open a second one
+      if (resumeUrl && tabId) {
         try {
-          await chrome.tabs.remove(tabId);
+          await chrome.tabs.update(tabId, { url: resumeUrl, active: true });
         } catch (_e) {
-          /* ignore */
+          await ensureSinglePlatformTab("indeed", resumeUrl, { active: true, forceNavigate: true });
+        }
+      } else if (resumeUrl) {
+        await ensureSinglePlatformTab("indeed", resumeUrl, { active: true, forceNavigate: true });
+      } else if (tabId && fromGlassdoor) {
+        // Glassdoor handoff finished: if Indeed session still needs SERP, go there in this tab;
+        // otherwise close only when another Indeed tab already exists.
+        const others = (await listPlatformTabs("indeed")).filter((t) => t.id !== tabId);
+        if (sessionIndeed?.active && !sessionIndeed.fromGlassdoor && sessionIndeed.searchUrl) {
+          try {
+            await chrome.tabs.update(tabId, { url: sessionIndeed.searchUrl, active: false });
+          } catch (_e) {
+            /* ignore */
+          }
+        } else if (others.length) {
+          try {
+            await chrome.tabs.remove(tabId);
+          } catch (_e) {
+            /* ignore */
+          }
         }
       }
+
+      await enforceOneTabPerPlatform("après smart apply");
       sendResponse({ ok: true });
     })();
     return true;

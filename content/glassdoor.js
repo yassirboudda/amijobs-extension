@@ -5,11 +5,34 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.0";
+  const VERSION = "1.3.1";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
   let lastGlassdoorRunAt = 0;
+
+  // Force Indeed/Smart Apply into the single Indeed tab (never spawn extra windows)
+  try {
+    const nativeOpen = window.open.bind(window);
+    window.open = function (url, target, features) {
+      const href = String(url || "");
+      if (/indeed\.(com|fr)|smartapply\.indeed/i.test(href)) {
+        chrome.runtime
+          .sendMessage({
+            action: "ensurePlatformTab",
+            platform: "indeed",
+            url: href,
+            active: true,
+            forceNavigate: true,
+          })
+          .catch(() => {});
+        return null;
+      }
+      return nativeOpen(url, target, features);
+    };
+  } catch (_e) {
+    /* ignore */
+  }
 
   function isBlockedPage() {
     const text = document.body?.innerText?.toLowerCase() || "";
@@ -59,6 +82,13 @@
       /* ignore */
     }
     for (let i = 0; i < 12; i++) {
+      if (i > 0 && i % 3 === 0) {
+        try {
+          await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
+        } catch (_e) {
+          /* ignore */
+        }
+      }
       for (const frame of S().$$(
         'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[title*="Widget"], iframe[title*="Cloudflare"]'
       )) {

@@ -4,11 +4,27 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.3.0";
+  const VERSION = "1.3.1";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
   let lastIndeedRunAt = 0;
+
+  // Keep Smart Apply in this Indeed tab whenever possible
+  try {
+    const nativeOpen = window.open.bind(window);
+    window.open = function (url, target, features) {
+      const href = String(url || "");
+      if (/indeed\.(com|fr)|smartapply\.indeed/i.test(href)) {
+        window.location.href = href;
+        chrome.runtime.sendMessage({ action: "enforceOneTabPerPlatform", reason: "indeed window.open" }).catch(() => {});
+        return null;
+      }
+      return nativeOpen(url, target, features);
+    };
+  } catch (_e) {
+    /* ignore */
+  }
 
   function getIndeedHost(session) {
     if (session?.searchUrl) {
@@ -216,6 +232,20 @@
       if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
     } catch (_e) {
       /* ignore */
+    }
+    // Retry inject a few times — Turnstile often mounts late
+    for (let injectTry = 0; injectTry < 3; injectTry++) {
+      await S().sleep(600);
+      try {
+        await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
+      } catch (_e) {
+        /* ignore */
+      }
+      try {
+        if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+      } catch (_e) {
+        /* ignore */
+      }
     }
 
     for (let i = 0; i < 12; i++) {
