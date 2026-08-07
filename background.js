@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.3.3";
+const EXT_VERSION = "1.3.4";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -1289,7 +1289,41 @@ async function startMultiSession(msg) {
   // Always open/reuse exactly one tab per selected platform
   await openPlatformTabs(urls, platforms);
 
+  // Kick content scripts (Glassdoor/LinkedIn sometimes miss the first auto-resume)
+  setTimeout(() => {
+    kickPlatformSessions(platforms).catch(() => {});
+  }, 2500);
+
   return { ok: true, urls, platforms };
+}
+
+async function kickPlatformSessions(platforms = []) {
+  for (const platform of platforms) {
+    try {
+      const tabs = await listPlatformTabs(platform);
+      for (const tab of tabs.slice(0, 1)) {
+        if (!tab?.id) continue;
+        try {
+          if (platform === "glassdoor") {
+            await chrome.scripting.executeScript({
+              target: { tabId: tab.id, allFrames: false },
+              files: ["content/shared-autofill.js", "content/glassdoor.js"],
+            });
+          } else if (platform === "linkedin") {
+            await chrome.scripting.executeScript({
+              target: { tabId: tab.id, allFrames: false },
+              files: ["content/linkedin.js"],
+            });
+          }
+        } catch (_e) {
+          /* already injected */
+        }
+        chrome.tabs.sendMessage(tab.id, { action: "startAutoApply" }).catch(() => {});
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+  }
 }
 
 function handleMessage(msg, sendResponse, sender = null) {

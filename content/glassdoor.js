@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.3";
+  const VERSION = "1.3.4";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -37,20 +37,26 @@
   function isBlockedPage() {
     const text = document.body?.innerText?.toLowerCase() || "";
     const title = document.title?.toLowerCase() || "";
-    return (
+    const hasCfWidget = !!S().$(
+      'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, #challenge-stage, #cf-challenge-running'
+    );
+    const hardBlock =
       text.includes("aidez-nous à protéger glassdoor") ||
       text.includes("help us protect glassdoor") ||
       text.includes("réservé aux humains") ||
-      text.includes("vérifiez que vous êtes humain") ||
-      text.includes("verify you are human") ||
       text.includes("bad gateway") ||
       text.includes("ray id:") ||
       title.includes("bad gateway") ||
       title.includes("un instant") ||
       document.body?.innerHTML?.includes("cf-error") ||
-      !!S().$("h1")?.textContent?.match(/502|503|429/i) ||
-      !!S().$('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, #challenge-stage')
-    );
+      !!S().$("h1")?.textContent?.match(/502|503|429/i);
+    const humanCheck =
+      text.includes("vérifiez que vous êtes humain") ||
+      text.includes("verify you are human") ||
+      text.includes("checking your browser") ||
+      text.includes("just a moment");
+    // Only treat Turnstile copy as blocked when the widget is actually present
+    return hardBlock || (humanCheck && hasCfWidget) || hasCfWidget;
   }
 
   async function tryPassCloudflareChallenge() {
@@ -139,7 +145,8 @@
   }
 
   function isSearchPage(url = window.location.href) {
-    return /glassdoor\.(com|fr)\/(Job|Emploi|job-listing|Emploi\/)/i.test(url);
+    return /glassdoor\.(com|fr)\/(Job|Emploi|job-listing|Emploi\/|Search)/i.test(url) ||
+      /glassdoor\.(com|fr)\/Job\/jobs/i.test(url);
   }
 
   function isJobDetailPage(url = window.location.href) {
@@ -838,4 +845,8 @@
 
   S().log(PLATFORM, `Glassdoor module v${VERSION} chargé`);
   if (isSearchPage() || isJobDetailPage()) checkAndResumeSession();
+  else {
+    // SPA / soft-nav: still poll for an active session
+    setTimeout(() => checkAndResumeSession().catch(() => {}), 2500);
+  }
 })();

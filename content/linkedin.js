@@ -14,7 +14,7 @@
   if (window.__AmijobsLinkedinLoaded) return;
   window.__AmijobsLinkedinLoaded = true;
 
-  const VERSION = "1.3.3";
+  const VERSION = "1.3.4";
   let isRunning = false;
   let shouldStop = false;
   const sessionStats = { applied: 0, skipped: 0, errors: 0 };
@@ -2085,7 +2085,18 @@
         sendResponse({ ok: false, reason: "already_running" });
         return;
       }
-      runAutoApplySession().then(() => sendResponse({ ok: true }));
+      (async () => {
+        const { sessionLinkedin: session } = await chrome.storage.local.get(["sessionLinkedin"]);
+        const onJobs =
+          window.location.href.includes("/jobs/search") ||
+          window.location.href.includes("/jobs/collection");
+        if (!onJobs && session?.searchUrl) {
+          log("Hors page jobs — redirection vers la recherche LinkedIn", "warn");
+          window.location.href = session.searchUrl;
+          return;
+        }
+        await runAutoApplySession();
+      })().then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
       return true;
     }
     if (msg.action === "applySingleJob") {

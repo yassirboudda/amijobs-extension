@@ -3,9 +3,29 @@
   window.__AmijobsHelloworkLoaded = true;
 
   // v1.0.26 — Blacklisted companies (profil candidat)
-  const VERSION = "1.3.3";
+  const VERSION = "1.3.4";
   let isRunning = false;
   let shouldStop = false;
+
+  // Never open recruiter / partner sites in new tabs (Free-Work, Google auth, etc.)
+  try {
+    const nativeOpen = window.open.bind(window);
+    window.open = function (url, target, features) {
+      const href = String(url || "");
+      if (
+        href &&
+        !/hellowork\.com/i.test(href) &&
+        !href.startsWith("about:") &&
+        !href.startsWith("javascript:")
+      ) {
+        log(`Blocage ouverture externe: ${href.slice(0, 120)}`, "warn");
+        return null;
+      }
+      return nativeOpen(url, target, features);
+    };
+  } catch (_e) {
+    /* ignore */
+  }
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const jitter = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -562,7 +582,9 @@
       t.includes("postuler sur le site du partenaire") ||
       t.includes("site du partenaire") ||
       t.includes("site de l'entreprise") ||
-      t.includes("candidater sur le site")
+      t.includes("candidater sur le site") ||
+      t.includes("free-work") ||
+      t.includes("freelance.com")
     );
   }
 
