@@ -3,7 +3,7 @@
   window.__AmijobsHelloworkLoaded = true;
 
   // v1.0.26 — Blacklisted companies (profil candidat)
-  const VERSION = "1.0.0";
+  const VERSION = "1.3.3";
   let isRunning = false;
   let shouldStop = false;
 
@@ -516,7 +516,7 @@
       textOf(document.querySelector('[data-testid*="title"]')) ||
       "Offre Hellowork";
 
-    const company =
+    let company =
       textOf(document.querySelector('a[href*="/entreprises/"]')) ||
       textOf(document.querySelector('[class*="company"], [class*="Company"]')) ||
       extractCompanyFromText(document.body?.innerText || "") ||
@@ -536,6 +536,10 @@
         return m ? m[1].trim() : "";
       })() ||
       "";
+    if (/se connecter|connexion|google|linkedin|créer un compte|s'inscrire/i.test(company)) {
+      company = extractCompanyFromText(document.body?.innerText || "") || "";
+      if (/se connecter|connexion|google|linkedin|créer un compte|s'inscrire/i.test(company)) company = "";
+    }
 
     return { title, company };
   }
@@ -550,17 +554,24 @@
     return true;
   }
 
+  function isExternalPartnerApplyText(text) {
+    const t = String(text || "").toLowerCase();
+    return (
+      t.includes("site du recruteur") ||
+      t.includes("sur le site du recruteur") ||
+      t.includes("postuler sur le site du partenaire") ||
+      t.includes("site du partenaire") ||
+      t.includes("site de l'entreprise") ||
+      t.includes("candidater sur le site")
+    );
+  }
+
   function findRecruiterSiteButton() {
-    const externalTexts = [
-      "postuler sur le site du recruteur",
-      "sur le site du recruteur",
-      "site du recruteur",
-    ];
     for (const el of Array.from(document.querySelectorAll("button, a"))) {
       if (el.offsetParent === null) continue;
       const text = textOf(el).toLowerCase();
       if (!text) continue;
-      if (externalTexts.some((t) => text.includes(t))) return el;
+      if (isExternalPartnerApplyText(text)) return el;
     }
     return null;
   }
@@ -969,10 +980,21 @@
     try {
       if (!searchUrl) return "";
       const u = new URL(searchUrl, window.location.origin);
-      return (u.searchParams.get("l") || "").trim();
+      const loc = (u.searchParams.get("l") || "").trim();
+      // Regions (Île-de-France) are not usable city form values — prefer Paris.
+      if (/île-de-france|ile-de-france|région|region/i.test(loc)) return "Paris";
+      return loc;
     } catch (_err) {
       return "";
     }
+  }
+
+  function isSensitiveOrFileField(field, fieldHint) {
+    const type = String(field?.type || "").toLowerCase();
+    if (type === "email" || type === "password" || type === "file" || type === "url") return true;
+    return /email|mail|courriel|cv|c\.v|résumé|resume|curriculum|fichier|file|upload|mot\s*de\s*passe|password|url|linkedin|github|portfolio/i.test(
+      fieldHint || ""
+    );
   }
 
   function getFieldLabel(el) {
@@ -1229,7 +1251,7 @@
         value = lastNameValue;
         shouldFill = true;
       }
-      else if (isCityField(fieldHint) && cityValue) {
+      else if (isCityField(fieldHint) && cityValue && !isSensitiveOrFileField(field, fieldHint)) {
         value = cityValue;
         shouldFill = true;
       }
@@ -1247,6 +1269,9 @@
         if (isBirthField && birthDateValue) {
           value = birthDateValue;
           shouldFill = true;
+        } else if (isSensitiveOrFileField(field, fieldHint) || isEmailField(fieldHint) || isPhoneField(fieldHint) || isNameField(fieldHint)) {
+          // Never invent email/CV/password/name from the search location.
+          shouldFill = false;
         } else {
           const wantsNumeric =
             field.inputMode === "numeric" ||
@@ -1274,16 +1299,7 @@
               value = postalCodeValue;
               shouldFill = true;
             }
-          } else if (
-            cityValue &&
-            !isSalaryField(fieldHint) &&
-            !isEmailField(fieldHint) &&
-            !isPhoneField(fieldHint) &&
-            !isNameField(fieldHint) &&
-            !/cv|c\.v|résumé|resume|curriculum|fichier|file|upload|mot\s*de\s*passe|password|url|linkedin|github|portfolio/i.test(
-              fieldHint
-            )
-          ) {
+          } else if (cityValue && !isSalaryField(fieldHint)) {
             value = cityValue;
             shouldFill = true;
           }
@@ -1349,6 +1365,10 @@
       "sauvegarder",
       "site du recruteur",
       "sur le site du recruteur",
+      "site du partenaire",
+      "postuler sur le site du partenaire",
+      "site de l'entreprise",
+      "candidater sur le site",
     ];
     let best = null;
     let bestScore = -1;
@@ -1808,6 +1828,7 @@
 
     // Loop for multi-step forms (Hellowork shows "Continuer ma candidature" buttons)
     let repeatedNonSubmit = 0;
+    let incompleteProfileHits = 0;
     let lastNonSubmitFingerprint = "";
     const loopExcludeButton = firstIsSubmit ? null : firstBtn;
 
@@ -1822,6 +1843,36 @@
       // Extra wait if selects were just answered (let Stimulus controller validate)
       if (selectsFilled > 0) await sleep(jitter(500, 900));
 
+      const mainForm = getVisibleOfferMainStepForm();
+      if (mainForm) {
+        const invalid = listVisibleInvalidFormFields(mainForm);
+        if (invalid.length) {
+          incompleteProfileHits++;
+          log(`⚠️ Étape profil incomplète — champs requis: ${invalid.join(", ")}`, "warn");
+          if (incompleteProfileHits >= 2) {
+            log("Profil candidat incomplet (email/CV…) — skip offre et retour recherche", "warn");
+            await chrome.runtime.sendMessage({
+              action: "markSkipped",
+              platform: "hellowork",
+              jobId: offerIdFromUrl(),
+              title: (await getSession())?.currentJobTitle || title || "Offre Hellowork",
+              url: window.location.href,
+              reason: `Profil incomplet: ${invalid.slice(0, 4).join(", ")}`,
+            });
+            const refreshed = await getSession();
+            const backUrl = sessionSearchReturnUrl(refreshed, refreshed?.resumeSearchUrl || "");
+            if (backUrl) {
+              await setSession({ phase: "search", currentOfferUrl: "", offerSubmitAttempted: false });
+              await sleep(jitter(800, 1400));
+              window.location.href = backUrl;
+            }
+            return;
+          }
+        } else {
+          incompleteProfileHits = 0;
+        }
+      }
+
       const nextBtn =
         findOfferMainStepSubmitButton() ||
         findFormSubmitButton() ||
@@ -1830,6 +1881,10 @@
 
       const nextIsSubmit = isLikelyFormSubmitButton(nextBtn);
       const nextLabel = buttonLabel(nextBtn);
+      if (isExternalPartnerApplyText(nextLabel)) {
+        log("CTA partenaire externe détecté — skip", "warn");
+        break;
+      }
       const nextFp = `${nextBtn.tagName}|${(nextBtn.getAttribute("type") || "").toLowerCase()}|${(nextBtn.getAttribute("href") || "").slice(0, 120)}|${nextLabel.toLowerCase()}`;
 
       if (!nextIsSubmit && nextFp === lastNonSubmitFingerprint) {

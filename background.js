@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.3.2";
+const EXT_VERSION = "1.3.3";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -1038,12 +1038,31 @@ async function ensureActiveSessionTabs() {
         await enforceOneTabPerPlatform("watchdog");
         continue;
       }
-      if (existing.length === 1) continue;
+      if (existing.length === 1) {
+        // LinkedIn often lands on /feed after auth — nudge back to jobs search.
+        if (platform === "linkedin") {
+          const url = existing[0].url || "";
+          if (!/\/jobs/i.test(url) && !/checkpoint|login|authwall|uas\//i.test(url)) {
+            const now = Date.now();
+            const last = lastPlatformReopenAt[platform] || 0;
+            if (now - last >= 20000) {
+              lastPlatformReopenAt[platform] = now;
+              await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
+              await appendLog("Onglet LinkedIn ramené vers la recherche", "warn", platform);
+            }
+          }
+        }
+        continue;
+      }
       const now = Date.now();
       const last = lastPlatformReopenAt[platform] || 0;
-      if (now - last < 15000) continue;
+      const debounceMs = platform === "linkedin" ? 10000 : 15000;
+      if (now - last < debounceMs) continue;
+      // Soft-reset reopen budget every ~3 minutes so a transient close can recover
+      if (now - last > 180000) platformReopenCount[platform] = 0;
+      const maxReopens = platform === "linkedin" ? 8 : 5;
       const count = platformReopenCount[platform] || 0;
-      if (count >= 5) continue;
+      if (count >= maxReopens) continue;
       lastPlatformReopenAt[platform] = now;
       platformReopenCount[platform] = count + 1;
       await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
@@ -1107,11 +1126,14 @@ chrome.tabs.onRemoved.addListener(async () => {
 
       const now = Date.now();
       const last = lastPlatformReopenAt[platform] || 0;
-      if (now - last < 20000) continue; // hard debounce 20s
+      const debounceMs = platform === "linkedin" ? 10000 : 20000;
+      if (now - last < debounceMs) continue; // hard debounce
+      if (now - last > 180000) platformReopenCount[platform] = 0;
+      const maxReopens = platform === "linkedin" ? 8 : 3;
       const count = platformReopenCount[platform] || 0;
-      if (count >= 3) {
+      if (count >= maxReopens) {
         await appendLog(
-          `Réouverture ${platform} bloquée (max 3) — évite crash PC`,
+          `Réouverture ${platform} bloquée (max ${maxReopens}) — évite crash PC`,
           "warn",
           platform
         );

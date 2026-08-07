@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.2";
+  const VERSION = "1.3.3";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -544,6 +544,7 @@
 
     try {
       let appliedThisRun = 0;
+      const processedIds = new Set();
       for (let i = 0; i < cards.length && !shouldStop; i++) {
         if (isBlockedPage()) {
           S().log(PLATFORM, "Protection Glassdoor détectée — arrêt session", "warn");
@@ -562,8 +563,16 @@
         if (!current?.active || (current?.applied || 0) >= maxJobs) break;
 
         const card = cards[i];
-        if (alreadyApplied(liveApplied, card.jobId) || alreadyApplied(appliedJobs, card.jobId)) continue;
+        const titleKey = String(card.title || "").trim().toLowerCase();
+        if (processedIds.has(card.jobId) || (titleKey && processedIds.has(`t:${titleKey}`))) continue;
+        if (alreadyApplied(liveApplied, card.jobId) || alreadyApplied(appliedJobs, card.jobId)) {
+          processedIds.add(card.jobId);
+          if (titleKey) processedIds.add(`t:${titleKey}`);
+          continue;
+        }
         Object.assign(appliedJobs, liveApplied);
+        processedIds.add(card.jobId);
+        if (titleKey) processedIds.add(`t:${titleKey}`);
 
         await clickJobCard(card);
         const jobInfo = {
@@ -613,16 +622,16 @@
           if (isIndeedHandoff) {
             S().log(PLATFORM, `Handoff Indeed: ${jobInfo.title} — attente Smart Apply`, "success");
             let handoffDone = false;
-            const appliedBefore = session.applied || 0;
-            for (let w = 0; w < 90; w++) {
+            const appliedBefore = current.applied || 0;
+            for (let w = 0; w < 55; w++) {
               if (shouldStop) break;
-              const { sessionGlassdoor: sWait, appliedJobs = {} } = await chrome.storage.local.get([
+              const { sessionGlassdoor: sWait, appliedJobs: jobsWait = {} } = await chrome.storage.local.get([
                 "sessionGlassdoor",
                 "appliedJobs",
               ]);
               if (
-                alreadyApplied(appliedJobs, jobInfo.jobId) ||
-                alreadyApplied(appliedJobs, sWait?.currentJk)
+                alreadyApplied(jobsWait, jobInfo.jobId) ||
+                alreadyApplied(jobsWait, sWait?.currentJk)
               ) {
                 handoffDone = true;
                 break;
@@ -670,15 +679,25 @@
               });
             }
             if (matched) {
+              if (!alreadyApplied(jobsNow, jobInfo.jobId)) {
+                await chrome.runtime.sendMessage({
+                  action: "markApplied",
+                  platform: PLATFORM,
+                  jobId: jobInfo.jobId,
+                  title: jobInfo.title,
+                  company: jobInfo.company,
+                  url: jobInfo.url,
+                });
+              }
               appliedThisRun++;
               S().log(PLATFORM, `Postulé (via Indeed): ${jobInfo.title}`, "success");
             } else {
               await chrome.runtime.sendMessage({
-                action: "markError",
+                action: "markSkipped",
                 platform: PLATFORM,
                 jobId: jobInfo.jobId,
                 title: jobInfo.title,
-                error: "indeed_handoff_timeout",
+                reason: "indeed_handoff_timeout",
               });
               S().log(PLATFORM, `Smart Apply Indeed non terminé: ${jobInfo.title}`, "warn");
             }
