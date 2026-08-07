@@ -496,6 +496,23 @@
     );
   }
 
+  async function alreadyHandled(jobId) {
+    if (!jobId) return false;
+    const { appliedJobs = {}, skippedJobs = {} } = await chrome.storage.local.get([
+      "appliedJobs",
+      "skippedJobs",
+    ]);
+    if (alreadyApplied(appliedJobs, jobId)) return true;
+    const keys = Object.keys(skippedJobs || {});
+    return keys.some(
+      (k) =>
+        k === jobId ||
+        k === `gd_${jobId}` ||
+        k.endsWith(`_${jobId}`) ||
+        (skippedJobs[k]?.title && false)
+    );
+  }
+
   async function runAutoApplySession() {
     if (isRunning) return;
     const now = Date.now();
@@ -572,7 +589,11 @@
         const card = cards[i];
         const titleKey = String(card.title || "").trim().toLowerCase();
         if (processedIds.has(card.jobId) || (titleKey && processedIds.has(`t:${titleKey}`))) continue;
-        if (alreadyApplied(liveApplied, card.jobId) || alreadyApplied(appliedJobs, card.jobId)) {
+        if (
+          alreadyApplied(liveApplied, card.jobId) ||
+          alreadyApplied(appliedJobs, card.jobId) ||
+          (await alreadyHandled(card.jobId))
+        ) {
           processedIds.add(card.jobId);
           if (titleKey) processedIds.add(`t:${titleKey}`);
           continue;
