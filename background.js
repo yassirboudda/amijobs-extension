@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.3.7";
+const EXT_VERSION = "1.3.8";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS = {
   autoSubmit: true,
   onlyEasyApply: true,
   allowExternalApply: true,
+  skipFormationOffers: true,
   maxConsecutiveNoApplyPages: 20,
   maxApplicationsPerCompany: 0,
 };
@@ -69,6 +70,7 @@ function sanitizeSettings(settings = {}) {
   s.autoSubmit = s.autoSubmit !== false;
   s.onlyEasyApply = s.onlyEasyApply !== false;
   s.allowExternalApply = s.allowExternalApply !== false;
+  s.skipFormationOffers = s.skipFormationOffers !== false;
   return s;
 }
 
@@ -511,6 +513,26 @@ async function openExternalApply(msg = {}) {
     await appendLog(`Refus site entreprise (URL job board): ${url.slice(0, 100)}`, "warn", "external");
     return { ok: false, success: false, reason: "job_board_url", url };
   }
+
+  // Free-Work / Malt / etc. are partner boards, not employer ATS — never open them
+  try {
+    const host = new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+    if (
+      host === "free-work.com" ||
+      host.endsWith(".free-work.com") ||
+      host === "freelance.com" ||
+      host.endsWith(".freelance.com") ||
+      host === "malt.fr" ||
+      host === "malt.com" ||
+      host.endsWith(".malt.fr") ||
+      host.endsWith(".malt.com") ||
+      host === "codeur.com" ||
+      host.endsWith(".codeur.com")
+    ) {
+      await appendLog(`Refus partenaire non supporté: ${host}`, "warn", "external");
+      return { ok: false, success: false, reason: "unsupported_partner", url };
+    }
+  } catch (_e) {}
 
   await chrome.storage.local.set({
     sessionExternalApply: {
@@ -1560,6 +1582,7 @@ async function startMultiSession(msg) {
       buildLinkedInSearchUrl(keywords, location, contracts, {
         onlyEasyApply: settings.onlyEasyApply,
         allowExternalApply: settings.allowExternalApply,
+        skipFormationOffers: settings.skipFormationOffers,
       });
     urls.linkedin = searchUrl;
     updates.sessionLinkedin = emptyPlatformSession("linkedin", {

@@ -1,4 +1,4 @@
-// AmiJobs — Generic company-website / ATS auto-apply (v1.3.7)
+// AmiJobs — Generic company-website / ATS auto-apply (v1.3.8)
 // Runs on external career sites opened from LinkedIn (or other boards).
 (function () {
   if (window.__AmijobsExternalApplyLoaded) return;
@@ -14,7 +14,7 @@
   window.__AmijobsExternalApplyLoaded = true;
 
   const PLATFORM = "external";
-  const VERSION = "1.3.7";
+  const VERSION = "1.3.8";
   let running = false;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

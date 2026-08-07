@@ -3,7 +3,7 @@
   window.__AmijobsHelloworkLoaded = true;
 
   // v1.0.26 — Blacklisted companies (profil candidat)
-  const VERSION = "1.3.7";
+  const VERSION = "1.3.8";
   let isRunning = false;
   let shouldStop = false;
 
@@ -1718,6 +1718,28 @@
         continue;
       }
 
+      if (
+        window.AmiJobsCompanySite &&
+        (await window.AmiJobsCompanySite.shouldSkipFormationOffer(target.title || "", companyForCheck))
+      ) {
+        await setSession({
+          phase: "search",
+          currentOfferUrl: "",
+          visitedOffers: { ...visitedOffers, [key]: true },
+        });
+        await chrome.runtime.sendMessage({
+          action: "markSkipped",
+          platform: "hellowork",
+          jobId: target.jobId,
+          title: target.title || companyForCheck,
+          url: target.url,
+          reason: "Offre de formation / CFA (filtrée)",
+        });
+        log(`Offre ignorée (formation/CFA): ${target.title || target.url}`, "warn");
+        await sleep(jitter(300, 700));
+        continue;
+      }
+
       const { autoApplySettings = {} } = await chrome.storage.local.get(["autoApplySettings"]);
       const maxPerCo = autoApplySettings.maxApplicationsPerCompany || 0;
       if (maxPerCo > 0 && companyForCheck) {
@@ -1811,6 +1833,34 @@
       `Offre: "${title}" (entreprise détectée: "${company || "(non trouvée)"}", Vérification blacklist avec: "${companyForBlacklist || title}")`
     );
 
+    if (
+      window.AmiJobsCompanySite &&
+      (await window.AmiJobsCompanySite.shouldSkipFormationOffer(title, companyForBlacklist || company))
+    ) {
+      const visitedOffers = session.visitedOffers || {};
+      await setSession({
+        phase: "search",
+        currentOfferUrl: "",
+        visitedOffers: { ...visitedOffers, [offerKey]: true },
+      });
+      await chrome.runtime.sendMessage({
+        action: "markSkipped",
+        platform: "hellowork",
+        jobId,
+        title,
+        url: window.location.href,
+        reason: "Offre de formation / CFA (filtrée)",
+      });
+      log("Offre ignorée (formation/CFA): " + title, "warn");
+      const refreshed = await getSession();
+      const backUrl = sessionSearchReturnUrl(refreshed, refreshed?.resumeSearchUrl || "");
+      if (backUrl) {
+        await sleep(jitter(800, 1600));
+        window.location.href = backUrl;
+      }
+      return;
+    }
+
     if (companyForBlacklist && (await isCompanyBlacklisted(companyForBlacklist))) {
       const visitedOffers = session.visitedOffers || {};
       await setSession({
@@ -1892,8 +1942,11 @@
         const allowExternal = (await chrome.storage.local.get(["autoApplySettings"])).autoApplySettings
           ?.allowExternalApply !== false;
         const externalSiteOffers = refreshedBefore?.externalSiteOffers || {};
+        const unsupported =
+          (window.AmiJobsCompanySite && window.AmiJobsCompanySite.isUnsupportedExternalUrl(partnerHref)) ||
+          /free-work\.com|freelance\.com|malt\.(fr|com)|codeur\.com/i.test(partnerHref);
 
-        // Mark before openExternalApply so a racing offer tab cannot re-enter
+        // Mark before any external attempt so a racing offer tab cannot re-enter
         await setSession({
           phase: "search",
           currentOfferUrl: "",
@@ -1901,10 +1954,19 @@
           visitedOffers: { ...(refreshedBefore?.visitedOffers || {}), [offerKey]: true },
         });
 
-        if (allowExternal && window.AmiJobsCompanySite) {
+        if (unsupported) {
+          await chrome.runtime.sendMessage({
+            action: "markSkipped",
+            platform: "hellowork",
+            jobId,
+            title,
+            url: window.location.href,
+            reason: "Partenaire Free-Work / board non supporté",
+          });
+          log("Offre ignorée (partenaire non supporté): " + partnerHref.slice(0, 80), "warn");
+        } else if (allowExternal && window.AmiJobsCompanySite) {
           log("Site recruteur/partenaire — candidature externe: " + partnerHref.slice(0, 100), "info");
           // Pass URL only — do not click (window.open is blocked for non-HelloWork).
-          // Cap wait so Free-Work/Google login cannot freeze the HelloWork offer loop.
           const extRes = await Promise.race([
             window.AmiJobsCompanySite.apply({
               url: partnerHref,

@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.3.7";
+  const VERSION = "1.3.8";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -1095,6 +1095,22 @@
             skipReason === "blacklist"
               ? `Blacklistée: ${item.company}`
               : `Limite entreprise (${item.company})`,
+        });
+        qIndex++;
+        await setSession({ qIndex });
+        continue;
+      }
+
+      if (
+        window.AmiJobsCompanySite &&
+        (await window.AmiJobsCompanySite.shouldSkipFormationOffer(item.title || "", item.company || ""))
+      ) {
+        await chrome.runtime.sendMessage({
+          action: "markSkipped",
+          platform: PLATFORM,
+          jobId: item.jobId,
+          title: item.title,
+          reason: "Offre de formation / CFA (filtrée)",
         });
         qIndex++;
         await setSession({ qIndex });

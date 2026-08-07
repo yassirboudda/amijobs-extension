@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.7";
+  const VERSION = "1.3.8";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -696,6 +696,20 @@
             jobId: jobInfo.jobId,
             title: jobInfo.title,
             reason: `Limite entreprise (${jobInfo.company})`,
+          });
+          continue;
+        }
+
+        if (
+          window.AmiJobsCompanySite &&
+          (await window.AmiJobsCompanySite.shouldSkipFormationOffer(jobInfo.title || "", jobInfo.company || ""))
+        ) {
+          await chrome.runtime.sendMessage({
+            action: "markSkipped",
+            platform: PLATFORM,
+            jobId: jobInfo.jobId,
+            title: jobInfo.title,
+            reason: "Offre de formation / CFA (filtrée)",
           });
           continue;
         }

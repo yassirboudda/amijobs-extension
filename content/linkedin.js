@@ -14,7 +14,7 @@
   if (window.__AmijobsLinkedinLoaded) return;
   window.__AmijobsLinkedinLoaded = true;
 
-  const VERSION = "1.3.7";
+  const VERSION = "1.3.8";
   let isRunning = false;
   let shouldStop = false;
   const sessionStats = { applied: 0, skipped: 0, errors: 0 };
@@ -1809,6 +1809,20 @@
           await chrome.runtime.sendMessage({
             action: "markSkipped", platform: "linkedin", jobId: jobInfo.jobId,
             title: jobInfo.title, reason: `Blacklistée: ${jobInfo.company}`,
+          }).catch(() => {});
+          continue;
+        }
+
+        if (
+          window.AmiJobsCompanySite &&
+          (await window.AmiJobsCompanySite.shouldSkipFormationOffer(jobInfo.title || "", jobInfo.company || ""))
+        ) {
+          await chrome.runtime.sendMessage({
+            action: "markSkipped",
+            platform: "linkedin",
+            jobId: jobInfo.jobId,
+            title: jobInfo.title,
+            reason: "Offre de formation / CFA (filtrée)",
           }).catch(() => {});
           continue;
         }

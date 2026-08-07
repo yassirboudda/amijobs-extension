@@ -114,6 +114,7 @@ async function load() {
   $("autoSubmit").checked = settings.autoSubmit !== false;
   $("onlyEasyApply").checked = settings.onlyEasyApply !== false;
   $("allowExternalApply").checked = settings.allowExternalApply !== false;
+  $("skipFormationOffers").checked = settings.skipFormationOffers !== false;
 }
 
 async function save() {
@@ -148,6 +149,7 @@ async function save() {
 
   const onlyEasy = $("onlyEasyApply").checked;
   const allowExternal = $("allowExternalApply").checked;
+  const skipFormation = $("skipFormationOffers").checked;
   const autoApplySettings = {
     maxJobsPerSession: Math.min(Math.max(parseInt($("maxJobsPerSession").value, 10) || 25, 1), 10000),
     delayBetweenJobs: {
@@ -161,6 +163,7 @@ async function save() {
     autoSubmit: $("autoSubmit").checked,
     onlyEasyApply: onlyEasy,
     allowExternalApply: allowExternal,
+    skipFormationOffers: skipFormation,
     maxConsecutiveNoApplyPages: Math.min(Math.max(parseInt($("maxNoApplyPages").value, 10) || 20, 1), 50),
     maxApplicationsPerCompany: Math.max(parseInt($("maxApplicationsPerCompany").value, 10) || 0, 0),
   };
