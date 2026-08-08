@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.8";
+  const VERSION = "1.3.9";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -355,18 +355,36 @@
     ]);
   }
 
-  function findApplyButton() {
-    // Live headed Chrome (HAR cookies): button[data-test="easyApply"] text "Candidature facile"
-    // → opens smartapply.indeed.com/beta/indeedapply/applybyapplyablejobid?...
+  function findEasyApplyButton() {
     const selectors = [
       'button[data-test="easyApply"]',
       '[data-test="easyApply"]',
+      '[data-test="easy-apply-button"]',
+      'button[aria-label*="Easy Apply" i]',
+      'button[aria-label*="Candidature facile" i]',
+      'button[aria-label*="Candidature simplifiée" i]',
+    ];
+    for (const sel of selectors) {
+      const el = S().$(sel);
+      if (el && S().isVisible(el) && !isCompanySiteApplyButton(el)) return el;
+    }
+    return S().findActionButton([
+      /candidature facile/i,
+      /easy apply/i,
+      /candidature simplifiée/i,
+      /postuler facilement/i,
+      /quick apply/i,
+    ]);
+  }
+
+  function findApplyButton() {
+    const easy = findEasyApplyButton();
+    if (easy) return easy;
+    const selectors = [
       '[data-test="applyButton"]',
       '[data-test="apply-button"]',
-      '[data-test="easy-apply-button"]',
       'button[data-test*="apply" i]',
       'a[data-test*="apply" i]',
-      'button[aria-label*="Easy Apply" i]',
       'button[aria-label*="Candidature" i]',
       'button[aria-label*="Postuler" i]',
     ];
@@ -374,15 +392,7 @@
       const el = S().$(sel);
       if (el && S().isVisible(el)) return el;
     }
-    return S().findActionButton([
-      /candidature facile/i,
-      /easy apply/i,
-      /candidature simplifiée/i,
-      /postuler facilement/i,
-      /^postuler$/i,
-      /apply now/i,
-      /quick apply/i,
-    ]);
+    return S().findActionButton([/^postuler$/i, /apply now/i]);
   }
 
   async function tryCompanySiteApply(settings, jobInfo, clickEl = null) {
@@ -394,10 +404,20 @@
     }
     const btn = clickEl || findCompanySiteButton();
     if (!btn) return { success: false, reason: "no_company_site" };
+    const href = window.AmiJobsCompanySite.hrefOf(btn);
+    if (
+      !href ||
+      window.AmiJobsCompanySite.isJobBoardUrl(href) ||
+      window.AmiJobsCompanySite.isUnsupportedExternalUrl(href)
+    ) {
+      // Never burn 55s resolving empty / job-board / Free-Work links
+      return { success: false, reason: "no_url" };
+    }
     S().log(PLATFORM, `Site entreprise détecté — candidature externe: ${jobInfo.title || jobInfo.jobId}`);
     const extRes = await Promise.race([
       window.AmiJobsCompanySite.apply({
-        clickEl: btn,
+        url: href,
+        clickEl: null,
         jobInfo: {
           jobId: jobInfo.jobId,
           title: jobInfo.title,
@@ -406,7 +426,7 @@
         },
         sourcePlatform: "glassdoor",
       }),
-      S().sleep(55000).then(() => ({ ok: false, success: false, reason: "timeout" })),
+      S().sleep(20000).then(() => ({ ok: false, success: false, reason: "timeout" })),
     ]);
     if (extRes?.ok || extRes?.success) {
       return { success: true, reason: "company_site_applied", url: extRes.url };
@@ -477,81 +497,83 @@
     return { success: false, reason: "wizard_timeout" };
   }
 
+  async function waitForEasyApplyButton(timeoutMs = 10000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const btn = findEasyApplyButton();
+      if (btn) return btn;
+      await S().sleep(400);
+    }
+    return null;
+  }
+
   async function applyCurrentJob(settings, jobInfo) {
     const info = jobInfo || getJobInfo("current");
-    const btn = await waitForApplyButton();
-    if (!btn) {
-      const companyRes = await tryCompanySiteApply(settings, info);
-      if (companyRes.success || companyRes.reason !== "no_company_site") return companyRes;
-      return { success: false, reason: "no_easy_apply" };
-    }
-
-    if (isCompanySiteApplyButton(btn)) {
-      return tryCompanySiteApply(settings, info, btn);
-    }
-
-    // Persist context so Indeed Smart Apply tab can resume
-    const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
-    if (session?.active) {
-      await chrome.storage.local.set({
-        sessionGlassdoor: {
-          ...session,
-          currentJk: info.jobId,
-          currentTitle: info.title,
-          currentCompany: info.company,
-          awaitingIndeed: true,
-          indeedHandoffDone: false,
-          lastRunAt: Date.now(),
-        },
-      });
-    }
-
-    await chrome.runtime.sendMessage({
-      action: "watchIndeedApplyFromGlassdoor",
-      jobInfo: info,
-    });
-
-    await S().humanClick(btn);
-    await S().sleep(S().randomDelay(1500, 2500));
-
-    // Same-tab redirect to Indeed / partner listing
-    if (detectIndeedHandoff()) {
-      S().log(PLATFORM, "Redirection Indeed Smart Apply détectée", "success");
-      return { success: true, reason: "indeed_handoff" };
-    }
-
-    // Wait for popup/new tab handoff signal from background (live test: opens smartapply tab)
-    for (let i = 0; i < 20; i++) {
-      if (detectApplySuccess()) return { success: true };
-      if (detectIndeedHandoff()) return { success: true, reason: "indeed_handoff" };
-      const { sessionGlassdoor: s } = await chrome.storage.local.get(["sessionGlassdoor"]);
-      if (s?.indeedHandoffDone) {
+    // Prefer Easy Apply (→ Indeed Smart Apply). Company-site only with a real employer URL.
+    const btn = await waitForEasyApplyButton(8000);
+    if (btn) {
+      const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
+      if (session?.active) {
         await chrome.storage.local.set({
-          sessionGlassdoor: { ...s, indeedHandoffDone: false, awaitingIndeed: true },
+          sessionGlassdoor: {
+            ...session,
+            currentJk: info.jobId,
+            currentTitle: info.title,
+            currentCompany: info.company,
+            awaitingIndeed: true,
+            indeedHandoffDone: false,
+            lastRunAt: Date.now(),
+          },
         });
-        S().log(PLATFORM, "Onglet Indeed Smart Apply ouvert", "success");
-        return { success: true, reason: "indeed_tab" };
       }
-      // Only run on-page Glassdoor wizard if a real modal appeared
-      const modalNext = S().findActionButton([
-        /continue|continuer|next|suivant|submit|soumettre|envoyer/i,
-      ]);
-      const dialog = S().$('[role="dialog"], .modal, [class*="Modal"]');
-      if (modalNext && dialog && S().isVisible(dialog)) {
-        return runApplyWizard(info, settings);
+
+      await chrome.runtime.sendMessage({
+        action: "watchIndeedApplyFromGlassdoor",
+        jobInfo: info,
+      });
+
+      await S().humanClick(btn);
+      await S().sleep(S().randomDelay(1500, 2500));
+
+      if (detectIndeedHandoff()) {
+        S().log(PLATFORM, "Redirection Indeed Smart Apply détectée", "success");
+        return { success: true, reason: "indeed_handoff" };
       }
-      await S().sleep(600);
+
+      for (let i = 0; i < 16; i++) {
+        if (detectApplySuccess()) return { success: true };
+        if (detectIndeedHandoff()) return { success: true, reason: "indeed_handoff" };
+        const { sessionGlassdoor: s } = await chrome.storage.local.get(["sessionGlassdoor"]);
+        if (s?.indeedHandoffDone) {
+          await chrome.storage.local.set({
+            sessionGlassdoor: { ...s, indeedHandoffDone: false, awaitingIndeed: true },
+          });
+          S().log(PLATFORM, "Onglet Indeed Smart Apply ouvert", "success");
+          return { success: true, reason: "indeed_tab" };
+        }
+        const modalNext = S().findActionButton([
+          /continue|continuer|next|suivant|submit|soumettre|envoyer/i,
+        ]);
+        const dialog = S().$('[role="dialog"], .modal, [class*="Modal"]');
+        if (modalNext && dialog && S().isVisible(dialog)) {
+          return runApplyWizard(info, settings);
+        }
+        await S().sleep(600);
+      }
+
+      S().log(PLATFORM, "Handoff Indeed assumé (pas de wizard Glassdoor)", "warn");
+      const { sessionGlassdoor: sAssumed } = await chrome.storage.local.get(["sessionGlassdoor"]);
+      if (sAssumed?.active) {
+        await chrome.storage.local.set({
+          sessionGlassdoor: { ...sAssumed, awaitingIndeed: true },
+        });
+      }
+      return { success: true, reason: "indeed_handoff_assumed" };
     }
 
-    // Easy Apply on Glassdoor almost always opens Indeed — do NOT fall into empty wizard_timeout
-    S().log(PLATFORM, "Handoff Indeed assumé (pas de wizard Glassdoor)", "warn");
-    const { sessionGlassdoor: sAssumed } = await chrome.storage.local.get(["sessionGlassdoor"]);
-    if (sAssumed?.active) {
-      await chrome.storage.local.set({
-        sessionGlassdoor: { ...sAssumed, awaitingIndeed: true },
-      });
-    }
-    return { success: true, reason: "indeed_handoff_assumed" };
+    const companyRes = await tryCompanySiteApply(settings, info);
+    if (companyRes.success) return companyRes;
+    return { success: false, reason: companyRes.reason || "no_easy_apply" };
   }
 
   function alreadyApplied(appliedJobs, jobId) {
@@ -564,21 +586,25 @@
     );
   }
 
-  async function alreadyHandled(jobId) {
-    if (!jobId) return false;
+  function titleAlreadyHandled(store, title) {
+    const t = String(title || "").trim().toLowerCase();
+    if (!t) return false;
+    return Object.values(store || {}).some((v) => String(v?.title || "").trim().toLowerCase() === t);
+  }
+
+  async function alreadyHandled(jobId, title = "") {
+    if (!jobId && !title) return false;
     const { appliedJobs = {}, skippedJobs = {} } = await chrome.storage.local.get([
       "appliedJobs",
       "skippedJobs",
     ]);
-    if (alreadyApplied(appliedJobs, jobId)) return true;
+    if (jobId && alreadyApplied(appliedJobs, jobId)) return true;
+    if (title && (titleAlreadyHandled(appliedJobs, title) || titleAlreadyHandled(skippedJobs, title))) {
+      return true;
+    }
+    if (!jobId) return false;
     const keys = Object.keys(skippedJobs || {});
-    return keys.some(
-      (k) =>
-        k === jobId ||
-        k === `gd_${jobId}` ||
-        k.endsWith(`_${jobId}`) ||
-        (skippedJobs[k]?.title && false)
-    );
+    return keys.some((k) => k === jobId || k === `gd_${jobId}` || k.endsWith(`_${jobId}`));
   }
 
   async function runAutoApplySession() {
@@ -660,7 +686,7 @@
         if (
           alreadyApplied(liveApplied, card.jobId) ||
           alreadyApplied(appliedJobs, card.jobId) ||
-          (await alreadyHandled(card.jobId))
+          (await alreadyHandled(card.jobId, card.title || titleKey))
         ) {
           processedIds.add(card.jobId);
           if (titleKey) processedIds.add(`t:${titleKey}`);
@@ -714,7 +740,7 @@
           continue;
         }
 
-        const btn = await waitForApplyButton(8000);
+        const btn = await waitForEasyApplyButton(8000);
         const companyBtn = !btn ? findCompanySiteButton() : null;
         if (!btn && !companyBtn) {
           await chrome.runtime.sendMessage({
@@ -750,7 +776,7 @@
             S().log(PLATFORM, `Handoff Indeed: ${jobInfo.title} — attente Smart Apply`, "success");
             let handoffDone = false;
             const appliedBefore = current.applied || 0;
-            for (let w = 0; w < 55; w++) {
+            for (let w = 0; w < 28; w++) {
               if (shouldStop) break;
               const { sessionGlassdoor: sWait, appliedJobs: jobsWait = {} } = await chrome.storage.local.get([
                 "sessionGlassdoor",
@@ -841,13 +867,20 @@
             S().log(PLATFORM, `Postulé: ${jobInfo.title}`, "success");
           }
         } else {
+          // Persist skip so tab restore cannot re-attack the same job (no_url loop)
           await chrome.runtime.sendMessage({
-            action: "markError",
+            action: "markSkipped",
             platform: PLATFORM,
             jobId: jobInfo.jobId,
             title: jobInfo.title,
-            error: result.reason || "error",
+            reason: result.reason || "error",
           });
+          const { sessionGlassdoor: sFail } = await chrome.storage.local.get(["sessionGlassdoor"]);
+          if (sFail?.awaitingIndeed) {
+            await chrome.storage.local.set({
+              sessionGlassdoor: { ...sFail, awaitingIndeed: false },
+            });
+          }
         }
 
         const jobDelay = Math.max(settings.delayBetweenJobs?.min || 500, 2500);

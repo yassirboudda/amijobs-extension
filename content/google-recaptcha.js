@@ -1,4 +1,4 @@
-// AmiJobs — Google reCAPTCHA checkbox clicker (v1.3.8)
+// AmiJobs — Google reCAPTCHA checkbox clicker (v1.3.9)
 (function () {
   if (window.__AmijobsRecaptchaLoaded) return;
   window.__AmijobsRecaptchaLoaded = true;

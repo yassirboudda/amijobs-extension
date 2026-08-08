@@ -3,7 +3,7 @@
   window.__AmijobsHelloworkLoaded = true;
 
   // v1.0.26 — Blacklisted companies (profil candidat)
-  const VERSION = "1.3.8";
+  const VERSION = "1.3.9";
   let isRunning = false;
   let shouldStop = false;
 
@@ -534,6 +534,7 @@
     if (/^\d+\s*(offres?|emplois?|résultats?)/i.test(line)) return true;
     if (/^(il y a|there are|voir|see also|en savoir plus)/i.test(line)) return true;
     if (/se connecter|continuer avec google|créer mon compte|hellowork avec google/i.test(line)) return true;
+    if (/trouver mon|créer une alerte|postuler facilement|voir l['']offre/i.test(line)) return true;
     if (line.length <= 2 || line.length >= 80) return true;
     return false;
   }
@@ -1649,6 +1650,12 @@
         `Page recherche: ${allLinks.length} offres, ${queue.length} nouvelles (${alreadyDone} déjà traitées toutes sessions)`
       );
 
+      // Empty SERP (end of results / broken page) — do not paginate forever
+      if (allLinks.length === 0) {
+        await endSession("Fin: page recherche vide (plus d'offres)");
+        return;
+      }
+
       if (queue.length === 0) {
         const noNewOfferPages = (session.noNewOfferPages || 0) + 1;
 
@@ -1661,7 +1668,8 @@
 
         if (!nextUrl) {
           const fallbackNext = buildFallbackNextPageUrl(currentSearch);
-          if (fallbackNext) {
+          // Cap fallback pagination hard — empty-ish runs must not walk to page 25
+          if (fallbackNext && noNewOfferPages <= Math.min(maxNoApplyPages, 5)) {
             nextUrl = fallbackNext;
             usedFallback = true;
             log("Pagination fallback (lien suivant introuvable): " + fallbackNext, "warn");
@@ -1670,7 +1678,7 @@
 
         const nextSearchKey = nextUrl ? searchPageKey(nextUrl) : "";
 
-        if (usedFallback && noNewOfferPages > maxNoApplyPages) {
+        if (usedFallback && noNewOfferPages > Math.min(maxNoApplyPages, 5)) {
           await endSession(`Fin: ${noNewOfferPages} pages consécutives sans nouvelles offres`);
           return;
         }

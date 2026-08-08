@@ -50,7 +50,7 @@
 
     // Known training / CFA brands & patterns (company name is the school, not an employer)
     if (
-      /\b(cfa|afpa|greta|aftral|iscod|ionis|ifocop|maestris|sup'?career|nuevo cfa|imc alternance|openclassrooms|simplon|wild code|le wagon)\b/i.test(
+      /\b(cfa|afpa|greta|aftral|iscod|ionis|ifocop|maestris|sup'?career|nuevo cfa|imc alternance|openclassrooms|simplon|wild code|le wagon|ifcv|ieft|aurlom|iffp)\b/i.test(
         companyOnly
       )
     ) {
@@ -79,7 +79,9 @@
 
     // Title is clearly a training enrollment pitch
     if (
-      /inscription formation|candidature (cfa|centre de formation)|apprenant(e)? h\/?f/i.test(String(title || ""))
+      /inscription formation|candidature (cfa|centre de formation)|apprenant(e)?\b|alternance\s*-\s*ifcv|\bifcv\b|\bieft\b|\baurlom\b/i.test(
+        String(title || "")
+      )
     ) {
       return true;
     }
