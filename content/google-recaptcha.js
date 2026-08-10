@@ -7,7 +7,6 @@
   let solving = false;
   let lastSolveAt = 0;
   let lastInjected = "";
-  let lastLoggedToken = "";
 
   function clickEl(el) {
     if (!el) return false;
@@ -309,8 +308,10 @@
               return true;
             }
             lastErr = res?.reason || "no_token";
-            // Don't retry other modes if workers explicitly failed this key
-            if (/workers could not solve/i.test(String(lastErr))) break;
+            // Wrong sitekey → try next mode/key (image/bframe keys often fail)
+            if (/workers could not solve|unsolvable|ERROR_CAPTCHA_UNSOLVABLE/i.test(String(lastErr))) {
+              continue;
+            }
           } catch (e) {
             lastErr = e?.message || "send_failed";
           }

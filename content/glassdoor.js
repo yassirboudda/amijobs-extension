@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.4.5";
+  const VERSION = "1.4.6";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -111,7 +111,7 @@
       return false;
     }
 
-    S().log(PLATFORM, "Challenge Cloudflare Glassdoor — clic case", "warn");
+    S().log(PLATFORM, "Challenge Cloudflare Glassdoor — 2captcha Turnstile + clic", "warn");
     try {
       await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
     } catch (_e) {
@@ -119,16 +119,20 @@
     }
     try {
       if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+      if (typeof window.__AmijobsSolveTurnstile === "function") window.__AmijobsSolveTurnstile(true);
     } catch (_e) {
       /* ignore */
     }
-    for (let i = 0; i < 12; i++) {
-      if (i > 0 && i % 3 === 0) {
+    const start = Date.now();
+    while (Date.now() - start < 130000) {
+      if (shouldStop) return false;
+      if ((Date.now() - start) % 20000 < 2000) {
         try {
           await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
-        } catch (_e) {
-          /* ignore */
-        }
+        } catch (_e) {}
+        try {
+          if (typeof window.__AmijobsSolveTurnstile === "function") window.__AmijobsSolveTurnstile(true);
+        } catch (_e) {}
       }
       for (const frame of S().$$(
         'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[title*="Widget"], iframe[title*="Cloudflare"]'
@@ -165,15 +169,14 @@
           }
         }
       }
-      await S().sleep(1500);
+      await S().sleep(2500);
       if (!needsCaptcha() && !S().$('iframe[src*="challenges.cloudflare.com"], .cf-turnstile')) {
         S().log(PLATFORM, "Challenge Cloudflare passé", "success");
         return true;
       }
-      try {
-        await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
-      } catch (_e) {
-        /* ignore */
+      if (collectJobCards().length > 0) {
+        S().log(PLATFORM, "Challenge Cloudflare passé (offres chargées)", "success");
+        return true;
       }
     }
     return !needsCaptcha();

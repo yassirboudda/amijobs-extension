@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AmiJobs",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "description": "Auto-apply to jobs across multiple job-application websites with AI-assisted form filling.",
   "icons": {
     "16": "icons/icon16.png",
@@ -42,6 +42,25 @@
     "service_worker": "background.js"
   },
   "content_scripts": [
+    {
+      "matches": [
+        "https://challenges.cloudflare.com/*",
+        "https://*.cloudflare.com/*",
+        "https://www.indeed.com/*",
+        "https://fr.indeed.com/*",
+        "https://*.indeed.com/*",
+        "https://smartapply.indeed.com/*",
+        "https://www.glassdoor.com/*",
+        "https://www.glassdoor.fr/*",
+        "https://*.glassdoor.com/*"
+      ],
+      "js": [
+        "content/turnstile-hook.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
+    },
     {
       "matches": [
         "https://challenges.cloudflare.com/*",

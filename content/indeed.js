@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.5";
+  const VERSION = "1.4.6";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -190,7 +190,7 @@
       !!S().$('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile');
     if (!hasWidget) return false;
 
-    S().log(PLATFORM, "Challenge Cloudflare détecté — clic sur la case", "warn");
+    S().log(PLATFORM, "Challenge Cloudflare détecté — 2captcha Turnstile + clic", "warn");
 
     const clickPoint = (el, xRatio = 0.12) => {
       if (!el) return;
@@ -218,7 +218,7 @@
       }
     };
 
-    // Ask background to inject turnstile script into all frames of this tab
+    // Inject hook + turnstile solver into all frames
     try {
       await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
     } catch (_e) {
@@ -226,26 +226,18 @@
     }
     try {
       if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+      if (typeof window.__AmijobsSolveTurnstile === "function") window.__AmijobsSolveTurnstile(true);
     } catch (_e) {
       /* ignore */
     }
-    // Retry inject a few times — Turnstile often mounts late
-    for (let injectTry = 0; injectTry < 3; injectTry++) {
-      await S().sleep(600);
-      try {
-        await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
-      } catch (_e) {
-        /* ignore */
-      }
-      try {
-        if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
-      } catch (_e) {
-        /* ignore */
-      }
-    }
 
-    for (let i = 0; i < 12; i++) {
-      // Click left side of Turnstile iframe (checkbox area)
+    const start = Date.now();
+    const maxMs = 130000; // 2captcha Turnstile can take ~1–2 min
+    let solveKicked = false;
+    while (Date.now() - start < maxMs) {
+      if (shouldStop) return false;
+
+      // Keep clicking while waiting for token
       const frames = S().$$(
         'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[title*="Widget"], iframe[title*="Cloudflare"]'
       );
@@ -253,9 +245,7 @@
         if (!S().isVisible(frame)) continue;
         clickPoint(frame, 0.1);
         clickPoint(frame, 0.15);
-        await S().sleep(400);
       }
-
       const widget = S().$(".cf-turnstile, #challenge-stage, [data-sitekey]");
       if (widget) clickPoint(widget, 0.1);
 
@@ -269,18 +259,20 @@
         }
       }
 
-      const cta = S().findActionButton([
-        /vérifiez que vous êtes humain/i,
-        /verify you are human/i,
-        /je ne suis pas un robot/i,
-        /i'?m not a robot/i,
-      ]);
-      if (cta) {
-        await S().humanClick(cta);
-        clickPoint(cta, 0.08);
+      // Kick / re-kick 2captcha every ~20s
+      if (!solveKicked || (Date.now() - start) % 20000 < 2500) {
+        solveKicked = true;
+        try {
+          await chrome.runtime.sendMessage({ action: "injectTurnstileClicker" });
+        } catch (_e) {}
+        try {
+          if (typeof window.__AmijobsSolveTurnstile === "function") {
+            window.__AmijobsSolveTurnstile(true);
+          }
+        } catch (_e) {}
       }
 
-      await S().sleep(1800);
+      await S().sleep(2500);
       const still =
         detectCloudflareChallenge() ||
         (document.body?.innerText || "").toLowerCase().includes("vérifiez que vous êtes humain");
@@ -288,8 +280,12 @@
         S().log(PLATFORM, "Challenge Cloudflare passé", "success");
         return true;
       }
+      // Job cards appeared → challenge cleared even if copy lingers
+      if (collectJobCards().length > 0 || isSmartApplyPage()) {
+        S().log(PLATFORM, "Challenge Cloudflare passé (contenu chargé)", "success");
+        return true;
+      }
     }
-    // Don't kill the session immediately — leave page for manual click if needed
     S().log(PLATFORM, "Challenge Cloudflare toujours présent — nouvelle tentative plus tard", "warn");
     return false;
   }
@@ -351,8 +347,11 @@
       text.includes("this job has expired") ||
       text.includes("cette offre a expiré") ||
       text.includes("offre n'est plus disponible") ||
+      text.includes("additional verification required") ||
+      text.includes("vérification supplémentaire") ||
       title.includes("page introuvable") ||
-      /page introuvable|not found|404/.test(h1)
+      title.includes("additional verification") ||
+      /page introuvable|not found|404|additional verification/.test(h1)
     );
   }
 
@@ -1260,6 +1259,21 @@
       return;
     }
 
+    // Always pause Indeed SERP while ANY Smart Apply wizard tab is open
+    // (previously only paused during Glassdoor handoff — Indeed-only mass apply kept
+    // opening new jobs and killed the wizard via tab merge / focus thrash).
+    try {
+      const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
+      const hasSmart =
+        tabs?.hasSmartApply ||
+        /smartapply|indeedapply/i.test(location.href);
+      if (hasSmart && isSearchPage()) {
+        S().log(PLATFORM, "Pause SERP — Smart Apply en cours", "warn");
+        await S().sleep(4000);
+        return;
+      }
+    } catch (_e) {}
+
     // Yield Indeed SERP while Glassdoor owns the single Indeed tab for Smart Apply
     const { sessionGlassdoor = null, glassdoorSmartApply = null } = await chrome.storage.local.get([
       "sessionGlassdoor",
@@ -1277,8 +1291,6 @@
         sessionGlassdoor: { ...sessionGlassdoor, awaitingIndeed: false, indeedHandoffDone: false },
       });
     } else if (gdAwaiting || gdSmartAge < 90000) {
-      // Only pause SERP if a Smart Apply tab actually exists; otherwise Glassdoor
-      // awaitingIndeed alone freezes Indeed forever while Glassdoor is stuck looping.
       const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
       const hasSmart =
         tabs?.hasSmartApply ||

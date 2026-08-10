@@ -5,7 +5,7 @@ let uiLang = "fr";
 let formTouched = false;
 
 try {
-  const ver = chrome.runtime.getManifest()?.version || "1.4.5";
+  const ver = chrome.runtime.getManifest()?.version || "1.4.6";
   const el = $("extVersion");
   if (el) el.textContent = `v${ver}`;
 } catch (_e) {}

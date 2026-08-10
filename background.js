@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.4.5";
+const EXT_VERSION = "1.4.6";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -945,7 +945,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         chrome.scripting
           .executeScript({
             target: { tabId, allFrames: true },
-            files: ["content/cloudflare-turnstile.js"],
+            files: ["content/turnstile-hook.js", "content/cloudflare-turnstile.js"],
           })
           .catch(() => {});
         chrome.scripting
@@ -954,6 +954,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
             func: () => {
               try {
                 if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+                if (typeof window.__AmijobsSolveTurnstile === "function") window.__AmijobsSolveTurnstile(true);
               } catch (_e) {}
             },
           })
@@ -1226,6 +1227,9 @@ async function solveCaptchaWith2Captcha({
   websiteURL,
   websiteKey,
   pageAction = "",
+  data = "",
+  pagedata = "",
+  userAgent = "",
   isEnterprise = false,
   isInvisible = false,
 } = {}) {
@@ -1247,7 +1251,11 @@ async function solveCaptchaWith2Captcha({
       websiteURL: pageUrl,
       websiteKey: siteKey,
     };
+    // Cloudflare Challenge pages REQUIRE these extras when available
     if (pageAction) task.action = pageAction;
+    if (data) task.data = data;
+    if (pagedata) task.pagedata = pagedata;
+    if (userAgent) task.userAgent = userAgent;
   } else if (isEnterprise || t.includes("enterprise")) {
     task = {
       type: "RecaptchaV2EnterpriseTaskProxyless",
@@ -1281,7 +1289,7 @@ async function solveCaptchaWith2Captcha({
     const taskId = created?.taskId;
     if (!taskId) return { ok: false, reason: "no_task_id" };
 
-    const deadline = Date.now() + 120000;
+    const deadline = Date.now() + 150000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 5000));
       const pollRes = await fetch(TWOCAPTCHA_RESULT, {
@@ -1302,7 +1310,12 @@ async function solveCaptchaWith2Captcha({
           "";
         if (!token) return { ok: false, reason: "empty_token" };
         await appendLog("2captcha: captcha résolu", "success");
-        return { ok: true, token, taskId };
+        return {
+          ok: true,
+          token,
+          taskId,
+          userAgent: polled?.solution?.userAgent || userAgent || "",
+        };
       }
     }
     return { ok: false, reason: "timeout" };
@@ -1600,15 +1613,18 @@ async function ensureActiveSessionTabs() {
       if (existing.length === 1) {
         const tabUrl = existing[0].url || "";
         // Indeed: if only Smart Apply is open, restore SERP in a second tab (do not navigate Apply)
+        // Skip while session is mid-apply — restoring SERP caused dual-tab thrash + wizard_timeout.
         if (
           platform === "indeed" &&
           !session.fromGlassdoor &&
           /smartapply|indeedapply/i.test(tabUrl) &&
-          searchUrl
+          searchUrl &&
+          session.phase !== "apply" &&
+          session.phase !== "viewjob"
         ) {
           const now = Date.now();
           const last = lastPlatformReopenAt[platform] || 0;
-          if (now - last >= 20000) {
+          if (now - last >= 45000) {
             lastPlatformReopenAt[platform] = now;
             await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
             await appendLog("SERP Indeed restaurée (Smart Apply conservé)", "warn", platform);
@@ -1972,7 +1988,7 @@ function handleMessage(msg, sendResponse, sender = null) {
       try {
         await chrome.scripting.executeScript({
           target: { tabId, allFrames: true },
-          files: ["content/cloudflare-turnstile.js"],
+          files: ["content/turnstile-hook.js", "content/cloudflare-turnstile.js"],
         });
         // Force re-click even if the content script was already loaded
         const results = await chrome.scripting.executeScript({
@@ -1985,29 +2001,20 @@ function handleMessage(msg, sendResponse, sender = null) {
             } catch (_e) {
               /* ignore */
             }
-            const click = (el) => {
-              if (!el) return;
-              const r = el.getBoundingClientRect();
-              const x = r.left + Math.min(22, Math.max(8, r.width * 0.12));
-              const y = r.top + r.height / 2;
-              const t = document.elementFromPoint(x, y) || el;
-              const o = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window, buttons: 1 };
-              for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-                try {
-                  t.dispatchEvent(new MouseEvent(type, o));
-                } catch (_e) {}
+            return { clicked: false, href: location.href.slice(0, 120) };
+          },
+        });
+        // Also kick 2captcha solve in all frames
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          func: () => {
+            try {
+              if (typeof window.__AmijobsSolveTurnstile === "function") {
+                window.__AmijobsSolveTurnstile(true);
+                return true;
               }
-              try {
-                el.click();
-              } catch (_e) {}
-            };
-            const nodes = [
-              ...document.querySelectorAll(
-                'input[type="checkbox"], [role="checkbox"], label.cb-lb, .cb-lb, .cf-turnstile, #challenge-stage, iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"]'
-              ),
-            ];
-            nodes.forEach(click);
-            return { clicked: nodes.length > 0, href: location.href.slice(0, 120), n: nodes.length };
+            } catch (_e) {}
+            return false;
           },
         });
         // Trusted CDP click — synthetic events are often ignored by Turnstile
@@ -2019,6 +2026,43 @@ function handleMessage(msg, sendResponse, sender = null) {
         });
       } catch (err) {
         sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.action === "injectTurnstileToken") {
+    (async () => {
+      const tabId = msg.tabId || sender?.tab?.id;
+      const token = msg.token || "";
+      if (!tabId || !token) {
+        sendResponse({ ok: false, reason: "missing" });
+        return;
+      }
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          world: "MAIN",
+          func: (tok) => {
+            try {
+              window.postMessage({ source: "amijobs-cf-token", token: tok }, "*");
+              for (const input of document.querySelectorAll(
+                '[name="cf-turnstile-response"], input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], [name="g-recaptcha-response"]'
+              )) {
+                input.value = tok;
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+              }
+              if (typeof window.__AmijobsCfCallback === "function") window.__AmijobsCfCallback(tok);
+              if (typeof window.cfCallback === "function") window.cfCallback(tok);
+              if (typeof window.tsCallback === "function") window.tsCallback(tok);
+            } catch (_e) {}
+          },
+          args: [token],
+        });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, reason: e.message });
       }
     })();
     return true;
@@ -2201,6 +2245,9 @@ function handleMessage(msg, sendResponse, sender = null) {
         websiteURL: msg.websiteURL || msg.pageUrl || msg.url || "",
         websiteKey: msg.websiteKey || msg.sitekey || msg.siteKey || "",
         pageAction: msg.pageAction || msg.actionName || "",
+        data: msg.data || msg.cData || "",
+        pagedata: msg.pagedata || msg.chlPageData || msg.pageData || "",
+        userAgent: msg.userAgent || "",
         isEnterprise: !!msg.isEnterprise || /enterprise/i.test(String(msg.type || "")),
         isInvisible: !!msg.isInvisible,
       });
