@@ -14,7 +14,7 @@
   window.__AmijobsExternalApplyLoaded = true;
 
   const PLATFORM = "external";
-  const VERSION = "1.4.0";
+  const VERSION = "1.4.2";
   let running = false;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
