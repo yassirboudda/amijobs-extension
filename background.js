@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.4.1";
+const EXT_VERSION = "1.4.2";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -482,6 +482,41 @@ async function enforceOneTabPerPlatform(reason = "") {
           await appendLog(`Onglets indeed fusionnés (SERP+Apply) — ${reason}`, "warn", platform);
         }
         continue;
+      }
+
+      // Glassdoor: keep job-detail + search briefly — closing the detail tab kills Easy Apply mid-click
+      if (platform === "glassdoor") {
+        const detailTabs = tabs.filter((t) =>
+          /jobListing|job-listing|jl=|partner\/jobListing|\/Emploi\//i.test(t.url || "")
+        );
+        const searchTabs = tabs.filter(
+          (t) =>
+            !/jobListing|job-listing|jl=|partner\/jobListing|\/Emploi\//i.test(t.url || "") &&
+            /glassdoor\.(com|fr)/i.test(t.url || "")
+        );
+        const keepDetail = pickTabToKeep(detailTabs) || detailTabs[0] || null;
+        const keepSearch = pickTabToKeep(searchTabs, "/Job/jobs") || searchTabs[0] || null;
+        // Prefer keeping detail when both exist (apply in progress)
+        if (keepDetail && keepSearch) {
+          for (const t of detailTabs) {
+            if (t.id !== keepDetail.id) {
+              try {
+                await chrome.tabs.remove(t.id);
+              } catch (_e) {}
+            }
+          }
+          for (const t of searchTabs) {
+            if (t.id !== keepSearch.id) {
+              try {
+                await chrome.tabs.remove(t.id);
+              } catch (_e) {}
+            }
+          }
+          if (reason && (detailTabs.length > 1 || searchTabs.length > 1)) {
+            await appendLog(`Onglets glassdoor fusionnés (SERP+détail) — ${reason}`, "warn", platform);
+          }
+          continue;
+        }
       }
 
       const keep = pickTabToKeep(tabs);
@@ -2144,17 +2179,67 @@ function handleMessage(msg, sendResponse, sender = null) {
     return true;
   }
 
-  if (msg.action === "solveCaptcha" || msg.action === "solve2Captcha") {
-    solveCaptchaWith2Captcha({
-      type: msg.type || msg.captchaType || "recaptcha_v2",
-      websiteURL: msg.websiteURL || msg.pageUrl || msg.url || "",
-      websiteKey: msg.websiteKey || msg.sitekey || msg.siteKey || "",
-      pageAction: msg.pageAction || msg.actionName || "",
-      isEnterprise: !!msg.isEnterprise || /enterprise/i.test(String(msg.type || "")),
-      isInvisible: !!msg.isInvisible,
-    })
-      .then((r) => sendResponse(r))
+  if (msg.action === "listIndeedTabs") {
+    listPlatformTabs("indeed")
+      .then((tabs) => {
+        const hasSmartApply = tabs.some((t) => /smartapply|indeedapply/i.test(t.url || ""));
+        const hasSerp = tabs.some((t) => /\/jobs|viewjob/i.test(t.url || "") && !/smartapply/i.test(t.url || ""));
+        sendResponse({ ok: true, count: tabs.length, hasSmartApply, hasSerp });
+      })
       .catch((e) => sendResponse({ ok: false, reason: e.message }));
+    return true;
+  }
+
+  if (msg.action === "solveCaptcha" || msg.action === "solve2Captcha") {
+    (async () => {
+      const r = await solveCaptchaWith2Captcha({
+        type: msg.type || msg.captchaType || "recaptcha_v2",
+        websiteURL: msg.websiteURL || msg.pageUrl || msg.url || "",
+        websiteKey: msg.websiteKey || msg.sitekey || msg.siteKey || "",
+        pageAction: msg.pageAction || msg.actionName || "",
+        isEnterprise: !!msg.isEnterprise || /enterprise/i.test(String(msg.type || "")),
+        isInvisible: !!msg.isInvisible,
+      });
+      // Always push token into the tab that asked (all frames) so host page gets it
+      if (r?.ok && r.token && sender?.tab?.id && msg.injectInTab !== false) {
+        const tabId = sender.tab.id;
+        try {
+          await chrome.tabs.sendMessage(tabId, { action: "injectRecaptchaToken", token: r.token });
+        } catch (_e) {}
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            func: (token) => {
+              try {
+                window.__AmijobsRecaptchaToken = token;
+                if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
+                  window.__AmijobsInjectRecaptchaToken(token);
+                }
+                const areas = document.querySelectorAll(
+                  'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
+                );
+                for (const area of areas) {
+                  area.value = token;
+                  area.innerHTML = token;
+                  area.dispatchEvent(new Event("input", { bubbles: true }));
+                  area.dispatchEvent(new Event("change", { bubbles: true }));
+                }
+                if (!areas.length) {
+                  const ta = document.createElement("textarea");
+                  ta.name = "g-recaptcha-response";
+                  ta.id = "g-recaptcha-response";
+                  ta.style.display = "none";
+                  ta.value = token;
+                  (document.body || document.documentElement).appendChild(ta);
+                }
+              } catch (_e) {}
+            },
+            args: [r.token],
+          });
+        } catch (_e) {}
+      }
+      sendResponse(r);
+    })().catch((e) => sendResponse({ ok: false, reason: e.message }));
     return true;
   }
 

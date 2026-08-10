@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.4.1";
+  const VERSION = "1.4.2";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -180,16 +180,23 @@
   }
 
   function isSearchPage(url = window.location.href) {
-    return /glassdoor\.(com|fr)\/(Job|Emploi|job-listing|Emploi\/|Search)/i.test(url) ||
-      /glassdoor\.(com|fr)\/Job\/jobs/i.test(url);
+    return (
+      /glassdoor\.(com|fr)\/Job\/jobs\.htm/i.test(url) ||
+      /glassdoor\.(com|fr)\/Emploi\/index\.htm/i.test(url) ||
+      /glassdoor\.(com|fr)\/Job\/index\.htm/i.test(url) ||
+      /glassdoor\.(com|fr)\/Search\/jobs/i.test(url)
+    );
   }
 
   function isJobDetailPage(url = window.location.href) {
+    // Search listing must NOT count as detail (was matching /Job/.*jobs/)
+    if (/\/Job\/jobs\.htm/i.test(url) && !/[?&]jl=/.test(url)) return false;
     return (
       /jobListing/i.test(url) ||
       /partner\/jobListing/i.test(url) ||
-      /Emploi\/.*job/i.test(url) ||
-      /Job\/.*jobs/i.test(url)
+      /job-listing/i.test(url) ||
+      /\/Emploi\/[^/?]+/i.test(url) ||
+      /[?&]jl=\d+/i.test(url)
     );
   }
 
@@ -395,13 +402,31 @@
       'button[data-test="easyApply"]',
       '[data-test="easyApply"]',
       '[data-test="easy-apply-button"]',
+      '[data-test="applyButton"]',
+      'button[data-test="apply-button"]',
       'button[aria-label*="Easy Apply" i]',
       'button[aria-label*="Candidature facile" i]',
       'button[aria-label*="Candidature simplifiée" i]',
+      'button[aria-label*="Postuler" i]',
+      'a[data-test="easyApply"]',
+      'a[aria-label*="Candidature facile" i]',
+      'a[aria-label*="Easy Apply" i]',
     ];
     for (const sel of selectors) {
       const el = S().$(sel);
       if (el && S().isVisible(el) && !isCompanySiteApplyButton(el)) return el;
+    }
+    // Also scan all visible buttons/links by text (Glassdoor FR often uses plain text CTAs)
+    for (const el of S().$$('button, a[role="button"], a')) {
+      if (!S().isVisible(el) || isCompanySiteApplyButton(el)) continue;
+      const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.trim();
+      if (
+        /candidature facile|easy apply|candidature simplifiée|postuler facilement|quick apply|^postuler$|postuler sur indeed/i.test(
+          text
+        )
+      ) {
+        return el;
+      }
     }
     return S().findActionButton([
       /candidature facile/i,
@@ -409,6 +434,8 @@
       /candidature simplifiée/i,
       /postuler facilement/i,
       /quick apply/i,
+      /^postuler$/i,
+      /postuler sur indeed/i,
     ]);
   }
 
@@ -490,11 +517,20 @@
   async function clickJobCard(card) {
     const link =
       card.element.querySelector?.(
-        "a[href*='jobListing'], a[href*='emploi'], a[href*='Job'], a.JobCard_jobTitle, a[data-test='job-link']"
+        "a[href*='jobListing'], a[href*='emploi'], a[href*='Job'], a.JobCard_jobTitle, a[data-test='job-link'], a[href*='jl=']"
       ) || (card.element.tagName === "A" ? card.element : null);
-    if (link) await S().humanClick(link);
-    else await S().humanClick(card.element);
-    await S().sleep(S().randomDelay(1400, 2400));
+    if (link) {
+      try {
+        // Same-tab only — a target=_blank opens a 2nd Glassdoor tab that the
+        // tab-merger kills, restarting the session forever without Easy Apply.
+        link.removeAttribute("target");
+        link.setAttribute("target", "_self");
+      } catch (_e) {}
+      await S().humanClick(link);
+    } else {
+      await S().humanClick(card.element);
+    }
+    await S().sleep(S().randomDelay(1600, 2800));
   }
 
   async function runApplyWizard(jobInfo, settings) {
@@ -689,6 +725,54 @@
     const appliedJobs = state?.appliedJobs || {};
 
     S().log(PLATFORM, `Session Glassdoor démarrée (${session?.applied || 0}/${maxJobs})`);
+
+    // If a job panel/detail is already open (jl= or dedicated listing), apply it first
+    // instead of re-scraping sidebar cards (that caused the open→merge→restart loop).
+    const readyApply =
+      findEasyApplyButton() ||
+      findApplyButton() ||
+      findCompanySiteButton();
+    if (readyApply && (isJobDetailPage() || /[?&]jl=/.test(window.location.href))) {
+      const jobInfo = getJobInfo(
+        new URLSearchParams(location.search).get("jl") || `gd_${Date.now()}`
+      );
+      S().log(PLATFORM, `Offre déjà ouverte — clic apply: ${jobInfo.title || jobInfo.jobId}`);
+      const result = await applyCurrentJob(settings, jobInfo);
+      if (result.success && /indeed/i.test(String(result.reason || ""))) {
+        S().log(PLATFORM, `Handoff Indeed: ${jobInfo.title} — attente Smart Apply`, "success");
+        // reuse handoff wait below via returning into loop is complex — mark awaiting and stop this run
+        isRunning = false;
+        return;
+      }
+      if (result.success) {
+        await chrome.runtime.sendMessage({
+          action: "markApplied",
+          platform: PLATFORM,
+          jobId: jobInfo.jobId,
+          title: jobInfo.title,
+          company: jobInfo.company,
+          url: jobInfo.url,
+        });
+      } else if (result.reason && result.reason !== "no_easy_apply") {
+        await chrome.runtime.sendMessage({
+          action: "markSkipped",
+          platform: PLATFORM,
+          jobId: jobInfo.jobId,
+          title: jobInfo.title,
+          reason: result.reason,
+        });
+      }
+      // Go back to pure search (drop jl) for next cards
+      try {
+        const u = new URL(window.location.href);
+        if (u.searchParams.has("jl")) {
+          u.searchParams.delete("jl");
+          window.location.href = u.toString();
+          isRunning = false;
+          return;
+        }
+      } catch (_e) {}
+    }
 
     const cards = await waitForJobCards(25000);
     if (!cards.length) {

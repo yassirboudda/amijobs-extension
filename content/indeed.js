@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.1";
+  const VERSION = "1.4.2";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -685,9 +685,9 @@
       /save and continue/i,
     ];
 
-    const buttons = S().$$("button, a[role='button'], input[type='submit']");
+    // Submit may stay "enabled" while captcha unchecked — still treat as submit
     for (const btn of buttons) {
-      if (!S().isVisible(btn) || btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
+      if (!S().isVisible(btn)) continue;
       const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
       if (!text || /signaler|fermer|close|exit|options de cv/i.test(text)) continue;
       if (submitRe.some((p) => p.test(text))) return { el: btn, kind: "submit" };
@@ -863,13 +863,46 @@
     }
   }
 
+  async function waitAndSolveRecaptcha(maxMs = 90000) {
+    const start = Date.now();
+    const hasWidget = () =>
+      !!document.querySelector(
+        'iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey], textarea[name="g-recaptcha-response"]'
+      ) || /je ne suis pas un robot|i'?m not a robot/i.test(document.body?.innerText || "");
+
+    if (!hasWidget()) return true;
+
+    S().log(PLATFORM, "reCAPTCHA détecté — résolution 2captcha…", "warn");
+    while (Date.now() - start < maxMs) {
+      if (shouldStop) return false;
+      const token =
+        window.__AmijobsRecaptchaToken ||
+        document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
+        "";
+      if (token && String(token).length > 40) {
+        S().log(PLATFORM, "reCAPTCHA token présent", "success");
+        return true;
+      }
+      try {
+        if (typeof window.__AmijobsSolveRecaptcha === "function") {
+          await window.__AmijobsSolveRecaptcha(true);
+        } else {
+          await chrome.runtime.sendMessage({ action: "solveRecaptchaNow" }).catch(() => {});
+        }
+        if (typeof window.__AmijobsClickRecaptcha === "function") window.__AmijobsClickRecaptcha();
+      } catch (_e) {}
+      await S().sleep(3500);
+    }
+    return !!(window.__AmijobsRecaptchaToken || document.querySelector('textarea[name="g-recaptcha-response"]')?.value);
+  }
+
   async function runApplyWizard(jobInfo, settings) {
     if (!isSmartApplyPage()) {
       S().log(PLATFORM, "Wizard ignoré (pas une page Smart Apply)", "warn");
       return { success: false, reason: "not_smartapply" };
     }
     S().log(PLATFORM, `Assistant Smart Apply — ${smartApplyPath()}`);
-    for (let step = 0; step < 48; step++) {
+    for (let step = 0; step < 60; step++) {
       if (shouldStop) return { success: false, reason: "stopped" };
       if (detectApplySuccess()) return { success: true };
 
@@ -900,19 +933,22 @@
       }
       if (/questions/i.test(path)) {
         await fillQuestionsStep();
-        // Prefer heuristics on employer questions — avoid slow/hanging AI per field
       } else {
         await S().fillVisibleFields(jobInfo, PLATFORM);
       }
 
+      // Review step often shows reCAPTCHA before "Déposer ma candidature"
+      if (/review/i.test(path)) {
+        await waitAndSolveRecaptcha(90000);
+      }
+
       const action = findVisibleContinueOrSubmit();
       if (!action) {
-        // On review page, keep waiting for submit CTA after loader
         if (/review/i.test(path)) {
+          await waitAndSolveRecaptcha(15000);
           await S().sleep(1200);
           continue;
         }
-        // Questions: Continuer may stay disabled until fields settle
         if (/questions/i.test(path)) {
           await fillQuestionsStep();
           await S().sleep(900);
@@ -924,23 +960,32 @@
       }
 
       if (action.kind === "submit") {
+        await waitAndSolveRecaptcha(90000);
         if (settings.autoSubmit !== false) {
           await S().humanClick(action.el);
           await S().sleep(2800);
-          for (let i = 0; i < 10; i++) {
+          for (let i = 0; i < 12; i++) {
             if (detectApplySuccess()) return { success: true };
+            // Captcha may reappear after failed submit
+            if (
+              document.querySelector('iframe[src*="recaptcha"]') &&
+              !(window.__AmijobsRecaptchaToken || "").length
+            ) {
+              await waitAndSolveRecaptcha(60000);
+              const again = findVisibleContinueOrSubmit();
+              if (again?.kind === "submit") await S().humanClick(again.el);
+            }
             await S().sleep(700);
           }
-          // post-apply navigation is success even without banner text
           if (/post-apply/i.test(smartApplyPath())) return { success: true };
           return { success: true, reason: "submitted" };
         }
         return { success: false, reason: "review" };
       }
 
-      // Disabled Continuer → refill and retry
       if (action.el.disabled || action.el.getAttribute("aria-disabled") === "true") {
         if (/questions/i.test(path)) await fillQuestionsStep();
+        if (/review/i.test(path)) await waitAndSolveRecaptcha(20000);
         await S().sleep(800);
         continue;
       }
@@ -1073,9 +1118,24 @@
         sessionGlassdoor: { ...sessionGlassdoor, awaitingIndeed: false, indeedHandoffDone: false },
       });
     } else if (gdAwaiting || gdSmartAge < 90000) {
-      S().log(PLATFORM, "Pause SERP — Smart Apply Glassdoor en cours sur cet onglet", "warn");
-      await S().sleep(4000);
-      return;
+      // Only pause SERP if a Smart Apply tab actually exists; otherwise Glassdoor
+      // awaitingIndeed alone freezes Indeed forever while Glassdoor is stuck looping.
+      const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
+      const hasSmart =
+        tabs?.hasSmartApply ||
+        /smartapply|indeedapply/i.test(location.href);
+      if (hasSmart || /smartapply|indeedapply/i.test(location.href)) {
+        S().log(PLATFORM, "Pause SERP — Smart Apply Glassdoor en cours sur cet onglet", "warn");
+        await S().sleep(4000);
+        return;
+      }
+      // Stale flag without Smart Apply → clear and continue SERP
+      if (gdAwaiting && gdAwaitAge > 20000) {
+        S().log(PLATFORM, "Libération Pause SERP — awaitingIndeed sans Smart Apply", "warn");
+        await chrome.storage.local.set({
+          sessionGlassdoor: { ...sessionGlassdoor, awaitingIndeed: false },
+        });
+      }
     }
 
     if ((session.applied || 0) >= maxJobs) {
