@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.4.4";
+  const VERSION = "1.4.5";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -610,7 +610,7 @@
 
   async function applyCurrentJob(settings, jobInfo) {
     const info = jobInfo || getJobInfo("current");
-    // Prefer Easy Apply (→ Indeed Smart Apply). Company-site only with a real employer URL.
+    // Prefer Easy Apply (→ Indeed Smart Apply). Skip company-site for mass Easy Apply sessions.
     const btn = await waitForEasyApplyButton(8000);
     if (btn) {
       const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
@@ -672,9 +672,9 @@
       return { success: true, reason: "indeed_handoff_assumed" };
     }
 
-    const companyRes = await tryCompanySiteApply(settings, info);
-    if (companyRes.success) return companyRes;
-    return { success: false, reason: companyRes.reason || "no_easy_apply" };
+    // Easy Apply filter sessions: do not fall through to company-site
+    S().log(PLATFORM, "Pas de Candidature facile — offre ignorée", "warn");
+    return { success: false, reason: "no_easy_apply" };
   }
 
   function alreadyApplied(appliedJobs, jobId) {

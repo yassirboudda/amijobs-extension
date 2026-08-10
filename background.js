@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.4.4";
+const EXT_VERSION = "1.4.5";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -2210,31 +2210,94 @@ function handleMessage(msg, sendResponse, sender = null) {
         try {
           await chrome.tabs.sendMessage(tabId, { action: "injectRecaptchaToken", token: r.token });
         } catch (_e) {}
+        // MAIN world: Indeed reads grecaptcha.getResponse(), not only the textarea
         try {
           await chrome.scripting.executeScript({
             target: { tabId, allFrames: true },
+            world: "MAIN",
+            func: (token) => {
+              try {
+                window.__AmijobsRecaptchaToken = token;
+                const fill = () => {
+                  let area =
+                    document.querySelector('textarea[name="g-recaptcha-response"]') ||
+                    document.querySelector("#g-recaptcha-response");
+                  if (!area) {
+                    area = document.createElement("textarea");
+                    area.name = "g-recaptcha-response";
+                    area.id = "g-recaptcha-response";
+                    area.style.cssText = "display:none !important";
+                    (document.body || document.documentElement).appendChild(area);
+                  }
+                  area.value = token;
+                  area.innerHTML = token;
+                };
+                fill();
+                for (const area of document.querySelectorAll(
+                  'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
+                )) {
+                  area.value = token;
+                  area.innerHTML = token;
+                }
+                const patch = (api) => {
+                  if (!api) return;
+                  try {
+                    api.getResponse = function () {
+                      return token;
+                    };
+                  } catch (_e) {}
+                  try {
+                    if (api.enterprise) {
+                      api.enterprise.getResponse = function () {
+                        return token;
+                      };
+                    }
+                  } catch (_e) {}
+                };
+                patch(window.grecaptcha);
+                const walk = (obj, depth) => {
+                  if (!obj || depth > 10) return;
+                  try {
+                    for (const k of Object.keys(obj)) {
+                      const v = obj[k];
+                      if (typeof v === "function" && /callback|promise|resolve|success/i.test(String(k))) {
+                        try {
+                          v(token);
+                        } catch (_e) {}
+                      } else if (v && typeof v === "object") walk(v, depth + 1);
+                    }
+                  } catch (_e) {}
+                };
+                try {
+                  if (window.___grecaptcha_cfg?.clients) {
+                    for (const id of Object.keys(window.___grecaptcha_cfg.clients)) {
+                      walk(window.___grecaptcha_cfg.clients[id], 0);
+                    }
+                  }
+                } catch (_e) {}
+                for (const el of document.querySelectorAll("[data-callback]")) {
+                  const name = el.getAttribute("data-callback");
+                  if (name && typeof window[name] === "function") {
+                    try {
+                      window[name](token);
+                    } catch (_e) {}
+                  }
+                }
+              } catch (_e) {}
+            },
+            args: [r.token],
+          });
+        } catch (_e) {}
+        // Also refresh isolated-world helpers
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            world: "ISOLATED",
             func: (token) => {
               try {
                 window.__AmijobsRecaptchaToken = token;
                 if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
                   window.__AmijobsInjectRecaptchaToken(token);
-                }
-                const areas = document.querySelectorAll(
-                  'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
-                );
-                for (const area of areas) {
-                  area.value = token;
-                  area.innerHTML = token;
-                  area.dispatchEvent(new Event("input", { bubbles: true }));
-                  area.dispatchEvent(new Event("change", { bubbles: true }));
-                }
-                if (!areas.length) {
-                  const ta = document.createElement("textarea");
-                  ta.name = "g-recaptcha-response";
-                  ta.id = "g-recaptcha-response";
-                  ta.style.display = "none";
-                  ta.value = token;
-                  (document.body || document.documentElement).appendChild(ta);
                 }
               } catch (_e) {}
             },

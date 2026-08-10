@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.4";
+  const VERSION = "1.4.5";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -399,7 +399,13 @@
       const company =
         el.querySelector("[data-testid='company-name'], .companyName, .company, span.companyName")
           ?.textContent?.trim() || "";
-      out.push({ element: el, jobId: jk, title, company });
+      // Prefer Easy Apply cards when filter is on; keep others only if no badge info
+      const easy = cardLooksLikeEasyApply(el);
+      out.push({ element: el, jobId: jk, title, company, easyApply: easy });
+    }
+    // If any card has Easy Apply badge, drop cards without it
+    if (out.some((c) => c.easyApply)) {
+      return out.filter((c) => c.easyApply);
     }
     return out;
   }
@@ -574,16 +580,24 @@
   }
 
   async function waitForApplyButton(timeoutMs = 14000) {
+    // Easy Apply / candidature simplifiée only — ignore "Continuer pour postuler"
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const easy = findIndeedEasyApplyButton();
       if (easy) return easy;
-      // Fallback: "Continuer pour postuler" → company website (when Easy Apply absent)
-      const cont = findContinueToApplyButton();
-      if (cont) return cont;
       await S().sleep(400);
     }
     return null;
+  }
+
+  function cardLooksLikeEasyApply(cardEl) {
+    if (!cardEl) return false;
+    const text = `${cardEl.innerText || cardEl.textContent || ""}`.toLowerCase();
+    if (/candidature simplifi|indeed apply|postuler facilement|easy apply/i.test(text)) return true;
+    if (cardEl.querySelector?.(".iaIcon, .indeed-apply-widget, [class*='indeedApply'], [data-indeed-apply-button]")) {
+      return true;
+    }
+    return false;
   }
 
   function detectApplySuccess() {
@@ -719,21 +733,29 @@
       '[data-testid="continue-button"]',
       '[data-testid^="hp-continue-button"]',
       '[data-testid="resume-selection-continue-button"]',
+      '[data-testid="submit-application"]',
+      '[data-testid="submit-button"]',
+      '[data-testid="indeed-apply-submit"]',
+      'button[data-testid*="submit"]',
     ];
     for (const sel of testIds) {
       for (const el of S().$$(sel)) {
-        if (S().isVisible(el) && !el.disabled) return { el, kind: "next" };
+        if (!S().isVisible(el) || el.disabled) continue;
+        const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase();
+        if (/d[ée]poser|soumettre|submit|envoyer/.test(text)) return { el, kind: "submit" };
+        return { el, kind: "next" };
       }
     }
 
     const submitRe = [
+      /d[ée]poser\s*(ma|votre)?\s*candidature/i,
       /submit (my )?application/i,
       /soumettre (ma |votre )?candidature/i,
       /envoyer (ma |votre )?candidature/i,
       /send application/i,
-      /déposer ma candidature/i,
       /^soumettre$/i,
       /finalize/i,
+      /^d[ée]poser$/i,
     ];
     const nextRe = [
       /^continue$/i,
@@ -747,11 +769,11 @@
       /save and continue/i,
     ];
 
-    const buttons = S().$$("button, a[role='button'], input[type='submit']");
+    const buttons = S().$$("button, a[role='button'], input[type='submit'], [role='button']");
     // Submit may stay "enabled" while captcha unchecked — still treat as submit
     for (const btn of buttons) {
       if (!S().isVisible(btn)) continue;
-      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
+      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
       if (!text || /signaler|fermer|close|exit|options de cv/i.test(text)) continue;
       // Never treat job-page "Continuer pour postuler" as Smart Apply wizard next
       if (/continuer (pour |à )?postuler|continue (to )?apply/i.test(text)) continue;
@@ -759,10 +781,21 @@
     }
     for (const btn of buttons) {
       if (!S().isVisible(btn) || btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
-      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
+      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
       if (!text || /signaler|fermer|close|exit|options de cv|passer au contenu/i.test(text)) continue;
       if (/continuer (pour |à )?postuler|continue (to )?apply/i.test(text)) continue;
       if (nextRe.some((p) => p.test(text))) return { el: btn, kind: "next" };
+    }
+
+    // Last resort on review: any purple primary with "candidature"
+    if (/review/i.test(smartApplyPath())) {
+      for (const btn of buttons) {
+        if (!S().isVisible(btn)) continue;
+        const text = (btn.textContent || "").replace(/\s+/g, " ").trim();
+        if (/candidature/i.test(text) && /d[ée]poser|soumettre|envoyer/i.test(text)) {
+          return { el: btn, kind: "submit" };
+        }
+      }
     }
     return null;
   }
@@ -938,15 +971,38 @@
 
     if (!hasWidget()) return true;
 
+    const readToken = () =>
+      String(
+        window.__AmijobsRecaptchaToken ||
+          document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
+          ""
+      );
+
+    if (readToken().length > 40) {
+      // Re-apply MAIN-world patch (Indeed may remount the widget)
+      try {
+        if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
+          window.__AmijobsInjectRecaptchaToken(readToken());
+        }
+      } catch (_e) {}
+      return true;
+    }
+
     S().log(PLATFORM, "reCAPTCHA détecté — résolution 2captcha…", "warn");
+    let loggedOk = false;
     while (Date.now() - start < maxMs) {
       if (shouldStop) return false;
-      const token =
-        window.__AmijobsRecaptchaToken ||
-        document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
-        "";
-      if (token && String(token).length > 40) {
-        S().log(PLATFORM, "reCAPTCHA token présent", "success");
+      const token = readToken();
+      if (token.length > 40) {
+        try {
+          if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
+            window.__AmijobsInjectRecaptchaToken(token);
+          }
+        } catch (_e) {}
+        if (!loggedOk) {
+          S().log(PLATFORM, "reCAPTCHA token présent — dépôt candidature", "success");
+          loggedOk = true;
+        }
         return true;
       }
       try {
@@ -961,7 +1017,7 @@
       await S().sleep(4000);
     }
     S().log(PLATFORM, "reCAPTCHA non résolu à temps", "warn");
-    return !!(window.__AmijobsRecaptchaToken || document.querySelector('textarea[name="g-recaptcha-response"]')?.value);
+    return readToken().length > 40;
   }
 
   async function runApplyWizard(jobInfo, settings) {
@@ -1010,10 +1066,20 @@
         await waitAndSolveRecaptcha(90000);
       }
 
-      const action = findVisibleContinueOrSubmit();
+      let action = findVisibleContinueOrSubmit();
+      // Review: force-find Déposer even if testids differ
+      if (!action && /review/i.test(path)) {
+        for (const el of S().$$("button, [role='button']")) {
+          const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+          if (/d[ée]poser\s*(ma|votre)?\s*candidature/i.test(t) && S().isVisible(el)) {
+            action = { el, kind: "submit" };
+            break;
+          }
+        }
+      }
       if (!action) {
         if (/review/i.test(path)) {
-          await waitAndSolveRecaptcha(15000);
+          await waitAndSolveRecaptcha(20000);
           await S().sleep(1200);
           continue;
         }
@@ -1028,24 +1094,58 @@
       }
 
       if (action.kind === "submit") {
-        await waitAndSolveRecaptcha(90000);
+        const captchaOk = await waitAndSolveRecaptcha(90000);
+        if (!captchaOk) {
+          S().log(PLATFORM, "Submit bloqué — captcha non résolu", "warn");
+          await S().sleep(1500);
+          continue;
+        }
+        // Re-inject token right before click (MAIN world)
+        try {
+          const tok = window.__AmijobsRecaptchaToken || "";
+          if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
+            window.__AmijobsInjectRecaptchaToken(tok);
+          }
+        } catch (_e) {}
         if (settings.autoSubmit !== false) {
+          S().log(PLATFORM, `Clic submit: ${(action.el.textContent || "").trim().slice(0, 40)}`);
+          // Force-enable if Indeed left it aria-disabled after token inject
+          try {
+            action.el.disabled = false;
+            action.el.removeAttribute("disabled");
+            action.el.removeAttribute("aria-disabled");
+          } catch (_e) {}
           await S().humanClick(action.el);
           await S().sleep(2800);
-          for (let i = 0; i < 12; i++) {
+          for (let i = 0; i < 16; i++) {
             if (detectApplySuccess()) return { success: true };
-            // Captcha may reappear after failed submit
+            if (/post-apply/i.test(smartApplyPath())) return { success: true };
+            // Captcha may reappear after failed submit — clear stale token and retry
             if (
               document.querySelector('iframe[src*="recaptcha"]') &&
-              !(window.__AmijobsRecaptchaToken || "").length
+              /review/i.test(smartApplyPath())
             ) {
-              await waitAndSolveRecaptcha(60000);
+              const still = document.querySelector('textarea[name="g-recaptcha-response"]')?.value || "";
+              if (!still || still.length < 40) {
+                window.__AmijobsRecaptchaToken = "";
+                await waitAndSolveRecaptcha(60000);
+              } else if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
+                window.__AmijobsInjectRecaptchaToken(still);
+              }
               const again = findVisibleContinueOrSubmit();
-              if (again?.kind === "submit") await S().humanClick(again.el);
+              if (again?.kind === "submit") {
+                await S().humanClick(again.el);
+              }
             }
             await S().sleep(700);
           }
           if (/post-apply/i.test(smartApplyPath())) return { success: true };
+          // Still on review after clicks → don't fake success
+          if (/review/i.test(smartApplyPath())) {
+            S().log(PLATFORM, "Submit review sans confirmation — nouvel essai captcha", "warn");
+            window.__AmijobsRecaptchaToken = "";
+            continue;
+          }
           return { success: true, reason: "submitted" };
         }
         return { success: false, reason: "review" };
@@ -1074,57 +1174,18 @@
     }
 
     const btn = await waitForApplyButton();
-    if (!btn) return { success: false, reason: "no_indeed_apply" };
+    if (!btn) {
+      // Easy Apply only for now — skip company-site / "Continuer pour postuler"
+      if (findContinueToApplyButton()) {
+        S().log(PLATFORM, "Offre sans candidature simplifiée — ignorée", "warn");
+      }
+      return { success: false, reason: "no_indeed_apply" };
+    }
 
-    // "Continuer pour postuler" / site entreprise — never treat as Smart Apply
-    if (isCompanySiteApplyButton(btn) || isContinueToApplyButton(btn)) {
-      if (settings?.allowExternalApply === false) {
-        return { success: false, reason: "company_site_apply" };
-      }
-      if (!window.AmiJobsCompanySite) {
-        return { success: false, reason: "company_site_apply" };
-      }
-      S().log(
-        PLATFORM,
-        `Continuer / site entreprise — candidature externe: ${info.title || info.jobId}`
-      );
-      const extRes = await Promise.race([
-        window.AmiJobsCompanySite.apply({
-          clickEl: btn,
-          jobInfo: {
-            jobId: info.jobId,
-            title: info.title,
-            company: info.company,
-            url: info.url || window.location.href,
-          },
-          sourcePlatform: "indeed",
-        }),
-        S().sleep(55000).then(() => ({ ok: false, success: false, reason: "timeout" })),
-      ]);
-      if (extRes?.ok || extRes?.success) {
-        return { success: true, reason: "company_site_applied", url: extRes.url };
-      }
-      // Same-tab leave Indeed after Continuer — finish via company-site worker on current URL
-      if (!/indeed\.(com|fr)|smartapply/i.test(window.location.hostname)) {
-        const ext2 = await Promise.race([
-          window.AmiJobsCompanySite.apply({
-            url: window.location.href,
-            jobInfo: {
-              jobId: info.jobId,
-              title: info.title,
-              company: info.company,
-              url: window.location.href,
-            },
-            sourcePlatform: "indeed",
-          }),
-          S().sleep(55000).then(() => ({ ok: false, success: false, reason: "timeout" })),
-        ]);
-        if (ext2?.ok || ext2?.success) {
-          return { success: true, reason: "company_site_applied", url: ext2.url || window.location.href };
-        }
-        return { success: false, reason: ext2?.reason || "company_site_apply" };
-      }
-      return { success: false, reason: extRes?.reason || "company_site_apply" };
+    // Safety: never treat Continuer as Smart Apply
+    if (isContinueToApplyButton(btn) || isCompanySiteApplyButton(btn)) {
+      S().log(PLATFORM, "Bouton externe détecté — skip (Easy Apply only)", "warn");
+      return { success: false, reason: "no_indeed_apply" };
     }
 
     const popupPromise = new Promise((resolve) => {
