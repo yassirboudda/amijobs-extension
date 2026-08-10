@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.2";
+  const VERSION = "1.4.3";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -100,21 +100,26 @@
   function isValidIndeedJobKey(jk) {
     if (!jk || typeof jk !== "string") return false;
     const key = jk.trim();
-    // Reject placeholders / too-short tokens from bad DOM matches
     if (key.length < 10 || key.length > 64) return false;
     if (/^(jk_)?test/i.test(key)) return false;
     if (!/^[a-z0-9_-]+$/i.test(key)) return false;
 
     const lower = key.toLowerCase();
-    // Known demo / sequential placeholders only (do NOT reject real hex job keys)
+    // Reject sequential / demo hex runs (cause "Page introuvable")
+    if (/abcdef|fedcba|01234567|89abcdef|abcdef01|deadbeef|cafebabe/i.test(lower)) return false;
     if (
-      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|deadbeefdeadbeef|123456789abcdef0|fedcba9876543210)$/i.test(
+      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|123456789abcdef0|fedcba9876543210|890abcdef0123456)$/i.test(
         lower
       )
     ) {
       return false;
     }
     if (/^(jk_)?0{8,}$/i.test(lower)) return false;
+    // Prefer real Indeed keys: 16-char hex with decent entropy
+    if (/^[0-9a-f]{16}$/i.test(lower)) {
+      const uniq = new Set(lower).size;
+      if (uniq < 8) return false;
+    }
     return true;
   }
 
@@ -485,12 +490,42 @@
       "#applyButtonLinkContainer button",
       ".jobsearch-IndeedApplyButton-newDesign",
       'button[id*="indeedApply"]',
+      '[data-indeed-apply-status]',
     ];
 
     for (const root of roots) {
       for (const sel of selectors) {
         const btn = root.querySelector(sel);
         if (btn && S().isVisible(btn)) return btn;
+      }
+    }
+
+    // Text match including nested hashed spans: <span class="…">Postuler sur Indeed</span>
+    for (const root of roots) {
+      const nodes = root.querySelectorAll("button, a, [role='button'], div[role='button']");
+      for (const el of nodes) {
+        if (!S().isVisible(el) || isCompanySiteApplyButton(el)) continue;
+        const text = `${el.innerText || el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.replace(
+          /\s+/g,
+          " "
+        );
+        if (
+          /postuler sur indeed|indeed apply|apply with indeed|candidature simplifiée|continue applying|continuer à postuler/i.test(
+            text
+          )
+        ) {
+          return el;
+        }
+      }
+      // Span-only match → climb to clickable parent
+      for (const span of root.querySelectorAll("span, div")) {
+        const t = (span.textContent || "").trim();
+        if (!/^postuler sur indeed$/i.test(t) && !/^indeed apply$/i.test(t)) continue;
+        const clickable =
+          span.closest("button, a, [role='button']") ||
+          span.parentElement?.closest?.("button, a, [role='button']") ||
+          span.parentElement;
+        if (clickable && S().isVisible(clickable) && !isCompanySiteApplyButton(clickable)) return clickable;
       }
     }
 
@@ -685,6 +720,7 @@
       /save and continue/i,
     ];
 
+    const buttons = S().$$("button, a[role='button'], input[type='submit']");
     // Submit may stay "enabled" while captcha unchecked — still treat as submit
     for (const btn of buttons) {
       if (!S().isVisible(btn)) continue;
@@ -885,14 +921,16 @@
       }
       try {
         if (typeof window.__AmijobsSolveRecaptcha === "function") {
-          await window.__AmijobsSolveRecaptcha(true);
+          const ok = await window.__AmijobsSolveRecaptcha(true);
+          if (!ok) S().log(PLATFORM, "2captcha en cours / échec partiel…", "warn");
         } else {
           await chrome.runtime.sendMessage({ action: "solveRecaptchaNow" }).catch(() => {});
         }
         if (typeof window.__AmijobsClickRecaptcha === "function") window.__AmijobsClickRecaptcha();
       } catch (_e) {}
-      await S().sleep(3500);
+      await S().sleep(4000);
     }
+    S().log(PLATFORM, "reCAPTCHA non résolu à temps", "warn");
     return !!(window.__AmijobsRecaptchaToken || document.querySelector('textarea[name="g-recaptcha-response"]')?.value);
   }
 
@@ -1192,10 +1230,21 @@
     if (queue.length) {
       const cleaned = queue.filter((q) => isValidIndeedJobKey(q.jobId));
       if (cleaned.length !== queue.length) {
+        S().log(PLATFORM, `File nettoyée: ${queue.length - cleaned.length} clé(s) invalide(s) retirée(s)`, "warn");
         queue = cleaned;
         qIndex = Math.min(qIndex, queue.length);
         await setSession({ queue, qIndex });
       }
+    }
+    // If queue empty after clean, rebuild from live SERP
+    if (!queue.length && isSearchPage()) {
+      const cards = await waitForJobCards(20000);
+      queue = cards
+        .filter((c) => isValidIndeedJobKey(c.jobId) && c.title && c.title.length >= 3)
+        .map((c) => ({ jobId: c.jobId, title: c.title, company: c.company }));
+      qIndex = 0;
+      await setSession({ queue, qIndex: 0, noApplyPages: 0 });
+      S().log(PLATFORM, `${queue.length} offres trouvées (rebuild)`);
     }
 
     while (qIndex < queue.length) {
@@ -1263,6 +1312,29 @@
         qIndex: qIndex + 1,
       });
 
+      // Prefer SPA: click the card on the SERP (right panel) then "Postuler sur Indeed"
+      // Avoids brittle /viewjob?jk= navigations that 404 on bad/stale keys.
+      const liveCard =
+        collectJobCards().find((c) => c.jobId === item.jobId) ||
+        [...document.querySelectorAll("[data-jk]")].find((el) => el.getAttribute("data-jk") === item.jobId);
+      const cardEl = liveCard?.element || liveCard || null;
+      if (cardEl && isSearchPage()) {
+        const link =
+          cardEl.querySelector?.("a.jcs-JobTitle, h2.jobTitle a, h2 a, a[href*='jk='], a[data-jk]") ||
+          (cardEl.tagName === "A" ? cardEl : null) ||
+          cardEl;
+        try {
+          link.removeAttribute?.("target");
+          link.setAttribute?.("target", "_self");
+        } catch (_e) {}
+        S().log(PLATFORM, `Ouverture offre SERP: ${item.title || item.jobId}`);
+        await S().humanClick(link);
+        await S().sleep(S().randomDelay(1600, 2600));
+        const fresh = await getSession();
+        await handleViewJobPage(fresh || session, settings);
+        return;
+      }
+
       const host = getIndeedHost(session);
       window.location.href = `${host}/viewjob?jk=${encodeURIComponent(item.jobId)}`;
       return;
@@ -1329,8 +1401,9 @@
       return;
     }
 
-    const btn = await waitForApplyButton(14000);
+    const btn = await waitForApplyButton(18000);
     if (!btn) {
+      S().log(PLATFORM, "Bouton Postuler sur Indeed introuvable", "warn");
       await chrome.runtime.sendMessage({
         action: "markSkipped",
         platform: PLATFORM,
@@ -1345,6 +1418,7 @@
       return;
     }
 
+    S().log(PLATFORM, `Clic: ${(btn.innerText || btn.textContent || "Postuler").trim().slice(0, 48)}`);
     await setSession({ phase: "apply", currentJk: jobInfo.jobId });
     const result = await applyCurrentJob(settings, jobInfo);
 

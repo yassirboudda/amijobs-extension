@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.4.2";
+const EXT_VERSION = "1.4.3";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -1288,6 +1288,7 @@ async function solveCaptchaWith2Captcha({
       });
       const polled = await pollRes.json();
       if (polled?.errorId) {
+        await appendLog(`2captcha poll: ${polled.errorDescription || "poll_failed"}`, "warn");
         return { ok: false, reason: polled.errorDescription || "poll_failed", errorId: polled.errorId };
       }
       if (polled?.status === "ready") {

@@ -59,24 +59,37 @@
     }
   }
 
-  function extractSiteKeyFromDoc(doc = document) {
+  function collectSiteKeys(doc = document) {
+    const keys = [];
+    const push = (k, score = 0) => {
+      if (!k || !/^6L[A-Za-z0-9_-]{20,}/.test(k)) return;
+      const existing = keys.find((x) => x.key === k);
+      if (existing) existing.score = Math.max(existing.score, score);
+      else keys.push({ key: k, score });
+    };
+
     const params = new URLSearchParams(doc.location?.search || location.search || "");
     const fromQuery = params.get("k") || params.get("sitekey");
-    if (fromQuery && /^6L/.test(fromQuery)) return fromQuery;
+    const isImage = /[?&]type=image\b/i.test(doc.location?.href || location.href || "");
+    push(fromQuery, isImage ? 100 : 40);
 
-    const el =
-      doc.querySelector("[data-sitekey]") ||
-      doc.querySelector(".g-recaptcha[data-sitekey]") ||
-      doc.querySelector("[data-recaptcha-sitekey]");
-    const sk = el?.getAttribute("data-sitekey");
-    if (sk && /^6L/.test(sk)) return sk;
-
+    for (const el of doc.querySelectorAll("[data-sitekey], .g-recaptcha[data-sitekey], [data-recaptcha-sitekey]")) {
+      push(el.getAttribute("data-sitekey") || el.getAttribute("data-recaptcha-sitekey"), 50);
+    }
     for (const iframe of doc.querySelectorAll('iframe[src*="recaptcha"]')) {
       const src = iframe.getAttribute("src") || "";
       const m = src.match(/[?&]k=(6L[^&]+)/);
-      if (m) return decodeURIComponent(m[1]);
+      if (!m) continue;
+      const k = decodeURIComponent(m[1]);
+      const score = /[?&]type=image\b/i.test(src) ? 100 : /\/enterprise\//i.test(src) ? 60 : 45;
+      push(k, score);
     }
-    return "";
+    keys.sort((a, b) => b.score - a.score);
+    return keys.map((x) => x.key);
+  }
+
+  function extractSiteKeyFromDoc(doc = document) {
+    return collectSiteKeys(doc)[0] || "";
   }
 
   function extractEnterpriseFromDoc(doc = document) {
@@ -85,7 +98,8 @@
     for (const iframe of doc.querySelectorAll('iframe[src*="recaptcha"]')) {
       if (/\/enterprise\//i.test(iframe.getAttribute("src") || "")) return true;
     }
-    return false;
+    // Indeed Smart Apply uses enterprise widgets
+    return /smartapply\.indeed|indeed\.(com|fr)/i.test(href + " " + (document.referrer || ""));
   }
 
   function hostPageUrl() {
@@ -193,47 +207,51 @@
 
   async function solveVia2Captcha(force = false) {
     if (solving) return false;
-    if (!force && Date.now() - lastSolveAt < 25000) return !!lastInjected;
-    const siteKey = extractSiteKeyFromDoc(document);
-    if (!siteKey) {
-      // Host page: pull key from iframe src
-      const iframe = document.querySelector('iframe[src*="recaptcha"]');
-      const src = iframe?.getAttribute("src") || "";
-      const m = src.match(/[?&]k=(6L[^&]+)/);
-      if (!m) return false;
-    }
-    const key = extractSiteKeyFromDoc(document) || (() => {
+    if (!force && Date.now() - lastSolveAt < 20000) return !!lastInjected;
+
+    const keys = collectSiteKeys(document);
+    if (!keys.length) {
       const iframe = document.querySelector('iframe[src*="recaptcha"]');
       const m = (iframe?.getAttribute("src") || "").match(/[?&]k=(6L[^&]+)/);
-      return m ? decodeURIComponent(m[1]) : "";
-    })();
-    if (!key) return false;
+      if (m) keys.push(decodeURIComponent(m[1]));
+    }
+    if (!keys.length) return false;
 
     solving = true;
     lastSolveAt = Date.now();
     try {
       const pageUrl = hostPageUrl();
-      const isEnterprise = extractEnterpriseFromDoc(document) || /enterprise/i.test(pageUrl);
-      const res = await chrome.runtime.sendMessage({
-        action: "solveCaptcha",
-        type: isEnterprise ? "recaptcha_enterprise" : "recaptcha_v2",
-        websiteURL: pageUrl,
-        websiteKey: key,
-        isEnterprise,
-        injectInTab: true,
-      });
-      if (res?.ok && res.token) {
-        injectToken(res.token);
-        // Ask parent via postMessage too (iframe → host)
+      const isEnterprise = true; // Indeed/Glassdoor Smart Apply = enterprise
+      let lastErr = "";
+      for (const key of keys.slice(0, 3)) {
         try {
-          if (window.parent && window.parent !== window) {
-            window.parent.postMessage({ source: "amijobs-recaptcha", token: res.token }, "*");
+          const res = await chrome.runtime.sendMessage({
+            action: "solveCaptcha",
+            type: "recaptcha_enterprise",
+            websiteURL: pageUrl,
+            websiteKey: key,
+            isEnterprise,
+            injectInTab: true,
+          });
+          if (res?.ok && res.token) {
+            injectToken(res.token);
+            try {
+              if (window.parent && window.parent !== window) {
+                window.parent.postMessage({ source: "amijobs-recaptcha", token: res.token }, "*");
+              }
+            } catch (_e) {}
+            return true;
           }
-        } catch (_e) {}
-        return true;
+          lastErr = res?.reason || "no_token";
+        } catch (e) {
+          lastErr = e?.message || "send_failed";
+        }
       }
-    } catch (_e) {
-      /* ignore */
+      try {
+        chrome.runtime
+          .sendMessage({ action: "appendLog", message: `2captcha échec: ${lastErr}`, level: "warn" })
+          .catch(() => {});
+      } catch (_e) {}
     } finally {
       solving = false;
     }
