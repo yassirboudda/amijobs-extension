@@ -4,6 +4,12 @@ let uiLang = "fr";
 // restoreFormInputs() from clobbering what the user just typed/checked.
 let formTouched = false;
 
+try {
+  const ver = chrome.runtime.getManifest()?.version || "1.4.2";
+  const el = $("extVersion");
+  if (el) el.textContent = `v${ver}`;
+} catch (_e) {}
+
 async function sendBg(msg) {
   try {
     return await chrome.runtime.sendMessage(msg);
