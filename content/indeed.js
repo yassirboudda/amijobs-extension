@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.3";
+  const VERSION = "1.4.4";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -90,6 +90,8 @@
     if (wantsFreelance && !kw) kw = "freelance";
     if (kw) p.set("q", kw);
     if (location) p.set("l", location);
+    // Candidature simplifiée uniquement (Same as FR UI filter / applicationType=1)
+    p.set("applicationType", "1");
     p.set("iafilter", "1");
     p.set("fromage", "14");
     if (wantsFreelance) p.set("sc", "0kf:attr(DSQF7);");
@@ -465,16 +467,14 @@
     return m ? decodeURIComponent(m[1]) : `indeed_${Date.now()}`;
   }
 
-  function findApplyButton() {
+  function findIndeedEasyApplyButton() {
     const roots = [document];
     try {
       for (const frame of document.querySelectorAll("iframe")) {
         try {
           const doc = frame.contentDocument || frame.contentWindow?.document;
           if (doc) roots.push(doc);
-        } catch (_e) {
-          /* cross-origin */
-        }
+        } catch (_e) {}
       }
     } catch (_e) {}
 
@@ -485,75 +485,102 @@
       "button.ia-IndeedApplyButton",
       'button[aria-label*="Postuler sur Indeed" i]',
       'button[aria-label*="Indeed Apply" i]',
-      'button[aria-label*="Apply now" i]',
       'a[data-indeed-apply-button]',
       "#applyButtonLinkContainer button",
       ".jobsearch-IndeedApplyButton-newDesign",
       'button[id*="indeedApply"]',
       '[data-indeed-apply-status]',
     ];
-
     for (const root of roots) {
       for (const sel of selectors) {
         const btn = root.querySelector(sel);
-        if (btn && S().isVisible(btn)) return btn;
+        if (btn && S().isVisible(btn) && !isCompanySiteApplyButton(btn) && !isContinueToApplyButton(btn)) {
+          return btn;
+        }
       }
     }
 
-    // Text match including nested hashed spans: <span class="…">Postuler sur Indeed</span>
     for (const root of roots) {
-      const nodes = root.querySelectorAll("button, a, [role='button'], div[role='button']");
-      for (const el of nodes) {
-        if (!S().isVisible(el) || isCompanySiteApplyButton(el)) continue;
+      for (const el of root.querySelectorAll("button, a, [role='button'], div[role='button']")) {
+        if (!S().isVisible(el) || isCompanySiteApplyButton(el) || isContinueToApplyButton(el)) continue;
         const text = `${el.innerText || el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.replace(
           /\s+/g,
           " "
         );
-        if (
-          /postuler sur indeed|indeed apply|apply with indeed|candidature simplifiée|continue applying|continuer à postuler/i.test(
-            text
-          )
-        ) {
+        if (/postuler sur indeed|indeed apply|apply with indeed|candidature simplifiée/i.test(text)) {
           return el;
         }
       }
-      // Span-only match → climb to clickable parent
       for (const span of root.querySelectorAll("span, div")) {
         const t = (span.textContent || "").trim();
         if (!/^postuler sur indeed$/i.test(t) && !/^indeed apply$/i.test(t)) continue;
-        const clickable =
-          span.closest("button, a, [role='button']") ||
-          span.parentElement?.closest?.("button, a, [role='button']") ||
-          span.parentElement;
+        const clickable = span.closest("button, a, [role='button']") || span.parentElement;
         if (clickable && S().isVisible(clickable) && !isCompanySiteApplyButton(clickable)) return clickable;
       }
     }
+    return null;
+  }
 
-    return (
-      S().findActionButtonDeep([
-        /postuler sur indeed/i,
-        /indeed apply/i,
-        /candidature simplifiée/i,
-        /apply with indeed/i,
-        /continue applying/i,
-        /continuer à postuler/i,
-      ]) || null
+  function isContinueToApplyButton(btn) {
+    if (!btn) return false;
+    const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.toLowerCase();
+    return /continuer (pour |à )?postuler|continue (to )?apply|apply on company|postuler sur le site/i.test(
+      text
     );
+  }
+
+  function findContinueToApplyButton() {
+    for (const el of S().$$("button, a, [role='button'], span")) {
+      const t = (el.textContent || "").trim();
+      if (!/continuer (pour |à )?postuler|continue (to )?apply/i.test(t)) continue;
+      const clickable = el.closest("button, a, [role='button']") || (el.tagName === "BUTTON" || el.tagName === "A" ? el : el.parentElement);
+      if (clickable && S().isVisible(clickable) && !isCompanySiteApplyButton(clickable)) return clickable;
+    }
+    return S().findActionButtonDeep([
+      /continuer pour postuler/i,
+      /continuer à postuler/i,
+      /continue to apply/i,
+      /continue applying/i,
+    ]);
+  }
+
+  function findApplyButton() {
+    // Prefer Indeed Easy Apply — never confuse with "Continuer pour postuler" (external)
+    return findIndeedEasyApplyButton();
   }
 
   function isCompanySiteApplyButton(btn) {
     if (!btn) return false;
+    if (isContinueToApplyButton(btn)) return true;
     const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.toLowerCase();
     return /site (de l['’]entreprise|de l['’]employeur)|company (site|website)|sur le site|externe|external apply/i.test(
       text
     );
   }
 
+  async function ensureEasyApplyOnlyFilter() {
+    if (/[?&]applicationType=1\b/i.test(window.location.href)) return false;
+    if (!/\/jobs\b/i.test(window.location.pathname || "")) return false;
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.set("applicationType", "1");
+      u.searchParams.set("iafilter", "1");
+      S().log(PLATFORM, "Filtre candidature simplifiée (applicationType=1)", "warn");
+      window.location.href = u.toString();
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
   async function waitForApplyButton(timeoutMs = 14000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      const btn = findApplyButton();
-      if (btn) return btn;
+      const easy = findIndeedEasyApplyButton();
+      if (easy) return easy;
+      // Fallback: "Continuer pour postuler" → company website (when Easy Apply absent)
+      const cont = findContinueToApplyButton();
+      if (cont) return cont;
       await S().sleep(400);
     }
     return null;
@@ -726,12 +753,15 @@
       if (!S().isVisible(btn)) continue;
       const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
       if (!text || /signaler|fermer|close|exit|options de cv/i.test(text)) continue;
+      // Never treat job-page "Continuer pour postuler" as Smart Apply wizard next
+      if (/continuer (pour |à )?postuler|continue (to )?apply/i.test(text)) continue;
       if (submitRe.some((p) => p.test(text))) return { el: btn, kind: "submit" };
     }
     for (const btn of buttons) {
       if (!S().isVisible(btn) || btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
       const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.trim();
       if (!text || /signaler|fermer|close|exit|options de cv|passer au contenu/i.test(text)) continue;
+      if (/continuer (pour |à )?postuler|continue (to )?apply/i.test(text)) continue;
       if (nextRe.some((p) => p.test(text))) return { el: btn, kind: "next" };
     }
     return null;
@@ -1045,14 +1075,19 @@
 
     const btn = await waitForApplyButton();
     if (!btn) return { success: false, reason: "no_indeed_apply" };
-    if (isCompanySiteApplyButton(btn)) {
+
+    // "Continuer pour postuler" / site entreprise — never treat as Smart Apply
+    if (isCompanySiteApplyButton(btn) || isContinueToApplyButton(btn)) {
       if (settings?.allowExternalApply === false) {
         return { success: false, reason: "company_site_apply" };
       }
       if (!window.AmiJobsCompanySite) {
         return { success: false, reason: "company_site_apply" };
       }
-      S().log(PLATFORM, `Site entreprise détecté — candidature externe: ${info.title || info.jobId}`);
+      S().log(
+        PLATFORM,
+        `Continuer / site entreprise — candidature externe: ${info.title || info.jobId}`
+      );
       const extRes = await Promise.race([
         window.AmiJobsCompanySite.apply({
           clickEl: btn,
@@ -1068,6 +1103,26 @@
       ]);
       if (extRes?.ok || extRes?.success) {
         return { success: true, reason: "company_site_applied", url: extRes.url };
+      }
+      // Same-tab leave Indeed after Continuer — finish via company-site worker on current URL
+      if (!/indeed\.(com|fr)|smartapply/i.test(window.location.hostname)) {
+        const ext2 = await Promise.race([
+          window.AmiJobsCompanySite.apply({
+            url: window.location.href,
+            jobInfo: {
+              jobId: info.jobId,
+              title: info.title,
+              company: info.company,
+              url: window.location.href,
+            },
+            sourcePlatform: "indeed",
+          }),
+          S().sleep(55000).then(() => ({ ok: false, success: false, reason: "timeout" })),
+        ]);
+        if (ext2?.ok || ext2?.success) {
+          return { success: true, reason: "company_site_applied", url: ext2.url || window.location.href };
+        }
+        return { success: false, reason: ext2?.reason || "company_site_apply" };
       }
       return { success: false, reason: extRes?.reason || "company_site_apply" };
     }
@@ -1138,6 +1193,11 @@
   async function handleSearchPage(session, settings) {
     const maxJobs = session.maxJobs || settings.maxJobsPerSession || 25;
     const appliedJobs = (await chrome.runtime.sendMessage({ action: "getState" }))?.appliedJobs || {};
+
+    // Force Easy Apply / candidature simplifiée only
+    if (await ensureEasyApplyOnlyFilter()) {
+      return;
+    }
 
     // Yield Indeed SERP while Glassdoor owns the single Indeed tab for Smart Apply
     const { sessionGlassdoor = null, glassdoorSmartApply = null } = await chrome.storage.local.get([

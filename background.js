@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.4.3";
+const EXT_VERSION = "1.4.4";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -271,6 +271,8 @@ function buildIndeedSearchUrl(keywords, location, page = 0, contracts = []) {
   const kw = freelanceAwareKeywords(keywords, contracts);
   if (kw) p.set("q", kw);
   if (location) p.set("l", location);
+  // Easy Apply / candidature simplifiée only
+  p.set("applicationType", "1");
   p.set("iafilter", "1");
   // Contract / freelance-oriented results on fr.indeed
   const list = asArray(contracts).map((c) => String(c).toLowerCase());
@@ -282,11 +284,12 @@ function buildIndeedSearchUrl(keywords, location, page = 0, contracts = []) {
 }
 
 function buildGlassdoorSearchUrl(keywords, location, contracts = []) {
-  // Prefer classic Job/jobs.htm search (live browser: Job/index.htm also lists Easy Apply cards)
+  // Prefer classic Job/jobs.htm + Easy Apply filter (applicationType=1)
   const p = new URLSearchParams();
   const kw = freelanceAwareKeywords(keywords, contracts);
   if (kw) p.set("sc.keyword", kw);
   if (location) p.set("sc.location", location);
+  p.set("applicationType", "1");
   return `https://www.glassdoor.fr/Job/jobs.htm?${p.toString()}`;
 }
 

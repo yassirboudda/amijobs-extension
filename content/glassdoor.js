@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.4.3";
+  const VERSION = "1.4.4";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -184,18 +184,23 @@
       /glassdoor\.(com|fr)\/Job\/jobs\.htm/i.test(url) ||
       /glassdoor\.(com|fr)\/Emploi\/index\.htm/i.test(url) ||
       /glassdoor\.(com|fr)\/Job\/index\.htm/i.test(url) ||
-      /glassdoor\.(com|fr)\/Search\/jobs/i.test(url)
+      /glassdoor\.(com|fr)\/Search\/jobs/i.test(url) ||
+      // FR SEO SERP: /Emploi/france-formateur-emplois-SRCH_IL.0,6_KO7,16.htm
+      /glassdoor\.(com|fr)\/Emploi\/[^/?]*SRCH_/i.test(url) ||
+      /glassdoor\.(com|fr)\/Emploi\/[^/?]*-emplois-/i.test(url) ||
+      /glassdoor\.(com|fr)\/Job\/[^/?]*SRCH_/i.test(url)
     );
   }
 
   function isJobDetailPage(url = window.location.href) {
-    // Search listing must NOT count as detail (was matching /Job/.*jobs/)
+    // Search listing must NOT count as detail
     if (/\/Job\/jobs\.htm/i.test(url) && !/[?&]jl=/.test(url)) return false;
+    if (/SRCH_|-emplois-/i.test(url) && !/[?&]jl=/.test(url)) return false;
     return (
       /jobListing/i.test(url) ||
       /partner\/jobListing/i.test(url) ||
       /job-listing/i.test(url) ||
-      /\/Emploi\/[^/?]+/i.test(url) ||
+      (/\/Emploi\/[^/?]+/i.test(url) && !/SRCH_|-emplois-/i.test(url)) ||
       /[?&]jl=\d+/i.test(url)
     );
   }
@@ -209,8 +214,31 @@
     if (location) p.set("locT", "N");
     if (location) p.set("locId", "");
     if (location) p.set("sc.location", location);
+    p.set("applicationType", "1"); // Candidature facile uniquement
     if (page > 0) p.set("p", String(page + 1)); // Glassdoor pages are 1-based in ?p=
     return `${host}/Job/jobs.htm?${p.toString()}`;
+  }
+
+  async function ensureEasyApplyOnlyFilter() {
+    if (/[?&]applicationType=1\b/i.test(window.location.href)) return false;
+    // Prefer URL param (stable) over clicking the pill
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.set("applicationType", "1");
+      S().log(PLATFORM, "Filtre Candidature facile (applicationType=1)", "warn");
+      window.location.href = u.toString();
+      return true;
+    } catch (_e) {}
+    const pill =
+      S().$('button[data-test="applicationType"]') ||
+      [...S().$$("button")].find((b) => /candidature facile uniquement/i.test(b.textContent || ""));
+    if (pill && S().isVisible(pill) && pill.getAttribute("aria-pressed") !== "true") {
+      S().log(PLATFORM, "Clic filtre Candidature facile uniquement");
+      await S().humanClick(pill);
+      await S().sleep(2500);
+      return false;
+    }
+    return false;
   }
 
   function findNextPageUrl(session) {
@@ -252,10 +280,12 @@
       else nextPath = "";
       if (nextPath) {
         u.pathname = nextPath;
+        u.searchParams.set("applicationType", "1");
         return u.toString();
       }
       const page = parseInt(u.searchParams.get("p") || "1", 10);
       u.searchParams.set("p", String(page + 1));
+      u.searchParams.set("applicationType", "1");
       return u.toString();
     } catch (_e) {
       /* ignore */
@@ -726,13 +756,22 @@
 
     S().log(PLATFORM, `Session Glassdoor démarrée (${session?.applied || 0}/${maxJobs})`);
 
-    // If a job panel/detail is already open (jl= or dedicated listing), apply it first
-    // instead of re-scraping sidebar cards (that caused the open→merge→restart loop).
+    // Always force Easy Apply SERP filter
+    if (isSearchPage() || /SRCH_|-emplois-/i.test(location.href)) {
+      const navigated = await ensureEasyApplyOnlyFilter();
+      if (navigated) {
+        isRunning = false;
+        return;
+      }
+    }
+
+    // If a real job panel/detail is already open (jl= / jobListing), apply it first.
+    // SEO SERP without jl= is handled via cards below (isJobDetailPage already excludes it).
+    const onRealDetail = isJobDetailPage();
     const readyApply =
-      findEasyApplyButton() ||
-      findApplyButton() ||
-      findCompanySiteButton();
-    if (readyApply && (isJobDetailPage() || /[?&]jl=/.test(window.location.href))) {
+      onRealDetail &&
+      (findEasyApplyButton() || findApplyButton() || findCompanySiteButton());
+    if (readyApply) {
       const jobInfo = getJobInfo(
         new URLSearchParams(location.search).get("jl") || `gd_${Date.now()}`
       );
