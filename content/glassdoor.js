@@ -5,11 +5,43 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.3.9";
+  const VERSION = "1.4.1";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
   let lastGlassdoorRunAt = 0;
+
+  // v1.4.0: Intercept anchor clicks that navigate to Indeed.
+  // Glassdoor Easy Apply uses <a href="...indeed..."> not window.open,
+  // so the window.open override alone doesn't prevent the Glassdoor tab
+  // from navigating to Indeed (which causes the open-crash-close loop).
+  try {
+    document.addEventListener(
+      "click",
+      (e) => {
+        const a = e.target?.closest?.("a");
+        if (!a || !a.href) return;
+        const href = String(a.href);
+        if (/indeed\.(com|fr)|smartapply\.indeed/i.test(href)) {
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          chrome.runtime
+            .sendMessage({
+              action: "ensurePlatformTab",
+              platform: "indeed",
+              url: href,
+              active: true,
+              forceNavigate: true,
+            })
+            .catch(() => {});
+        }
+      },
+      true
+    );
+  } catch (_e) {
+    /* ignore */
+  }
 
   // Force Indeed/Smart Apply into the single Indeed tab (never spawn extra windows)
   try {
@@ -55,8 +87,11 @@
       text.includes("verify you are human") ||
       text.includes("checking your browser") ||
       text.includes("just a moment");
-    // Only treat Turnstile copy as blocked when the widget is actually present
-    return hardBlock || (humanCheck && hasCfWidget) || hasCfWidget;
+    // v1.4.0: Only return true for actual blocks or active challenges.
+    // Previously `hasCfWidget` alone caused false positives (the widget
+    // can be present on a normal page without a block), which triggered
+    // the open-crash-close loop.
+    return hardBlock || (humanCheck && hasCfWidget);
   }
 
   async function tryPassCloudflareChallenge() {
@@ -635,6 +670,15 @@
       return;
     }
 
+    // v1.4.0: Don't start a new Glassdoor run while an Indeed handoff is in progress.
+    // This was a key cause of the open-crash-close loop: Glassdoor navigates its tab
+    // to Indeed, background reopens Glassdoor, new Glassdoor starts → repeat.
+    if (session.awaitingIndeed) {
+      S().log(PLATFORM, "Handoff Indeed en cours — attente (anti-boucle)", "warn");
+      isRunning = false;
+      return;
+    }
+
     await chrome.storage.local.set({
       sessionGlassdoor: { ...session, lastRunAt: Date.now() },
     });
@@ -776,7 +820,7 @@
             S().log(PLATFORM, `Handoff Indeed: ${jobInfo.title} — attente Smart Apply`, "success");
             let handoffDone = false;
             const appliedBefore = current.applied || 0;
-            for (let w = 0; w < 28; w++) {
+            for (let w = 0; w < 90; w++) {
               if (shouldStop) break;
               const { sessionGlassdoor: sWait, appliedJobs: jobsWait = {} } = await chrome.storage.local.get([
                 "sessionGlassdoor",
@@ -954,6 +998,8 @@
 
   async function checkAndResumeSession() {
     if (!isSearchPage() && !isJobDetailPage()) return;
+    // v1.4.0: Don't resume if tab navigated to Indeed (handoff in progress)
+    if (/indeed\.(com|fr)|smartapply\.indeed/i.test(window.location.href)) return;
     if (isBlockedPage()) {
       await tryPassCloudflareChallenge();
       if (isBlockedPage()) return;
@@ -961,7 +1007,7 @@
     const start = Date.now();
     while (Date.now() - start < 60000) {
       const { sessionGlassdoor: session } = await chrome.storage.local.get(["sessionGlassdoor"]);
-      if (session?.active && !isRunning) {
+      if (session?.active && !session.awaitingIndeed && !isRunning) {
         // Only skip if another run finished very recently on THIS tab cycle
         if (session.lastRunAt && Date.now() - session.lastRunAt < 8000) {
           await S().sleep(2500);

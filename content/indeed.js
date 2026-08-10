@@ -4,20 +4,29 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.3.9";
+  const VERSION = "1.4.1";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
   let lastIndeedRunAt = 0;
 
-  // Keep Smart Apply in this Indeed tab whenever possible
+  // Keep SERP intact: Smart Apply opens in its own tab (never navigate the jobs list away)
   try {
     const nativeOpen = window.open.bind(window);
     window.open = function (url, target, features) {
       const href = String(url || "");
-      if (/indeed\.(com|fr)|smartapply\.indeed/i.test(href)) {
+      if (/smartapply\.indeed|indeedapply/i.test(href)) {
+        const opened = nativeOpen(href, "_blank", features);
+        chrome.runtime
+          .sendMessage({ action: "enforceOneTabPerPlatform", reason: "indeed smartapply window.open" })
+          .catch(() => {});
+        return opened;
+      }
+      if (/indeed\.(com|fr)/i.test(href)) {
         window.location.href = href;
-        chrome.runtime.sendMessage({ action: "enforceOneTabPerPlatform", reason: "indeed window.open" }).catch(() => {});
+        chrome.runtime
+          .sendMessage({ action: "enforceOneTabPerPlatform", reason: "indeed window.open" })
+          .catch(() => {});
         return null;
       }
       return nativeOpen(url, target, features);
@@ -51,6 +60,17 @@
   }
 
   function isSmartApplyPage(url = window.location.href) {
+    // v1.4.0: Ignore service worker iframes — they match smartapply but have no form
+    const path = (() => {
+      try {
+        return new URL(url, location.href).pathname;
+      } catch (_e) {
+        return url;
+      }
+    })();
+    if (/^\/_\/service_worker/i.test(path) || /^\/_\/scripts\//i.test(path) || /^\/sw_iframe/i.test(path)) {
+      return false;
+    }
     return (
       /smartapply\.indeed\.com/i.test(url) ||
       /indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(url) ||
@@ -86,54 +106,15 @@
     if (!/^[a-z0-9_-]+$/i.test(key)) return false;
 
     const lower = key.toLowerCase();
-    // Known demo / sequential placeholders seen in live mass-apply
+    // Known demo / sequential placeholders only (do NOT reject real hex job keys)
     if (
-      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|deadbeef|123456789abcdef0|0f1e2d3c4b5a6978|fedcba9876543210|f1e2d3c4b5a67890|456789abcdef0123)$/i.test(
+      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|deadbeefdeadbeef|123456789abcdef0|fedcba9876543210)$/i.test(
         lower
       )
     ) {
       return false;
     }
-    if (/^(123456789|456789abc|abcdef012)/i.test(lower)) return false;
-    if (/abcdef0$/i.test(lower) || /[0-9]{5,}abcdef/i.test(lower)) return false;
-    if (/^(a1b2c3d4|0f1e2d3c|fedcba98|f1e2d3c4|e2d3c4b5|456789ab)/i.test(lower)) return false;
-    if (/f1e2d3c4|e2d3c4b5|d3c4b5a6|c4b5a678/i.test(lower)) return false;
-
-    // Reject 16-char hex keys that are arithmetic / constant-step sequences
-    if (/^[0-9a-f]{16}$/i.test(lower)) {
-      const pairs = lower.match(/.{2}/g) || [];
-      if (pairs.length === 8) {
-        const vals = pairs.map((p) => parseInt(p, 16));
-        let asc = 0;
-        let desc = 0;
-        for (let i = 1; i < vals.length; i++) {
-          if (vals[i] === vals[i - 1] + 1) asc++;
-          if (vals[i] === vals[i - 1] - 1) desc++;
-        }
-        if (asc >= 5 || desc >= 5) return false;
-        const steps = [];
-        for (let i = 1; i < vals.length; i++) steps.push(vals[i] - vals[i - 1]);
-        // Long run of identical non-zero steps (even if later steps break)
-        let run = 1;
-        for (let i = 1; i < steps.length; i++) {
-          if (steps[i] === steps[i - 1] && steps[i] !== 0) run++;
-          else run = 1;
-          if (run >= 4) return false;
-        }
-        if (steps.length >= 5 && steps.every((s) => s === steps[0] && s !== 0)) return false;
-
-        // Interleaved first/second nibble monotonic (f1 e2 d3 c4 b5 a6)
-        const hi = pairs.map((p) => parseInt(p[0], 16));
-        const lo = pairs.map((p) => parseInt(p[1], 16));
-        let hiDesc = 0;
-        let loAsc = 0;
-        for (let i = 1; i < Math.min(6, hi.length); i++) {
-          if (hi[i] === hi[i - 1] - 1) hiDesc++;
-          if (lo[i] === lo[i - 1] + 1) loAsc++;
-        }
-        if (hiDesc >= 4 && loAsc >= 4) return false;
-      }
-    }
+    if (/^(jk_)?0{8,}$/i.test(lower)) return false;
     return true;
   }
 
@@ -607,6 +588,8 @@
     if (label && S().isVisible(label)) {
       await S().humanClick(label);
       await S().sleep(400);
+      // v1.4.0: after selecting existing resume radio, also try uploading CV file
+      await uploadCvFallback();
       return true;
     }
     const radio =
@@ -623,7 +606,31 @@
       } catch (_e) {
         /* ignore */
       }
+      await S().sleep(400);
+      // v1.4.0: also try uploading CV file after radio selection
+      await uploadCvFallback();
       return true;
+    }
+
+    // v1.4.0: No radio/label — try uploading CV directly to a file input
+    return await uploadCvFallback();
+  }
+
+  // v1.4.0: Upload CV file to any file input on resume-selection step.
+  // File inputs are often display:none (hidden by design) but still
+  // accept programmatic file assignment via DataTransfer.
+  async function uploadCvFallback() {
+    const fileInputs = S().$$(
+      'input[type="file"][accept*="pdf"], input[type="file"][accept*="doc"], input[type="file"], [data-testid*="resume-upload"], [data-testid*="file-upload"]'
+    );
+    for (const input of fileInputs) {
+      // File inputs are intentionally hidden — don't use isVisible() here
+      const ok = await S().uploadCvToFileInput(input);
+      if (ok) {
+        S().log(PLATFORM, "CV importé (upload fichier)", "success");
+        await S().sleep(800);
+        return true;
+      }
     }
     return false;
   }
@@ -694,6 +701,36 @@
     return null;
   }
 
+  async function answerFromCvOrAi(label, fieldType, el) {
+    const profile = await S().getProfile();
+    const fromProfile = String(profile.experience || "").match(/(\d+(?:[.,]\d+)?)/);
+    const isExp =
+      /antiquit|anciennet[ée]|exp[eé]rience|seniority|années?|ans\b|years?\s*(of\s*)?exp|combien d['’]?ann/i.test(
+        label
+      ) || fieldType === "number";
+    if (isExp && fromProfile) {
+      return fieldType === "number" || /nombre|combien|ans\b|years?\b/i.test(label)
+        ? fromProfile[1]
+        : `${fromProfile[1]} ans`;
+    }
+    try {
+      const res = await chrome.runtime.sendMessage({
+        action: "generateAnswer",
+        question: label,
+        fieldType: fieldType || (el?.type === "number" ? "number" : "text"),
+        options: [],
+        jobInfo: { title: document.title || "", company: "" },
+      });
+      const ans = String(res?.answer || "").trim();
+      if (ans && !/^(oui|yes|we|n\/?a|na|none|null)\.?$/i.test(ans)) return ans;
+      if (isExp && fromProfile) return fromProfile[1];
+      if (isExp) return "3";
+      return ans || "";
+    } catch (_e) {
+      return isExp ? fromProfile?.[1] || "3" : "";
+    }
+  }
+
   async function fillQuestionsStep() {
     const profile = await S().getProfile();
 
@@ -741,19 +778,40 @@
       }
     }
 
-    // Selects: pick first non-empty option if none selected
+    // Selects: AI when label is experience-like, else first non-empty
     for (const sel of S().$$("select")) {
       if (!S().isVisible(sel) || sel.value) continue;
-      const opt = [...sel.options].find((o) => o.value && !/select|choisir|—|--/i.test(o.textContent || ""));
-      if (opt) {
-        sel.value = opt.value;
-        sel.dispatchEvent(new Event("input", { bubbles: true }));
-        sel.dispatchEvent(new Event("change", { bubbles: true }));
-        await S().sleep(100);
+      const label = (
+        (sel.id && document.querySelector(`label[for="${sel.id}"]`)?.textContent) ||
+        sel.getAttribute("aria-label") ||
+        ""
+      ).trim();
+      const options = [...sel.options].map((o) => o.text.trim()).filter(Boolean);
+      let picked = null;
+      if (/antiquit|anciennet|exp[eé]rience|années|seniority/i.test(label)) {
+        const ans = await answerFromCvOrAi(label, "select", sel);
+        picked = options.find((o) => o.toLowerCase() === String(ans).toLowerCase()) ||
+          options.find(
+            (o) =>
+              o.toLowerCase().includes(String(ans).toLowerCase()) ||
+              String(ans).toLowerCase().includes(o.toLowerCase())
+          );
       }
+      if (!picked) {
+        picked = options.find((o) => o && !/select|choisir|—|--/i.test(o));
+      }
+      if (picked) {
+        const opt = [...sel.options].find((o) => o.text.trim() === picked);
+        if (opt) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event("input", { bubbles: true }));
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }
+      await S().sleep(100);
     }
 
-    // Text / number / date / textarea
+    // Text / number / date / textarea — use CV/AI for experience / antiquity
     for (const el of S().$$(
       "textarea, input[type='text'], input[type='number'], input[type='date'], input[type='tel'], input:not([type])"
     )) {
@@ -776,18 +834,30 @@
           await S().humanType(el, dateVal);
         }
       } else if (/url|link|http|linkedin|portfolio|github/i.test(label)) {
-        await S().humanType(el, "https://www.linkedin.com");
+        await S().humanType(el, profile.linkedin || "https://www.linkedin.com");
       } else if (/rythme|alternance.*(école|ecole|entreprise)|jours?\s*(école|ecole)/i.test(label)) {
         await S().humanType(el, "2 jours école / 3 jours entreprise");
-      } else if (/année|year|experience|expérience|ans/i.test(label) || el.type === "number") {
-        await S().humanType(el, "3");
+      } else if (
+        /antiquit|anciennet[ée]|exp[eé]rience|seniority|année|year|ans\b|poste|previous|précédent/i.test(label) ||
+        el.type === "number"
+      ) {
+        let answer = await answerFromCvOrAi(label || "années d'expérience", el.type === "number" ? "number" : "text", el);
+        if (el.type === "number") {
+          const num = String(answer).match(/\d+/);
+          answer = num ? num[0] : "3";
+        }
+        if (!answer || /^(oui|yes|we)\.?$/i.test(answer)) {
+          const n = String(profile.experience || "").match(/(\d+)/);
+          answer = el.type === "number" ? n?.[1] || "3" : n ? `${n[1]} ans` : "3 ans";
+        }
+        await S().humanType(el, answer);
       } else if (/salaire|salary|prétention|compensation/i.test(label)) {
-        await S().humanType(el, "45000");
+        await S().humanType(el, profile.salaryExpectation || "45000");
       } else if (/phone|téléphone|tel/i.test(label)) {
         await S().humanType(el, profile.phone || "0612345678");
       } else {
-        // Short answer — never dump a long sentence into structured fields
-        await S().humanType(el, "Oui");
+        const ai = await answerFromCvOrAi(label || "question candidature", "text", el);
+        await S().humanType(el, ai && !/^(we)\.?$/i.test(ai) ? ai : "Oui");
       }
       await S().sleep(120);
     }
@@ -799,9 +869,17 @@
       return { success: false, reason: "not_smartapply" };
     }
     S().log(PLATFORM, `Assistant Smart Apply — ${smartApplyPath()}`);
-    for (let step = 0; step < 36; step++) {
+    for (let step = 0; step < 48; step++) {
       if (shouldStop) return { success: false, reason: "stopped" };
       if (detectApplySuccess()) return { success: true };
+
+      // reCAPTCHA / Turnstile on Smart Apply
+      try {
+        if (typeof window.__AmijobsClickRecaptcha === "function") window.__AmijobsClickRecaptcha();
+        if (typeof window.__AmijobsSolveRecaptcha === "function") window.__AmijobsSolveRecaptcha();
+        if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+        if (typeof window.__AmijobsSolveTurnstile === "function") window.__AmijobsSolveTurnstile();
+      } catch (_e) {}
 
       const path = smartApplyPath();
       // Wait for review preview loader (live test: "Préparation de l'aperçu")
@@ -1417,6 +1495,11 @@
 
   async function runAutoApplySession() {
     if (isRunning) return;
+    // v1.4.0: Skip service worker iframes — they're not real apply pages
+    const winPath = window.location.pathname || "";
+    if (/^\/_\/service_worker/i.test(winPath) || /^\/_\/scripts\//i.test(winPath) || /^\/sw_iframe/i.test(winPath)) {
+      return;
+    }
     const now = Date.now();
     if (now - lastIndeedRunAt < 2500) return;
     lastIndeedRunAt = now;

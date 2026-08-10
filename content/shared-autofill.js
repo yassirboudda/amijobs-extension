@@ -89,6 +89,10 @@
     if (/cover|motivation|lettre|message|why|pourquoi/.test(l)) {
       return profile.coverLetterDefault || "";
     }
+    if (/antiquit|anciennet[ée]|exp[eé]rience|seniority|années?\s*d['’]?exp|years?\s*(of\s*)?exp/i.test(l)) {
+      const n = String(profile.experience || "").match(/(\d+(?:[.,]\d+)?)/);
+      if (n) return /nombre|combien|number|ans\b|years?\b/i.test(l) ? n[1] : `${n[1]} ans`;
+    }
     return "";
   }
 
@@ -237,9 +241,27 @@
 
     let answer = direct;
     if (!answer) {
-      // Avoid AI inventing prose for short structured fields
-      if (field.type === "number" || /année|year|expérience|experience/i.test(label)) answer = "3";
-      else if (/url|link|linkedin/i.test(label)) answer = "https://www.linkedin.com";
+      const wantsExp =
+        field.type === "number" ||
+        /antiquit|anciennet[ée]|année|year|exp[eé]rience|experience|seniority|ans\b/i.test(label);
+      if (wantsExp) {
+        const res = await withTimeout(
+          chrome.runtime.sendMessage({
+            action: "generateAnswer",
+            question: label,
+            fieldType: field.type === "number" ? "number" : "text",
+            options: [],
+            jobInfo,
+          }),
+          6000,
+          null
+        );
+        answer = res?.answer || "";
+        if (!answer || /^(oui|yes|we|n\/?a)\.?$/i.test(String(answer).trim())) {
+          const n = String(profile.experience || "").match(/(\d+)/);
+          answer = n ? n[1] : "3";
+        }
+      } else if (/url|link|linkedin/i.test(label)) answer = profile.linkedin || "https://www.linkedin.com";
       else if (/phone|téléphone|tel/i.test(label)) answer = profile.phone || "0612345678";
       else {
         const res = await withTimeout(
@@ -254,6 +276,7 @@
           null
         );
         answer = res?.answer || "Oui";
+        if (/^(we|n\/?a|none|null)\.?$/i.test(String(answer).trim())) answer = "Oui";
         // If AI returned a long sentence but the field looks like a short input, keep it short
         if (el.tagName === "INPUT" && String(answer).length > 40 && !/cover|motivation|message|pourquoi/i.test(label)) {
           answer = "Oui";
@@ -326,13 +349,14 @@
     } catch (_e) {}
     for (const r of roots) {
       for (const el of $$("input, textarea, select", r)) {
-        if (!isVisible(el)) continue;
         const type = (el.getAttribute("type") || el.tagName.toLowerCase()).toLowerCase();
         if (["hidden", "submit", "button", "image", "reset"].includes(type)) continue;
+        // v1.4.0: File inputs are often hidden by design but still need upload
         if (type === "file") {
           fields.push({ type: "file", label: getFieldLabel(el), element: el });
           continue;
         }
+        if (!isVisible(el)) continue;
         if (type === "radio") {
           const name = el.name;
           if (!name || fields.some((f) => f.type === "radio" && f.name === name)) continue;

@@ -144,6 +144,21 @@
     </div>
 
     <div class="panel">
+      <h2>2Captcha</h2>
+      <div class="grid">
+        <div>
+          <label>Clé API 2Captcha</label>
+          <input id="twoCaptchaApiKey" type="password" autocomplete="off" placeholder="Votre clé 2captcha…" />
+        </div>
+      </div>
+      <p class="hint">
+        Utilisée pour résoudre reCAPTCHA et Cloudflare Turnstile sur Indeed / Glassdoor.
+        Créez un compte sur <a href="https://2captcha.com" target="_blank" rel="noopener">2captcha.com</a>.
+        La clé reste locale (chrome.storage) et n’est jamais publiée avec l’extension.
+      </p>
+    </div>
+
+    <div class="panel">
       <h2 data-i18n="settingsTitle">Réglages automation</h2>
       <div class="grid">
         <div><label data-i18n="maxJobs">Max offres / session</label><input id="maxJobsPerSession" type="number" min="1" max="10000" /></div>

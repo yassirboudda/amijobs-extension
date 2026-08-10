@@ -3,10 +3,12 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.3.9";
+const EXT_VERSION = "1.4.1";
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
+const TWOCAPTCHA_CREATE = "https://api.2captcha.com/createTask";
+const TWOCAPTCHA_RESULT = "https://api.2captcha.com/getTaskResult";
 
 const DEFAULT_PROFILE = {
   fullName: "",
@@ -359,8 +361,58 @@ function pickTabToKeep(tabs, preferredUrl = "") {
   return tabs[0];
 }
 
-/** HARD RULE: at most one browser tab per job board. Never create a second. */
+/** HARD RULE: at most one browser tab per job board. Never create a second.
+ * Indeed exception: SERP and Smart Apply may coexist — never navigate Apply→SERP or close the other. */
 async function ensureSinglePlatformTab(platform, url, { active = false, forceNavigate = true } = {}) {
+  // Indeed: keep board + apply as separate slots
+  if (platform === "indeed") {
+    const tabs = await listPlatformTabs("indeed");
+    const wantApply = /smartapply|indeedapply/i.test(String(url || ""));
+    const applyTabs = tabs.filter((t) => /smartapply|indeedapply/i.test(t.url || ""));
+    const boardTabs = tabs.filter((t) => !/smartapply|indeedapply/i.test(t.url || ""));
+    const pool = wantApply ? applyTabs : boardTabs;
+    const otherPool = wantApply ? boardTabs : applyTabs;
+
+    // Cap duplicates inside the target pool only — never touch the other pool
+    const keep = pickTabToKeep(pool, url) || pool[0] || null;
+    for (const t of pool) {
+      if (keep && t.id === keep.id) continue;
+      try {
+        await chrome.tabs.remove(t.id);
+      } catch (_e) {}
+    }
+    // Cap other pool to 1 as well (without navigating it)
+    if (otherPool.length > 1) {
+      const keepOther = pickTabToKeep(otherPool, wantApply ? "/jobs" : "smartapply") || otherPool[0];
+      for (const t of otherPool) {
+        if (keepOther && t.id === keepOther.id) continue;
+        try {
+          await chrome.tabs.remove(t.id);
+        } catch (_e) {}
+      }
+    }
+
+    if (keep?.id) {
+      const patch = {};
+      if (active) patch.active = true;
+      if (forceNavigate && url && keep.url !== url) patch.url = url;
+      if (Object.keys(patch).length) {
+        try {
+          await chrome.tabs.update(keep.id, patch);
+        } catch (_e) {}
+      }
+      return keep.id;
+    }
+
+    if (!url) return null;
+    try {
+      const created = await chrome.tabs.create({ url, active: !!active });
+      return created?.id || null;
+    } catch (_e) {
+      return null;
+    }
+  }
+
   const tabs = await listPlatformTabs(platform);
   const keep = pickTabToKeep(tabs, url);
   const extras = tabs.filter((t) => keep && t.id !== keep.id);
@@ -404,6 +456,34 @@ async function enforceOneTabPerPlatform(reason = "") {
     for (const platform of SUPPORTED_PLATFORMS) {
       const tabs = await listPlatformTabs(platform);
       if (tabs.length <= 1) continue;
+
+      // Indeed exception: allow 1 SERP (/jobs|/viewjob) + 1 Smart Apply at once.
+      // Old logic preferred Smart Apply and closed the SERP → "Indeed closes alone".
+      if (platform === "indeed") {
+        const applyTabs = tabs.filter((t) => /smartapply|indeedapply/i.test(t.url || ""));
+        const boardTabs = tabs.filter((t) => !/smartapply|indeedapply/i.test(t.url || ""));
+        const keepApply = pickTabToKeep(applyTabs, "smartapply");
+        const keepBoard = pickTabToKeep(boardTabs, "/jobs");
+        for (const t of applyTabs) {
+          if (keepApply && t.id !== keepApply.id) {
+            try {
+              await chrome.tabs.remove(t.id);
+            } catch (_e) {}
+          }
+        }
+        for (const t of boardTabs) {
+          if (keepBoard && t.id !== keepBoard.id) {
+            try {
+              await chrome.tabs.remove(t.id);
+            } catch (_e) {}
+          }
+        }
+        if (reason && (applyTabs.length > 1 || boardTabs.length > 1)) {
+          await appendLog(`Onglets indeed fusionnés (SERP+Apply) — ${reason}`, "warn", platform);
+        }
+        continue;
+      }
+
       const keep = pickTabToKeep(tabs);
       for (const t of tabs) {
         if (!keep || t.id === keep.id) continue;
@@ -846,6 +926,23 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     }
   }
 
+  // v1.4.0: Skip service worker iframes — they match the Smart Apply URL pattern
+  // but have no apply form, causing wizard_timeout.
+  try {
+    const checkPath = (() => {
+      try {
+        return new URL(url, location.href).pathname;
+      } catch (_e) {
+        return url;
+      }
+    })();
+    if (/^\/_\/service_worker/i.test(checkPath) || /^\/_\/scripts\//i.test(checkPath) || /^\/sw_iframe/i.test(checkPath)) {
+      return;
+    }
+  } catch (_e) {
+    /* ignore */
+  }
+
   if (!/smartapply\.indeed\.com/i.test(url) && !/indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(url)) {
     return;
   }
@@ -1066,10 +1163,139 @@ async function askMistral(systemPrompt, userPrompt, maxTokens = 300) {
   }
 }
 
+async function getTwoCaptchaApiKey() {
+  try {
+    const { twoCaptchaApiKey } = await chrome.storage.local.get(["twoCaptchaApiKey"]);
+    if (twoCaptchaApiKey) return String(twoCaptchaApiKey).trim();
+  } catch (_e) {}
+  // Optional local-only file (gitignored) — never ship a real key in the public zip
+  try {
+    const res = await fetch(chrome.runtime.getURL("secrets.local.json"));
+    if (res.ok) {
+      const data = await res.json();
+      const k = String(data?.twoCaptchaApiKey || "").trim();
+      if (k) {
+        await chrome.storage.local.set({ twoCaptchaApiKey: k });
+        return k;
+      }
+    }
+  } catch (_e) {}
+  return "";
+}
+
+async function solveCaptchaWith2Captcha({
+  type = "recaptcha_v2",
+  websiteURL,
+  websiteKey,
+  pageAction = "",
+  isEnterprise = false,
+  isInvisible = false,
+} = {}) {
+  const clientKey = await getTwoCaptchaApiKey();
+  if (!clientKey) {
+    return { ok: false, reason: "missing_2captcha_key" };
+  }
+  const pageUrl = String(websiteURL || "").trim();
+  const siteKey = String(websiteKey || "").trim();
+  if (!pageUrl || !siteKey) {
+    return { ok: false, reason: "missing_sitekey_or_url" };
+  }
+
+  let task;
+  const t = String(type || "").toLowerCase();
+  if (t.includes("turnstile") || t.includes("cloudflare")) {
+    task = {
+      type: "TurnstileTaskProxyless",
+      websiteURL: pageUrl,
+      websiteKey: siteKey,
+    };
+    if (pageAction) task.action = pageAction;
+  } else if (isEnterprise || t.includes("enterprise")) {
+    task = {
+      type: "RecaptchaV2EnterpriseTaskProxyless",
+      websiteURL: pageUrl,
+      websiteKey: siteKey,
+      isInvisible: !!isInvisible,
+    };
+  } else {
+    task = {
+      type: "RecaptchaV2TaskProxyless",
+      websiteURL: pageUrl,
+      websiteKey: siteKey,
+      isInvisible: !!isInvisible,
+    };
+  }
+
+  try {
+    const createRes = await fetch(TWOCAPTCHA_CREATE, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientKey, task }),
+    });
+    const created = await createRes.json();
+    if (created?.errorId) {
+      await appendLog(
+        `2captcha createTask: ${created.errorDescription || created.errorCode || "error"}`,
+        "warn"
+      );
+      return { ok: false, reason: created.errorDescription || "create_failed", errorId: created.errorId };
+    }
+    const taskId = created?.taskId;
+    if (!taskId) return { ok: false, reason: "no_task_id" };
+
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5000));
+      const pollRes = await fetch(TWOCAPTCHA_RESULT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientKey, taskId }),
+      });
+      const polled = await pollRes.json();
+      if (polled?.errorId) {
+        return { ok: false, reason: polled.errorDescription || "poll_failed", errorId: polled.errorId };
+      }
+      if (polled?.status === "ready") {
+        const token =
+          polled?.solution?.gRecaptchaResponse ||
+          polled?.solution?.token ||
+          polled?.solution?.text ||
+          "";
+        if (!token) return { ok: false, reason: "empty_token" };
+        await appendLog("2captcha: captcha résolu", "success");
+        return { ok: true, token, taskId };
+      }
+    }
+    return { ok: false, reason: "timeout" };
+  } catch (err) {
+    console.error("[AmiJobs] 2captcha error:", err);
+    return { ok: false, reason: err?.message || "network_error" };
+  }
+}
+
 async function generateAnswer(question, fieldType, options, jobInfo, profile, cvText) {
   const q = String(question || "");
-  const cv = String(cvText || "");
+  const cv = String(cvText || profile?.cvText || "");
   const loc = String(profile.location || profile.country || "France").toLowerCase();
+
+  // Years of experience / "Antiquité du poste" — derive from CV/profile, never invent "we"
+  if (
+    /antiquit|anciennet[ée]|exp[eé]rience|seniority|years?\s*(of\s*)?experience|combien d['’]?ann[ée]es|nombre d['’]?ann[ée]es|ans d['’]?exp/i.test(
+      q
+    )
+  ) {
+    const fromProfile = String(profile.experience || "").match(/(\d+(?:[.,]\d+)?)/);
+    const fromCv =
+      cv.match(/(\d+(?:[.,]\d+)?)\s*(?:\+)?\s*(?:ans|ann[ée]es?|years?)\s*(?:d['’]?exp[eé]rience|of\s*experience|exp\.?)/i) ||
+      cv.match(/exp[eé]rience[^\n]{0,40}?(\d+(?:[.,]\d+)?)\s*(?:ans|ann[ée]es?|years?)/i) ||
+      cv.match(/(\d+(?:[.,]\d+)?)\s*\+\s*(?:ans|years?)/i);
+    const years = (fromCv && fromCv[1]) || (fromProfile && fromProfile[1]) || "";
+    if (years) {
+      const n = years.replace(",", ".");
+      if (fieldType === "number" || /nombre|combien|ans\b|years?\b/i.test(q)) return String(parseFloat(n) || n);
+      return `${n} ans`;
+    }
+  }
 
   // Structured fallbacks BEFORE calling Mistral — avoid off-topic "Oui"
   if (/rythme|alternance.*(école|ecole|entreprise)|jours?\s*(école|ecole|entreprise)|school\s*\/\s*company/i.test(q)) {
@@ -1104,26 +1330,32 @@ async function generateAnswer(question, fieldType, options, jobInfo, profile, cv
   if (profile.stack) contextParts.push(`Compétences: ${profile.stack}`);
   if (profile.languages) contextParts.push(`Langues: ${profile.languages}`);
   const profileContext = contextParts.join("\n");
-  const cvContext = cv ? `\n\nCV:\n${cv.substring(0, 3500)}` : "";
+  const cvContext = cv ? `\n\nCV (texte intégral — source de vérité):\n${cv.substring(0, 6000)}` : "";
   const systemPrompt = `Tu aides à remplir un formulaire de candidature pour ${profile.fullName || "le candidat"}.
 ${profileContext}${cvContext}
 Poste: ${jobInfo?.title || "?"} @ ${jobInfo?.company || "?"}
 
 RÈGLES STRICTES:
-- Réponds UNIQUEMENT avec la valeur du champ, sans explication.
-- Base-toi d'abord sur le CV et le profil. Ne invente pas de faits absents du CV.
-- Si l'info n'est pas dans le CV, utilise une réponse plausible et courte adaptée au contexte (région, type de contrat).
-- Ne réponds JAMAIS juste "Oui" si la question demande un détail (rythme, date, montant, durée, niveau).
+- Réponds UNIQUEMENT avec la valeur du champ, sans explication ni phrase.
+- Base-toi UNIQUEMENT sur le CV et le profil. N'invente rien.
+- Pour antiquité / années d'expérience: réponds avec un nombre (ex: 5) ou "X ans" selon le champ.
+- Interdit: réponses vides, "we", "oui" seul, "n/a", anglais générique.
+- Si l'info manque dans le CV, réponds de façon minimale et factuelle (ex: profil.experience).
 - Dates au format JJ/MM/AAAA sauf si le champ exige ISO.`;
   let userPrompt = `Question: "${question}"\nType: ${fieldType}`;
   if (options?.length) userPrompt += `\nOptions: ${JSON.stringify(options)}`;
   const ai = await askMistral(systemPrompt, userPrompt, 200);
   if (!ai) return null;
-  // Guard against lazy "Oui" on detail questions
-  if (/^oui\.?$/i.test(ai.trim()) && /rythme|date|combien|salaire|expérience|niveau|jours/i.test(q)) {
+  let cleaned = ai.trim().replace(/^["'«»]+|["'«»]+$/g, "");
+  // Guard against lazy / broken AI answers
+  if (/^(oui|yes|we|n\/?a|na|none|null)\.?$/i.test(cleaned) && /rythme|date|combien|salaire|expérience|antiquit|anciennet|niveau|jours|ans/i.test(q)) {
     if (/rythme|alternance/i.test(q)) return "2 jours école / 3 jours entreprise";
+    if (/antiquit|anciennet|expérience|ans/i.test(q)) {
+      const n = String(profile.experience || "").match(/(\d+)/);
+      return n ? n[1] : "3";
+    }
   }
-  return ai;
+  return cleaned;
 }
 
 async function appendLog(message, level = "info", platform = "") {
@@ -1317,6 +1549,8 @@ async function ensureActiveSessionTabs() {
     for (const [platform, session] of checks) {
       if (!session?.active) continue;
       if (platform === "indeed" && session.fromGlassdoor) continue;
+      // v1.4.0: Don't reopen Glassdoor during Indeed handoff (anti-loop)
+      if (platform === "glassdoor" && session.awaitingIndeed) continue;
       const searchUrl = session.searchUrl || session.resumeSearchUrl || "";
       if (!searchUrl) continue;
       const existing = await listPlatformTabs(platform);
@@ -1326,6 +1560,21 @@ async function ensureActiveSessionTabs() {
       }
       if (existing.length === 1) {
         const tabUrl = existing[0].url || "";
+        // Indeed: if only Smart Apply is open, restore SERP in a second tab (do not navigate Apply)
+        if (
+          platform === "indeed" &&
+          !session.fromGlassdoor &&
+          /smartapply|indeedapply/i.test(tabUrl) &&
+          searchUrl
+        ) {
+          const now = Date.now();
+          const last = lastPlatformReopenAt[platform] || 0;
+          if (now - last >= 20000) {
+            lastPlatformReopenAt[platform] = now;
+            await ensureSinglePlatformTab(platform, searchUrl, { active: false, forceNavigate: true });
+            await appendLog("SERP Indeed restaurée (Smart Apply conservé)", "warn", platform);
+          }
+        }
         // LinkedIn often lands on /feed after auth — nudge back to jobs search.
         if (platform === "linkedin") {
           if (!/\/jobs/i.test(tabUrl) && !/checkpoint|login|authwall|uas\//i.test(tabUrl)) {
@@ -1442,6 +1691,12 @@ chrome.tabs.onRemoved.addListener(async () => {
     for (const [platform, session] of checks) {
       if (!session?.active) continue;
       if (platform === "indeed" && session.fromGlassdoor) continue;
+
+      // v1.4.0: Don't reopen Glassdoor while an Indeed handoff is in progress.
+      // During handoff, the Glassdoor tab navigates to Indeed Smart Apply, so
+      // listPlatformTabs("glassdoor") returns 0 → the watchdog would reopen
+      // Glassdoor → new run → another handoff → open-crash-close loop.
+      if (platform === "glassdoor" && session.awaitingIndeed) continue;
 
       const searchUrl = session.searchUrl || session.resumeSearchUrl || "";
       if (!searchUrl) continue;
@@ -1889,6 +2144,20 @@ function handleMessage(msg, sendResponse, sender = null) {
     return true;
   }
 
+  if (msg.action === "solveCaptcha" || msg.action === "solve2Captcha") {
+    solveCaptchaWith2Captcha({
+      type: msg.type || msg.captchaType || "recaptcha_v2",
+      websiteURL: msg.websiteURL || msg.pageUrl || msg.url || "",
+      websiteKey: msg.websiteKey || msg.sitekey || msg.siteKey || "",
+      pageAction: msg.pageAction || msg.actionName || "",
+      isEnterprise: !!msg.isEnterprise || /enterprise/i.test(String(msg.type || "")),
+      isInvisible: !!msg.isInvisible,
+    })
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, reason: e.message }));
+    return true;
+  }
+
   if (msg.action === "checkBackend") {
     // External apply is handled in-extension (no remote backend)
     sendResponse({ available: true, ok: true, mode: "in_extension" });
@@ -2195,6 +2464,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return handleMessage(msg, sendResponse, sender);
 });
 
+// Seed local 2captcha key from secrets.local.json on every SW wake (local installs only)
+getTwoCaptchaApiKey().catch(() => {});
+
 chrome.runtime.onInstalled.addListener(async () => {
   const existing = await chrome.storage.local.get([
     "profile",
@@ -2202,6 +2474,7 @@ chrome.runtime.onInstalled.addListener(async () => {
     "mistralApiKey",
     "uiSettings",
     "enabled",
+    "twoCaptchaApiKey",
   ]);
   const patch = {};
   if (!existing.profile) patch.profile = { ...DEFAULT_PROFILE };
@@ -2211,5 +2484,9 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (!existing.uiSettings) patch.uiSettings = { language: "auto" };
   if (typeof existing.enabled !== "boolean") patch.enabled = true;
   if (Object.keys(patch).length) await chrome.storage.local.set(patch);
+  // Local-only: seed 2captcha from secrets.local.json if present (gitignored)
+  try {
+    await getTwoCaptchaApiKey();
+  } catch (_e) {}
   await appendLog(`AmiJobs v${EXT_VERSION} installé — amijobs.com`, "success");
 });

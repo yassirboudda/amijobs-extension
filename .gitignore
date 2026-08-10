@@ -2,3 +2,6 @@
 *.log
 .env
 node_modules/
+secrets.local.json
+*.local.json
+.amijobs-local/

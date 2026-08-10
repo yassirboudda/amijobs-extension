@@ -219,6 +219,58 @@
     }
   }
 
+  async function solveTurnstileVia2Captcha() {
+    if (window.__AmijobsTurnstileSolving) return false;
+    const widget =
+      document.querySelector(".cf-turnstile[data-sitekey], [data-sitekey].cf-turnstile, div[data-sitekey]") ||
+      document.querySelector("[data-sitekey]");
+    const siteKey =
+      widget?.getAttribute?.("data-sitekey") ||
+      (() => {
+        const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+        const src = iframe?.src || "";
+        const m = src.match(/[?&](?:sitekey|k)=([^&]+)/i);
+        return m ? decodeURIComponent(m[1]) : "";
+      })();
+    if (!siteKey) return false;
+    window.__AmijobsTurnstileSolving = true;
+    try {
+      let pageUrl = location.href;
+      try {
+        if (window.top && window.top !== window) pageUrl = window.top.location.href;
+      } catch (_e) {
+        pageUrl = document.referrer || pageUrl;
+      }
+      const res = await chrome.runtime.sendMessage({
+        action: "solveCaptcha",
+        type: "turnstile",
+        websiteURL: pageUrl,
+        websiteKey: siteKey,
+      });
+      if (!res?.ok || !res.token) return false;
+      const token = res.token;
+      for (const input of document.querySelectorAll(
+        '[name="cf-turnstile-response"], input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+      )) {
+        input.value = token;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      try {
+        if (typeof window.turnstile !== "undefined" && widget) {
+          /* best-effort callback via data-callback */
+          const cbName = widget.getAttribute("data-callback");
+          if (cbName && typeof window[cbName] === "function") window[cbName](token);
+        }
+      } catch (_e) {}
+      return true;
+    } catch (_e) {
+      return false;
+    } finally {
+      window.__AmijobsTurnstileSolving = false;
+    }
+  }
+
   // Always expose re-trigger (injectTurnstileClicker must be able to re-fire)
   window.__AmijobsClickTurnstile = () => {
     try {
@@ -228,6 +280,7 @@
     }
   };
   window.__AmijobsTurnstileLoop = () => loop();
+  window.__AmijobsSolveTurnstile = solveTurnstileVia2Captcha;
 
   if (!window.__AmijobsTurnstileBooted) {
     window.__AmijobsTurnstileBooted = true;
@@ -236,6 +289,9 @@
     } else {
       loop();
     }
+    setTimeout(() => {
+      solveTurnstileVia2Captcha().catch(() => {});
+    }, 3500);
     try {
       const mo = new MutationObserver(() => {
         try {
@@ -253,5 +309,6 @@
     // Re-injected by background: click immediately + short burst
     attempt();
     loop(8, 500);
+    solveTurnstileVia2Captcha().catch(() => {});
   }
 })();

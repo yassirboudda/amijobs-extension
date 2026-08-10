@@ -72,6 +72,7 @@ async function load() {
     "profile",
     "autoApplySettings",
     "mistralApiKey",
+    "twoCaptchaApiKey",
     "blacklistedCompanies",
     "uiSettings",
     "cvText",
@@ -104,6 +105,7 @@ async function load() {
   updateBlacklistCount(blacklist.length);
 
   $("mistralApiKey").value = data.mistralApiKey || "";
+  $("twoCaptchaApiKey").value = data.twoCaptchaApiKey || "";
   $("maxJobsPerSession").value = settings.maxJobsPerSession || 25;
   $("maxNoApplyPages").value = settings.maxConsecutiveNoApplyPages || 20;
   $("maxApplicationsPerCompany").value = settings.maxApplicationsPerCompany ?? 0;
@@ -169,6 +171,7 @@ async function save() {
   };
 
   const mistralApiKey = $("mistralApiKey").value.trim();
+  const twoCaptchaApiKey = $("twoCaptchaApiKey").value.trim();
   const uiSettings = { language: $("uiLanguage").value || "auto" };
 
   const payload = {
@@ -178,6 +181,7 @@ async function save() {
     blacklistedCompanies,
     uiSettings,
     mistralApiKey: mistralApiKey || undefined,
+    twoCaptchaApiKey: twoCaptchaApiKey || "",
   };
   if (pendingCvFile) {
     payload.cvFile = pendingCvFile;
