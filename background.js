@@ -3,7 +3,8 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.4.6";
+const EXT_VERSION = "1.4.45";
+let lastGlassdoorSerpRestoreAt = 0;
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
@@ -34,6 +35,8 @@ const DEFAULT_PROFILE = {
 
 const DEFAULT_SETTINGS = {
   maxJobsPerSession: 25,
+  // 0 = no per-page cap. Set to 2 to apply 2 jobs on page 1 then flip to page 2, etc.
+  maxJobsPerPage: 0,
   delayBetweenJobs: { min: 500, max: 500 },
   delayBetweenSteps: { min: 100, max: 100 },
   autoSubmit: true,
@@ -55,6 +58,7 @@ function clampInt(value, min, max, fallback) {
 function sanitizeSettings(settings = {}) {
   const s = { ...DEFAULT_SETTINGS, ...settings };
   s.maxJobsPerSession = clampInt(s.maxJobsPerSession, 1, 10000, 25);
+  s.maxJobsPerPage = clampInt(s.maxJobsPerPage, 0, 50, 0);
   s.maxConsecutiveNoApplyPages = clampInt(s.maxConsecutiveNoApplyPages, 1, 50, 20);
   s.maxApplicationsPerCompany = clampInt(s.maxApplicationsPerCompany, 0, 100, 0);
   const dj = s.delayBetweenJobs || {};
@@ -186,6 +190,7 @@ function emptyPlatformSession(platform, overrides = {}) {
       contracts: [],
       searchUrl: "",
       currentPage: 0,
+      pageApplied: 0,
       noApplyPages: 0,
       phase: "search",
       queue: [],
@@ -310,9 +315,121 @@ const PLATFORM_URL_MATCH = {
 
 let watchingIndeedFromGlassdoor = null;
 let lastSmartApplyKick = 0;
+let lastIndeedLoginWallAt = 0;
+/** Armed while Glassdoor clicks Easy Apply without a scrapable Indeed href. */
+let indeedHandoffCapture = null;
 let tabEnforceLock = false;
 const lastPlatformReopenAt = Object.create(null);
 const platformReopenCount = Object.create(null);
+
+/** secure.indeed.com/auth — must not match as Smart Apply via ?continue=… */
+function isIndeedLoginWallUrl(url = "") {
+  try {
+    const u = new URL(String(url || ""), "https://indeed.com");
+    return /(^|\.)secure\.indeed\.com$/i.test(u.hostname) && /^\/(auth|account)/i.test(u.pathname);
+  } catch (_e) {
+    const s = String(url || "").split(/[?#]/)[0];
+    return /secure\.indeed\.com\/(auth|account)/i.test(s);
+  }
+}
+
+/** True Smart Apply host/path only — never match smartapply inside ?continue=. */
+function isIndeedSmartApplyUrl(url = "") {
+  if (isIndeedLoginWallUrl(url)) return false;
+  try {
+    const u = new URL(String(url || ""), "https://indeed.com");
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname || "";
+    if (host === "smartapply.indeed.com" || host.endsWith(".smartapply.indeed.com")) return true;
+    if (/(^|\.)indeed\.(com|fr)$/i.test(host) && /\/(?:beta\/)?indeedapply(?:\/|$)/i.test(path)) return true;
+    if (/(^|\.)indeed\.(com|fr)$/i.test(host) && /\/apply(?:\/|$)/i.test(path)) return true;
+    return false;
+  } catch (_e) {
+    const s = String(url || "").split(/[?#]/)[0];
+    return (
+      /smartapply\.indeed\.com/i.test(s) ||
+      /indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(s) ||
+      /indeed\.(com|fr)\/apply(?:\/|$)/i.test(s)
+    );
+  }
+}
+
+/**
+ * Glassdoor→Indeed landed on login. Clear handoff, close auth tab, block further
+ * Indeed handoffs for this run so we don't endSession→kickGlassdoor→auth forever.
+ */
+async function handleIndeedLoginWall(tabId, url = "") {
+  const now = Date.now();
+  if (now - lastIndeedLoginWallAt < 8000) return { ok: true, deduped: true };
+  lastIndeedLoginWallAt = now;
+
+  const data = await chrome.storage.local.get([
+    "sessionIndeed",
+    "sessionGlassdoor",
+    "amijobsMeta",
+    "indeedWizardBusy",
+  ]);
+  const sessionIndeed = data.sessionIndeed || null;
+  const sessionGlassdoor = data.sessionGlassdoor || null;
+  const meta = data.amijobsMeta || {};
+
+  await chrome.storage.local.set({
+    amijobsMeta: { ...meta, indeedLoginRequired: true, indeedLoginAt: new Date().toISOString() },
+    indeedWizardBusy: null,
+    glassdoorSmartApply: null,
+  });
+
+  try {
+    await releaseSmartApplyLock("indeed");
+  } catch (_e) {}
+
+  // Always clear Glassdoor handoff wait — auth will never complete the wizard
+  if (sessionGlassdoor?.active) {
+    await chrome.storage.local.set({
+      sessionGlassdoor: {
+        ...sessionGlassdoor,
+        awaitingIndeed: false,
+        indeedHandoffDone: false,
+        lastRunAt: Date.now(),
+        runLockAt: 0,
+      },
+    });
+  }
+
+  const wasHandoff = !!(sessionIndeed?.fromGlassdoor || sessionGlassdoor?.awaitingIndeed);
+  if (sessionIndeed?.active && sessionIndeed.fromGlassdoor) {
+    await chrome.storage.local.set({
+      sessionIndeed: { ...sessionIndeed, active: false, phase: "done", endedAt: new Date().toISOString() },
+      lastSessionIndeed: { ...sessionIndeed, active: false, endedAt: new Date().toISOString() },
+    });
+  }
+
+  await appendLog(
+    wasHandoff
+      ? "Connexion Indeed requise — handoff Glassdoor abandonné (pas de boucle)"
+      : "Connexion Indeed requise — handoffs Indeed bloqués pour cette session",
+    "warn",
+    "indeed"
+  );
+
+  if (tabId != null) {
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (_e) {}
+  }
+
+  // Native Indeed mass-apply cannot continue without login
+  if (sessionIndeed?.active && !sessionIndeed.fromGlassdoor) {
+    await endPlatformSession("indeed", "Connexion Indeed requise");
+  } else if (sessionGlassdoor?.active) {
+    // Resume Glassdoor SERP without re-opening Indeed auth tabs
+    setTimeout(() => {
+      kickPlatformSessions(["glassdoor"]).catch(() => {});
+    }, 1200);
+  }
+
+  return { ok: true, blocked: true };
+}
 
 function detectPlatformFromUrl(url = "") {
   const raw = String(url || "");
@@ -370,9 +487,15 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
   // Indeed: keep board + apply as separate slots
   if (platform === "indeed") {
     const tabs = await listPlatformTabs("indeed");
-    const wantApply = /smartapply|indeedapply/i.test(String(url || ""));
-    const applyTabs = tabs.filter((t) => /smartapply|indeedapply/i.test(t.url || ""));
-    const boardTabs = tabs.filter((t) => !/smartapply|indeedapply/i.test(t.url || ""));
+    // Glassdoor Easy Apply often lands on viewjob / rc/clk — treat as APPLY slot so we
+    // never force-navigate the SERP tab (that causes "Onglets indeed fusionnés").
+    const wantApply = /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk|\/apply\b/i.test(
+      String(url || "")
+    );
+    const isApplyTab = (t) =>
+      /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(t.url || "");
+    const applyTabs = tabs.filter((t) => isApplyTab(t));
+    const boardTabs = tabs.filter((t) => !isApplyTab(t));
     const pool = wantApply ? applyTabs : boardTabs;
     const otherPool = wantApply ? boardTabs : applyTabs;
 
@@ -398,11 +521,24 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
     if (keep?.id) {
       const patch = {};
       if (active) patch.active = true;
-      if (forceNavigate && url && keep.url !== url) patch.url = url;
+      // Never turn a SERP board tab into an apply URL
+      if (forceNavigate && url && keep.url !== url) {
+        const keepIsBoard = !isApplyTab(keep);
+        if (!(wantApply && keepIsBoard)) patch.url = url;
+      }
       if (Object.keys(patch).length) {
         try {
           await chrome.tabs.update(keep.id, patch);
         } catch (_e) {}
+      }
+      // Need apply tab but only had board → create apply tab
+      if (wantApply && !isApplyTab(keep) && url) {
+        try {
+          const created = await chrome.tabs.create({ url, active: !!active });
+          return created?.id || keep.id;
+        } catch (_e) {
+          return keep.id;
+        }
       }
       return keep.id;
     }
@@ -460,18 +596,26 @@ async function enforceOneTabPerPlatform(reason = "") {
       const tabs = await listPlatformTabs(platform);
       if (tabs.length <= 1) continue;
 
-      // Indeed exception: allow 1 SERP (/jobs|/viewjob) + 1 Smart Apply at once.
-      // Old logic preferred Smart Apply and closed the SERP → "Indeed closes alone".
+      // Indeed exception: allow 1 SERP + 1 Apply (smartapply / indeedapply / viewjob handoff)
       if (platform === "indeed") {
-        const applyTabs = tabs.filter((t) => /smartapply|indeedapply/i.test(t.url || ""));
-        const boardTabs = tabs.filter((t) => !/smartapply|indeedapply/i.test(t.url || ""));
+        const isApplyTab = (t) =>
+          /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(
+            t.url || ""
+          );
+        const applyTabs = tabs.filter((t) => isApplyTab(t));
+        const boardTabs = tabs.filter((t) => !isApplyTab(t));
         const keepApply = pickTabToKeep(applyTabs, "smartapply");
         const keepBoard = pickTabToKeep(boardTabs, "/jobs");
-        for (const t of applyTabs) {
-          if (keepApply && t.id !== keepApply.id) {
-            try {
-              await chrome.tabs.remove(t.id);
-            } catch (_e) {}
+        // During an active wizard, do not close apply tabs (SPA URL changes look like dupes)
+        const { indeedWizardBusy = null } = await chrome.storage.local.get(["indeedWizardBusy"]);
+        const wizardHot = indeedWizardBusy?.at && Date.now() - indeedWizardBusy.at < 180000;
+        if (!wizardHot) {
+          for (const t of applyTabs) {
+            if (keepApply && t.id !== keepApply.id) {
+              try {
+                await chrome.tabs.remove(t.id);
+              } catch (_e) {}
+            }
           }
         }
         for (const t of boardTabs) {
@@ -481,7 +625,7 @@ async function enforceOneTabPerPlatform(reason = "") {
             } catch (_e) {}
           }
         }
-        if (reason && (applyTabs.length > 1 || boardTabs.length > 1)) {
+        if (reason && !wizardHot && (applyTabs.length > 1 || boardTabs.length > 1)) {
           await appendLog(`Onglets indeed fusionnés (SERP+Apply) — ${reason}`, "warn", platform);
         }
         continue;
@@ -542,8 +686,12 @@ async function enforceOneTabPerPlatform(reason = "") {
 
 async function openPlatformTabs(urls, platforms) {
   let first = true;
-  for (const p of SUPPORTED_PLATFORMS) {
-    if (!platforms.includes(p) || !urls[p]) continue;
+  // Honor caller order (Glassdoor before Indeed for parallel startup)
+  const ordered = Array.isArray(platforms) && platforms.length
+    ? platforms.filter((p) => SUPPORTED_PLATFORMS.includes(p))
+    : SUPPORTED_PLATFORMS;
+  for (const p of ordered) {
+    if (!urls[p]) continue;
     await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
     first = false;
   }
@@ -824,6 +972,267 @@ async function openExternalApply(msg = {}) {
   return { ok: false, success: false, reason: "timeout", url };
 }
 
+/** Write stored CV to disk then attach via CDP DOM.setFileInputFiles (React ignores DataTransfer). */
+async function materializeCvFileToDisk() {
+  const { cvFile = null } = await chrome.storage.local.get(["cvFile"]);
+  if (!cvFile?.base64) return { ok: false, reason: "no_cv_file" };
+  const safeName = String(cvFile.name || "cv.pdf")
+    .replace(/[^\w.\- ()]+/g, "_")
+    .slice(0, 80);
+  const filename = `AmiJobsTemp/${Date.now()}_${safeName || "cv.pdf"}`;
+  const mime = cvFile.mime || "application/pdf";
+  const url = `data:${mime};base64,${cvFile.base64}`;
+
+  const downloadId = await new Promise((resolve, reject) => {
+    chrome.downloads.download(
+      { url, filename, conflictAction: "overwrite", saveAs: false },
+      (id) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(id);
+      }
+    );
+  });
+
+  for (let i = 0; i < 50; i++) {
+    const items = await chrome.downloads.search({ id: downloadId });
+    const item = items?.[0];
+    if (item?.state === "complete" && item.filename) {
+      return { ok: true, path: item.filename, name: safeName };
+    }
+    if (item?.state === "interrupted") {
+      return { ok: false, reason: item.error || "download_interrupted" };
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return { ok: false, reason: "download_timeout" };
+}
+
+async function uploadCvViaDebugger(tabId) {
+  if (!tabId || !chrome.debugger) return { ok: false, reason: "no_debugger" };
+  const disk = await materializeCvFileToDisk();
+  if (!disk.ok) return disk;
+
+  const target = { tabId };
+  let attachedHere = false;
+  let interceptOn = false;
+  const onEvent = (source, method, params) => {
+    if (source.tabId !== tabId) return;
+    if (method === "Page.fileChooserOpened") {
+      uploadCvViaDebugger._chooser = params || {};
+    }
+  };
+
+  const fileName = disk.name || "cv.pdf";
+  const nameStem = String(fileName).replace(/\.[^.]+$/, "").slice(0, 40);
+
+  try {
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      attachedHere = true;
+    } catch (_e) {
+      // already attached is fine
+    }
+
+    try {
+      await chrome.debugger.sendCommand(target, "DOM.enable");
+      await chrome.debugger.sendCommand(target, "Page.enable");
+    } catch (_e) {
+      /* ignore */
+    }
+
+    chrome.debugger.onEvent.addListener(onEvent);
+    uploadCvViaDebugger._chooser = null;
+
+    try {
+      await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: true });
+      interceptOn = true;
+    } catch (e) {
+      return { ok: false, reason: `intercept_fail:${e?.message || e}` };
+    }
+
+    // Wait for resume UI / file input (Smart Apply mounts slowly after applybyapplyablejobid)
+    let clickOk = false;
+    let noUploadUiStreak = 0;
+    for (let wait = 0; wait < 40 && !clickOk; wait++) {
+      const clicked = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: () => {
+          const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+          const exactRe = /^(S[ée]lectionner un fichier|Choose (a )?file|Upload (a )?resume|Browse( files)?)$/i;
+          const nodes = [
+            ...document.querySelectorAll(
+              'button, label, [role="button"], [data-testid*="upload"], [data-testid*="file"], input[type="file"]'
+            ),
+          ];
+          const byExact = nodes.find((b) => b.tagName !== "INPUT" && exactRe.test(norm(b.textContent)));
+          if (byExact) {
+            byExact.click();
+            return { ok: true, how: "exact-button", text: norm(byExact.textContent).slice(0, 40) };
+          }
+          const byTestId = nodes.find((b) =>
+            /upload|file-input|fileInput|select-file/i.test(b.getAttribute("data-testid") || "")
+          );
+          if (byTestId) {
+            byTestId.click();
+            return { ok: true, how: "testid" };
+          }
+          const input = document.querySelector('input[type="file"]');
+          if (input) {
+            input.click();
+            return { ok: true, how: "input" };
+          }
+          return { ok: false, hasResumeText: /Importer un CV|resume|Sélectionner/i.test(document.body?.innerText || "") };
+        },
+      });
+      clickOk = (clicked || []).some((r) => r?.result?.ok);
+      if (clickOk) break;
+      // No upload affordance at all — bail out instead of burning the full 16s wait
+      noUploadUiStreak = (clicked || []).some((r) => r?.result?.hasResumeText)
+        ? 0
+        : noUploadUiStreak + 1;
+      if (noUploadUiStreak >= 8) {
+        return { ok: false, reason: "no_file_input", disk: disk.path, clickOk: false };
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
+    // Wait for file chooser event (primary path — React listens to real chooser)
+    let chooser = null;
+    for (let i = 0; i < 15; i++) {
+      chooser = uploadCvViaDebugger._chooser;
+      if (chooser) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    const nodeRefs = [];
+    if (chooser?.backendNodeId) nodeRefs.push({ backendNodeId: chooser.backendNodeId });
+    else if (chooser?.nodeId) nodeRefs.push({ nodeId: chooser.nodeId });
+
+    // Always also attach to every file input (Indeed sometimes ignores the chooser node alone)
+    try {
+      const search = await chrome.debugger.sendCommand(target, "DOM.performSearch", {
+        query: 'input[type="file"]',
+        includeUserAgentShadowDOM: true,
+      });
+      const total = search?.resultCount || 0;
+      if (total > 0) {
+        const { nodeIds } = await chrome.debugger.sendCommand(target, "DOM.getSearchResults", {
+          searchId: search.searchId,
+          fromIndex: 0,
+          toIndex: Math.min(total, 8),
+        });
+        for (const id of nodeIds || []) {
+          if (id) nodeRefs.push({ nodeId: id });
+        }
+      }
+      try {
+        await chrome.debugger.sendCommand(target, "DOM.discardSearchResults", { searchId: search.searchId });
+      } catch (_e) {
+        /* ignore */
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+
+    if (!nodeRefs.length) {
+      return { ok: false, reason: "no_file_input", disk: disk.path, clickOk };
+    }
+
+    for (const nodeRef of nodeRefs) {
+      try {
+        await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", {
+          ...nodeRef,
+          files: [disk.path],
+        });
+      } catch (_e) {
+        /* try next node */
+      }
+    }
+
+    // Nudge React controlled inputs after CDP attach
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        for (const el of document.querySelectorAll('input[type="file"]')) {
+          try {
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          } catch (_e) {
+            /* ignore */
+          }
+        }
+      },
+    });
+
+    // Indeed uploads async — wait until validation error clears + filename appears
+    let last = { withFiles: [], err: true, hasName: false, inputCount: 0 };
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 400));
+      const verify = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: (stem, fullName) => {
+          const inputs = [...document.querySelectorAll('input[type="file"]')];
+          const withFiles = inputs
+            .filter((inp) => inp.files && inp.files.length > 0)
+            .map((inp) => inp.files[0].name);
+          const body = (document.body?.innerText || "").replace(/\s+/g, " ");
+          const err = /Sélectionnez un fichier pour continuer|Select a file to continue/i.test(body);
+          const low = body.toLowerCase();
+          // Require CV name in UI — "PDF, DOCX" help text must NOT count as uploaded
+          const hasName =
+            (!!stem && stem.length >= 5 && low.includes(String(stem).toLowerCase())) ||
+            (!!fullName && low.includes(String(fullName).toLowerCase()));
+          return { withFiles, err, hasName, inputCount: inputs.length, bodySample: body.slice(0, 220) };
+        },
+        args: [nameStem, fileName],
+      });
+      last =
+        (verify || []).find((r) => (r?.result?.inputCount || 0) > 0)?.result ||
+        verify?.[0]?.result ||
+        last;
+      if (!last.err && last.hasName) break;
+    }
+
+    // Only accept when Indeed dropped the validation error AND shows our filename
+    const accepted = !last.err && !!last.hasName;
+
+    return {
+      ok: accepted,
+      path: disk.path,
+      name: disk.name,
+      files: last.withFiles || [],
+      stillError: !!last.err,
+      hasName: !!last.hasName,
+      viaChooser: !!chooser,
+      clickOk,
+      accepted,
+      reason: accepted ? "ui_accepted" : last.err ? "still_validation_error" : "no_filename_ui",
+    };
+  } catch (e) {
+    return { ok: false, reason: String(e?.message || e), path: disk.path };
+  } finally {
+    try {
+      chrome.debugger.onEvent.removeListener(onEvent);
+    } catch (_e) {
+      /* ignore */
+    }
+    if (interceptOn) {
+      try {
+        await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: false });
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+    if (attachedHere) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+  }
+}
+
 /** Trusted mouse click via CDP (needed for Cloudflare Turnstile checkbox). */
 async function clickTurnstileWithDebugger(tabId) {
   if (!tabId || !chrome.debugger) return { ok: false, reason: "no_debugger" };
@@ -982,9 +1391,66 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     /* ignore */
   }
 
-  if (!/smartapply\.indeed\.com/i.test(url) && !/indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(url)) {
+  // Login wall: ?continue=…smartapply… used to look like Smart Apply and restart Indeed forever
+  if (isIndeedLoginWallUrl(url)) {
+    await handleIndeedLoginWall(tabId, url);
     return;
   }
+
+  const isSmartApplyUrl = isIndeedSmartApplyUrl(url);
+  const isHandoffLandingUrl = (() => {
+    try {
+      const u = new URL(url);
+      const hostPath = `${u.hostname}${u.pathname}`;
+      if (!/indeed\.(com|fr)/i.test(hostPath) || /smartapply/i.test(u.hostname)) return false;
+      if (/\/(?:viewjob|pagead\/clk|rc\/clk)/i.test(u.pathname)) return true;
+      if (/\/jobs\b/i.test(u.pathname) && /[?&](?:jk|vjk|fromjk)=/i.test(u.search)) return true;
+      return false;
+    } catch (_e) {
+      const s = String(url).split(/[?#]/)[0];
+      return (
+        /indeed\.(com|fr)\/(?:viewjob|pagead\/clk|rc\/clk)/i.test(s) ||
+        (/indeed\.(com|fr)\/jobs\b/i.test(s) && /[?&](?:jk|vjk|fromjk)=/i.test(url))
+      );
+    }
+  })();
+
+  try {
+    const { sessionIndeed, sessionGlassdoor, amijobsMeta } = await chrome.storage.local.get([
+      "sessionIndeed",
+      "sessionGlassdoor",
+      "amijobsMeta",
+    ]);
+
+    if (amijobsMeta?.indeedLoginRequired && (isSmartApplyUrl || isHandoffLandingUrl)) {
+      // User must log in manually — don't keep spawning apply tabs
+      return;
+    }
+
+    const glassdoorOwnsTab = !!(
+      watchingIndeedFromGlassdoor ||
+      (sessionGlassdoor?.active && sessionGlassdoor?.awaitingIndeed)
+    );
+
+    // Glassdoor Easy Apply often lands on viewjob / jobs?vjk= before Smart Apply —
+    // still kick Indeed so it can click Postuler under Glassdoor's lock.
+    if (!isSmartApplyUrl) {
+      if (glassdoorOwnsTab && isHandoffLandingUrl) {
+        const nowLanding = Date.now();
+        if (nowLanding - lastSmartApplyKick < 2500) return;
+        lastSmartApplyKick = nowLanding;
+        setTimeout(() => {
+          chrome.tabs
+            .sendMessage(tabId, { action: "startAutoApply", fromGlassdoor: true, handoffViewjob: true })
+            .catch(() => {});
+        }, 900);
+      }
+      return;
+    }
+  } catch (_e) {
+    if (!isSmartApplyUrl) return;
+  }
+
   // Debounce duplicate kicks (many Smart Apply URL changes per wizard)
   const now = Date.now();
   if (now - lastSmartApplyKick < 3500) return;
@@ -1004,6 +1470,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
     // Glassdoor Easy Apply opened this Smart Apply tab (may run alongside Indeed)
     if (glassdoorOwnsTab && sessionGlassdoor?.active) {
+      const { amijobsMeta: metaGate = null } = await chrome.storage.local.get(["amijobsMeta"]);
+      if (metaGate?.indeedLoginRequired) {
+        await handleIndeedLoginWall(tabId, url);
+        return;
+      }
       const job = watchingIndeedFromGlassdoor || {
         jobId: sessionGlassdoor.currentJk,
         title: sessionGlassdoor.currentTitle,
@@ -1014,6 +1485,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
           ...sessionGlassdoor,
           indeedHandoffDone: true,
           awaitingIndeed: true,
+          lastRunAt: Date.now(),
         },
         glassdoorSmartApply: {
           jobId: job.jobId || sessionGlassdoor.currentJk || "",
@@ -1023,6 +1495,18 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         },
       });
       watchingIndeedFromGlassdoor = null;
+
+      // Keep Glassdoor SERP visible — Easy Apply often navigates the GD tab to Indeed
+      try {
+        const gdTabs = await listPlatformTabs("glassdoor");
+        const resume = sessionGlassdoor.searchUrl || sessionGlassdoor.resumeSearchUrl || "";
+        if (gdTabs.length === 0 && resume) {
+          await ensureSinglePlatformTab("glassdoor", resume, {
+            active: false,
+            forceNavigate: true,
+          });
+        }
+      } catch (_e) {}
 
       // If Indeed is NOT also running its own session, create a lightweight apply session
       if (!indeedOwnsSession) {
@@ -1222,6 +1706,123 @@ async function getTwoCaptchaApiKey() {
   return "";
 }
 
+/** Serialize Indeed Smart Apply across Indeed mass-apply + Glassdoor Easy Apply.
+ *  TTL must outlast slow 2captcha (workers fail + recreate can take 3–6 min).
+ *  Fairness: after release, prefer the other board so applies interleave. */
+const SMART_APPLY_LOCK_TTL_MS = 420000;
+// After A finishes, give B ~45s to start its next Smart Apply (SERP→click→wizard)
+const SMART_APPLY_FAIR_MS = 45000;
+
+async function peekSmartApplyLock(ttlMs = SMART_APPLY_LOCK_TTL_MS) {
+  const { amijobsSmartApplyLock = null } = await chrome.storage.local.get(["amijobsSmartApplyLock"]);
+  if (!amijobsSmartApplyLock?.owner) return { ok: true, owner: null, age: 0 };
+  const age = Date.now() - (amijobsSmartApplyLock.at || 0);
+  if (age > ttlMs) {
+    await chrome.storage.local.set({ amijobsSmartApplyLock: null });
+    return { ok: true, owner: null, age };
+  }
+  return { ok: false, owner: amijobsSmartApplyLock.owner, age };
+}
+
+async function preferredBoardStillActive(preferOwner) {
+  if (!preferOwner) return false;
+  const key = preferOwner === "indeed" ? "sessionIndeed" : preferOwner === "glassdoor" ? "sessionGlassdoor" : null;
+  if (!key) return false;
+  const data = await chrome.storage.local.get([key]);
+  return !!data[key]?.active;
+}
+
+async function acquireSmartApplyLock(owner, ttlMs = SMART_APPLY_LOCK_TTL_MS, handoff = false) {
+  if (!owner) return { ok: false, reason: "no_owner" };
+  const data = await chrome.storage.local.get([
+    "amijobsSmartApplyLock",
+    "amijobsSmartApplyPrefer",
+    "indeedWizardBusy",
+  ]);
+  let amijobsSmartApplyLock = data.amijobsSmartApplyLock || null;
+  const amijobsSmartApplyPrefer = data.amijobsSmartApplyPrefer || null;
+  const indeedWizardBusy = data.indeedWizardBusy || null;
+  const now = Date.now();
+  let age = amijobsSmartApplyLock?.at ? now - amijobsSmartApplyLock.at : 999999;
+  // Stale lock: held without an active wizard for >100s (Postuler miss / crashed tab)
+  const wizardAge = indeedWizardBusy?.at ? now - indeedWizardBusy.at : 999999;
+  if (amijobsSmartApplyLock?.owner && age > 100000 && wizardAge > 100000) {
+    await chrome.storage.local.set({ amijobsSmartApplyLock: null });
+    amijobsSmartApplyLock = null;
+    age = 999999;
+  }
+  const heldByOther =
+    amijobsSmartApplyLock?.owner &&
+    amijobsSmartApplyLock.owner !== owner &&
+    age < ttlMs;
+  // The Indeed wizard spawned by a Glassdoor Easy Apply runs under Glassdoor's lock;
+  // its heartbeats must refresh the TTL instead of being rejected during long captchas.
+  if (heldByOther && handoff && owner === "indeed" && amijobsSmartApplyLock.owner === "glassdoor") {
+    await chrome.storage.local.set({ amijobsSmartApplyLock: { owner: "glassdoor", at: now } });
+    return { ok: true, owner: "glassdoor", handoff: true };
+  }
+  if (heldByOther) {
+    return { ok: false, owner: amijobsSmartApplyLock.owner, age };
+  }
+  // Fair turn-taking: after A finishes, B gets first shot for ~60s while B's session is alive
+  const preferAge = amijobsSmartApplyPrefer?.at ? now - amijobsSmartApplyPrefer.at : 999999;
+  if (
+    amijobsSmartApplyPrefer?.owner &&
+    amijobsSmartApplyPrefer.owner !== owner &&
+    preferAge < SMART_APPLY_FAIR_MS &&
+    (await preferredBoardStillActive(amijobsSmartApplyPrefer.owner))
+  ) {
+    return {
+      ok: false,
+      owner: amijobsSmartApplyPrefer.owner,
+      reason: "fairness",
+      age: preferAge,
+    };
+  }
+  await chrome.storage.local.set({
+    amijobsSmartApplyLock: { owner, at: now },
+    amijobsSmartApplyPrefer: null,
+  });
+  return { ok: true, owner };
+}
+
+async function releaseSmartApplyLock(owner, { fair = false } = {}) {
+  if (!owner) return { ok: true };
+  const { amijobsSmartApplyLock = null } = await chrome.storage.local.get(["amijobsSmartApplyLock"]);
+  if (!amijobsSmartApplyLock?.owner || amijobsSmartApplyLock.owner === owner) {
+    const other =
+      owner === "indeed" ? "glassdoor" : owner === "glassdoor" ? "indeed" : null;
+    const updates = { amijobsSmartApplyLock: null };
+    // Only alternate boards after a real Smart Apply finish — failed handoffs must not
+    // soft-lock the other board for SMART_APPLY_FAIR_MS (looked like Indeed monopoly).
+    if (fair && other && (await preferredBoardStillActive(other))) {
+      updates.amijobsSmartApplyPrefer = { owner: other, at: Date.now() };
+    } else {
+      updates.amijobsSmartApplyPrefer = null;
+    }
+    await chrome.storage.local.set(updates);
+    // Immediately nudge the preferred board so fairness isn't wasted
+    if (updates.amijobsSmartApplyPrefer?.owner) {
+      const prefer = updates.amijobsSmartApplyPrefer.owner;
+      setTimeout(() => {
+        kickPlatformSessions([prefer]).catch(() => {});
+        if (prefer === "indeed") {
+          // Also poke any open apply tab
+          listPlatformTabs("indeed")
+            .then((tabs) => {
+              for (const t of tabs.slice(0, 2)) {
+                if (t?.id) chrome.tabs.sendMessage(t.id, { action: "startAutoApply" }).catch(() => {});
+              }
+            })
+            .catch(() => {});
+        }
+      }, 400);
+    }
+    return { ok: true };
+  }
+  return { ok: false, owner: amijobsSmartApplyLock.owner };
+}
+
 async function solveCaptchaWith2Captcha({
   type = "recaptcha_v2",
   websiteURL,
@@ -1230,6 +1831,7 @@ async function solveCaptchaWith2Captcha({
   data = "",
   pagedata = "",
   userAgent = "",
+  apiDomain = "",
   isEnterprise = false,
   isInvisible = false,
 } = {}) {
@@ -1243,6 +1845,19 @@ async function solveCaptchaWith2Captcha({
     return { ok: false, reason: "missing_sitekey_or_url" };
   }
 
+  // Deduplicate parallel identical solves (many frames used to spam 2captcha)
+  const dedupeKey = `${String(type).toLowerCase()}|${siteKey}|${pageUrl}|${!!isEnterprise}|${pageAction}|${data}`;
+  if (!globalThis.__amijobsCaptchaInflight) globalThis.__amijobsCaptchaInflight = new Map();
+  const inflight = globalThis.__amijobsCaptchaInflight;
+  if (inflight.has(dedupeKey)) {
+    try {
+      return await inflight.get(dedupeKey);
+    } catch (_e) {
+      /* fall through */
+    }
+  }
+
+  const run = (async () => {
   let task;
   const t = String(type || "").toLowerCase();
   if (t.includes("turnstile") || t.includes("cloudflare")) {
@@ -1263,6 +1878,7 @@ async function solveCaptchaWith2Captcha({
       websiteKey: siteKey,
       isInvisible: !!isInvisible,
     };
+    if (apiDomain) task.apiDomain = apiDomain.replace(/^https?:\/\//, "");
   } else {
     task = {
       type: "RecaptchaV2TaskProxyless",
@@ -1270,26 +1886,38 @@ async function solveCaptchaWith2Captcha({
       websiteKey: siteKey,
       isInvisible: !!isInvisible,
     };
+    if (apiDomain) task.apiDomain = apiDomain.replace(/^https?:\/\//, "");
   }
 
   try {
-    const createRes = await fetch(TWOCAPTCHA_CREATE, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientKey, task }),
-    });
-    const created = await createRes.json();
-    if (created?.errorId) {
-      await appendLog(
-        `2captcha createTask: ${created.errorDescription || created.errorCode || "error"}`,
-        "warn"
-      );
-      return { ok: false, reason: created.errorDescription || "create_failed", errorId: created.errorId };
-    }
-    const taskId = created?.taskId;
-    if (!taskId) return { ok: false, reason: "no_task_id" };
-
     const deadline = Date.now() + 150000;
+    let taskId = null;
+    let recreates = 0;
+    const createTask = async () => {
+      const createRes = await fetch(TWOCAPTCHA_CREATE, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientKey, task }),
+      });
+      const created = await createRes.json();
+      if (created?.errorId) {
+        return {
+          ok: false,
+          reason: created.errorDescription || "create_failed",
+          errorId: created.errorId,
+        };
+      }
+      if (!created?.taskId) return { ok: false, reason: "no_task_id" };
+      return { ok: true, taskId: created.taskId };
+    };
+
+    const created0 = await createTask();
+    if (!created0.ok) {
+      await appendLog(`2captcha createTask: ${created0.reason}`, "warn");
+      return created0;
+    }
+    taskId = created0.taskId;
+
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 5000));
       const pollRes = await fetch(TWOCAPTCHA_RESULT, {
@@ -1299,8 +1927,25 @@ async function solveCaptchaWith2Captcha({
       });
       const polled = await pollRes.json();
       if (polled?.errorId) {
-        await appendLog(`2captcha poll: ${polled.errorDescription || "poll_failed"}`, "warn");
-        return { ok: false, reason: polled.errorDescription || "poll_failed", errorId: polled.errorId };
+        const reason = polled.errorDescription || "poll_failed";
+        await appendLog(`2captcha poll: ${reason}`, "warn");
+        // Fresh task often succeeds after "Workers could not solve"
+        if (
+          recreates < 2 &&
+          /workers could not solve|unsolvable|ERROR_CAPTCHA_UNSOLVABLE/i.test(reason)
+        ) {
+          recreates += 1;
+          await appendLog(`2captcha recreateTask ${recreates}/2…`, "warn");
+          const again = await createTask();
+          if (again.ok) {
+            taskId = again.taskId;
+            continue;
+          }
+        }
+        try {
+          inflight.delete(dedupeKey);
+        } catch (_e) {}
+        return { ok: false, reason, errorId: polled.errorId };
       }
       if (polled?.status === "ready") {
         const token =
@@ -1309,7 +1954,7 @@ async function solveCaptchaWith2Captcha({
           polled?.solution?.text ||
           "";
         if (!token) return { ok: false, reason: "empty_token" };
-        await appendLog("2captcha: captcha résolu", "success");
+        await appendLog(`2captcha: captcha résolu (${task.type})`, "success");
         return {
           ok: true,
           token,
@@ -1323,6 +1968,72 @@ async function solveCaptchaWith2Captcha({
     console.error("[AmiJobs] 2captcha error:", err);
     return { ok: false, reason: err?.message || "network_error" };
   }
+  })();
+
+  inflight.set(dedupeKey, run);
+  try {
+    return await run;
+  } finally {
+    inflight.delete(dedupeKey);
+  }
+}
+
+function answerYesNoCredential(question, cv, profile = {}) {
+  const q = String(question || "").toLowerCase();
+  const blob = `${cv || ""} ${profile.education || ""} ${profile.title || ""} ${profile.stack || ""}`.toLowerCase();
+  const isYn =
+    /avez-vous|êtes-vous|etes-vous|poss[eè]dez|disposez|titulaire|do you (have|hold)|are you (a |an )?/i.test(q) ||
+    (/dipl[oô]me|certificat|habilitation|permis|licence|qualification/.test(q) &&
+      /avez|êtes|etes|poss|dispos|titulaire|\?/.test(q));
+  if (!isYn) return null;
+  if (/disponib|mobile|télétravail|teletravail|permis de travail|right to work|autoris[eé].*travailler|consent|accepte/i.test(q)) {
+    return "Oui";
+  }
+  const needles = [];
+  const add = (s) => {
+    const t = String(s || "").toLowerCase().trim();
+    if (t.length >= 4) needles.push(t);
+  };
+  const m = q.match(
+    /\b(infirmier(?:e|ère)?|aide[\s-]?soignant(?:e)?|m[eé]decin|pharmacien(?:ne)?|kin[eé]|sage[\s-]?femme|formateur(?:trice)?|comptable|expert[\s-]?comptable|avocat|notaire|architect(?:e)?|ing[eé]nieur)\b/i
+  );
+  if (m) add(m[1]);
+  const m2 = q.match(/dipl[oô]me[^a-zàâäéèêëïîôùûüç]{0,20}(?:d['’]|de|en)\s*([a-zàâäéèêëïîôùûüç][\wàâäéèêëïîôùûüç\s-]{2,40})/i);
+  if (m2) add(m2[1].split(/\s+/).slice(0, 3).join(" "));
+  const m3 = q.match(/\b(permis\s*[a-z0-9]+|caces|habilitation\s*[a-z0-9]+|toeic|toefl|ielts)\b/i);
+  if (m3) add(m3[1]);
+  if (!needles.length) {
+    for (const tok of q.split(/[^a-zàâäéèêëïîôùûüç0-9+]+/i)) {
+      if (
+        tok.length >= 5 &&
+        !/avez|etes|êtes|vous|diplome|diplôme|certificat|requis|niveau|etudes|études|formation|annee|année|experience|expérience|obtenir/.test(tok)
+      ) {
+        add(tok);
+      }
+    }
+  }
+  if (!blob.trim()) return "Non";
+  const norm = (s) => String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const mentions = (hayRaw, needle) => {
+    const hay = norm(hayRaw);
+    const n = norm(needle);
+    if (!n || n.length < 4) return false;
+    let from = 0;
+    while (from < hay.length) {
+      const idx = hay.indexOf(n, from);
+      if (idx < 0) return false;
+      const before = hay.slice(Math.max(0, idx - 48), idx);
+      // "pas de diplôme infirmier" / "sans permis B" must not count as possession
+      if (/(pas\s+(de\s+|d['’])?|sans\s+|aucun(?:e)?\s+|without\s+|not\s+a\s+|no\s+)/.test(before)) {
+        from = idx + n.length;
+        continue;
+      }
+      return true;
+    }
+    return false;
+  };
+  const hit = needles.some((n) => mentions(blob, n));
+  return hit ? "Oui" : "Non";
 }
 
 async function generateAnswer(question, fieldType, options, jobInfo, profile, cvText) {
@@ -1330,11 +2041,23 @@ async function generateAnswer(question, fieldType, options, jobInfo, profile, cv
   const cv = String(cvText || profile?.cvText || "");
   const loc = String(profile.location || profile.country || "France").toLowerCase();
 
+  // Credential / diplôme yes-no BEFORE education fallback (was answering Bac+5 / Oui blindly)
+  const yn = answerYesNoCredential(q, cv, profile || {});
+  if (yn && (fieldType === "radio" || fieldType === "select" || /oui|non|yes|no/i.test(String(options || "")) || !options?.length)) {
+    if (options?.length) {
+      const want = yn.toLowerCase() === "oui" ? /oui|yes|true|1/i : /non|no|false|0/i;
+      const hit = options.find((o) => want.test(String(o)));
+      if (hit) return hit;
+    }
+    return yn;
+  }
+
   // Years of experience / "Antiquité du poste" — derive from CV/profile, never invent "we"
   if (
     /antiquit|anciennet[ée]|exp[eé]rience|seniority|years?\s*(of\s*)?experience|combien d['’]?ann[ée]es|nombre d['’]?ann[ée]es|ans d['’]?exp/i.test(
       q
-    )
+    ) &&
+    !/avez-vous|dipl[oô]me d/i.test(q)
   ) {
     const fromProfile = String(profile.experience || "").match(/(\d+(?:[.,]\d+)?)/);
     const fromCv =
@@ -1344,8 +2067,36 @@ async function generateAnswer(question, fieldType, options, jobInfo, profile, cv
     const years = (fromCv && fromCv[1]) || (fromProfile && fromProfile[1]) || "";
     if (years) {
       const n = years.replace(",", ".");
-      if (fieldType === "number" || /nombre|combien|ans\b|years?\b/i.test(q)) return String(parseFloat(n) || n);
-      return `${n} ans`;
+      const rounded = Math.round(parseFloat(n));
+      // Never send 0 / NaN — Indeed rejects invalid numeric screening
+      const safe = Number.isFinite(rounded) && rounded > 0 ? rounded : 3;
+      return String(safe);
+    }
+    if (fieldType === "number" || /nombre|combien|années?|year|ans\b|de combien/i.test(q)) {
+      return "3";
+    }
+  }
+
+  // Education / niveau d'études — NOT for "avez-vous un diplôme d'X ?"
+  if (
+    /niveau|[ée]tudes|education|degree|formation\s*(initiale|scolaire)?/i.test(q) ||
+    (/dipl[oô]me/i.test(q) && /niveau|quel| Bac|master|licence/i.test(q))
+  ) {
+    if (!/avez-vous|êtes-vous|etes-vous|poss[eè]dez|disposez|titulaire/i.test(q)) {
+      const edu = String(profile.education || "").trim();
+      if (edu) return edu;
+      if (options?.length) {
+        const real = options.filter(
+          (o) => o && !/sélectionn|select(\s+an)?\s*option|choisir|veuillez|^[-—–\s]*$/i.test(String(o))
+        );
+        const prefer =
+          real.find((o) => /bac\s*\+?\s*5|master|ingénieur|ingenieur/i.test(o)) ||
+          real.find((o) => /bac\s*\+?\s*4|maîtrise|maitrise/i.test(o)) ||
+          real.find((o) => /bac\s*\+?\s*3|licence|bachelor/i.test(o)) ||
+          real[0];
+        if (prefer) return prefer;
+      }
+      return "Bac+5";
     }
   }
 
@@ -1389,22 +2140,32 @@ Poste: ${jobInfo?.title || "?"} @ ${jobInfo?.company || "?"}
 
 RÈGLES STRICTES:
 - Réponds UNIQUEMENT avec la valeur du champ, sans explication ni phrase.
-- Base-toi UNIQUEMENT sur le CV et le profil. N'invente rien.
-- Pour antiquité / années d'expérience: réponds avec un nombre (ex: 5) ou "X ans" selon le champ.
-- Interdit: réponses vides, "we", "oui" seul, "n/a", anglais générique.
-- Si l'info manque dans le CV, réponds de façon minimale et factuelle (ex: profil.experience).
+- Base-toi UNIQUEMENT sur le CV texte et le profil. N'invente AUCUNE compétence, diplôme ou certification absente du CV.
+- Questions oui/non sur diplôme/certificat/permis: réponds "Non" si le CV ne le mentionne pas explicitement.
+- Pour antiquité / années d'expérience: réponds avec un nombre entier uniquement (ex: 5).
+- Interdit: inventer "Oui", "we", "n/a", anglais générique.
+- Si l'info manque dans le CV, préfère "Non" (credentials) ou une valeur minimale factuelle.
 - Dates au format JJ/MM/AAAA sauf si le champ exige ISO.`;
   let userPrompt = `Question: "${question}"\nType: ${fieldType}`;
   if (options?.length) userPrompt += `\nOptions: ${JSON.stringify(options)}`;
+  if (!cv) userPrompt += `\n(ATTENTION: aucun texte CV fourni — ne pas inventer de diplômes)`;
   const ai = await askMistral(systemPrompt, userPrompt, 200);
-  if (!ai) return null;
+  if (!ai) {
+    // No AI — safe credential default
+    const fallbackYn = answerYesNoCredential(q, cv, profile || {});
+    return fallbackYn || null;
+  }
   let cleaned = ai.trim().replace(/^["'«»]+|["'«»]+$/g, "");
-  // Guard against lazy / broken AI answers
+  // Guard: never keep invented Oui on credential questions
+  const credYn = answerYesNoCredential(q, cv, profile || {});
+  if (credYn && /^(oui|yes)\.?$/i.test(cleaned) && credYn === "Non") {
+    return options?.length ? options.find((o) => /non|no/i.test(String(o))) || "Non" : "Non";
+  }
   if (/^(oui|yes|we|n\/?a|na|none|null)\.?$/i.test(cleaned) && /rythme|date|combien|salaire|expérience|antiquit|anciennet|niveau|jours|ans/i.test(q)) {
     if (/rythme|alternance/i.test(q)) return "2 jours école / 3 jours entreprise";
     if (/antiquit|anciennet|expérience|ans/i.test(q)) {
       const n = String(profile.experience || "").match(/(\d+)/);
-      return n ? n[1] : "3";
+      return n && Number(n[1]) > 0 ? n[1] : "3";
     }
   }
   return cleaned;
@@ -1498,6 +2259,42 @@ async function endPlatformSession(platform, reason = "") {
       "info",
       platform
     );
+  }
+
+  // Free shared Smart Apply lock when Indeed/Glassdoor session ends
+  if (platform === "indeed" || platform === "glassdoor") {
+    try {
+      await releaseSmartApplyLock(platform);
+    } catch (_e) {}
+    try {
+      await chrome.storage.local.set({ indeedWizardBusy: null, glassdoorSmartApply: null });
+    } catch (_e) {}
+  }
+
+  // When Indeed finishes its quota, Glassdoor must keep going — clear stale handoff
+  // flags and re-kick the Glassdoor SERP (it often stalls waiting on a dead wizard).
+  if (platform === "indeed") {
+    try {
+      const { sessionGlassdoor = null } = await chrome.storage.local.get(["sessionGlassdoor"]);
+      if (sessionGlassdoor?.active) {
+        if (sessionGlassdoor.awaitingIndeed) {
+          await chrome.storage.local.set({
+            sessionGlassdoor: {
+              ...sessionGlassdoor,
+              awaitingIndeed: false,
+              indeedHandoffDone: false,
+              lastRunAt: 0,
+              runLockAt: 0,
+            },
+            glassdoorSmartApply: null,
+          });
+        }
+        await appendLog("Indeed terminé — reprise Glassdoor", "info", "glassdoor");
+        setTimeout(() => {
+          kickPlatformSessions(["glassdoor"]).catch(() => {});
+        }, 1500);
+      }
+    } catch (_e) {}
   }
 
   const stillActive = await isAnySessionActive();
@@ -1601,8 +2398,20 @@ async function ensureActiveSessionTabs() {
     for (const [platform, session] of checks) {
       if (!session?.active) continue;
       if (platform === "indeed" && session.fromGlassdoor) continue;
-      // v1.4.0: Don't reopen Glassdoor during Indeed handoff (anti-loop)
-      if (platform === "glassdoor" && session.awaitingIndeed) continue;
+      // Keep Glassdoor SERP alive during Smart Apply handoff (tab often becomes Indeed)
+      if (platform === "glassdoor" && session.awaitingIndeed) {
+        const searchUrl = session.searchUrl || session.resumeSearchUrl || "";
+        const existing = await listPlatformTabs("glassdoor");
+        if (existing.length === 0 && searchUrl) {
+          try {
+            await ensureSinglePlatformTab("glassdoor", searchUrl, {
+              active: false,
+              forceNavigate: true,
+            });
+          } catch (_e) {}
+        }
+        continue;
+      }
       const searchUrl = session.searchUrl || session.resumeSearchUrl || "";
       if (!searchUrl) continue;
       const existing = await listPlatformTabs(platform);
@@ -1712,15 +2521,54 @@ setInterval(() => {
 }, 12000);
 
 // Hard cap: never more than 1 tab per job board
-chrome.tabs.onCreated.addListener(() => {
-  setTimeout(() => enforceOneTabPerPlatform("nouvel onglet").catch(() => {}), 400);
+function isIndeedHandoffApplyUrl(url = "") {
+  if (isIndeedLoginWallUrl(url)) return false;
+  try {
+    const u = new URL(String(url || ""), "https://indeed.com");
+    const hostPath = `${u.hostname}${u.pathname}`;
+    if (!/indeed\.(com|fr)|smartapply\.indeed/i.test(hostPath)) return false;
+    if (/help\.|support\.|\/hc\/|guidelines|articles\/|job-seeker/i.test(hostPath)) return false;
+    // Host+path only — never match smartapply inside ?continue=
+    return /smartapply|indeedapply|\/viewjob|\/rc\/clk|\/pagead\/clk|applybyapplyablejobid/i.test(hostPath);
+  } catch (_e) {
+    const s = String(url || "").split(/[?#]/)[0];
+    if (!/indeed\.(com|fr)|smartapply\.indeed/i.test(s)) return false;
+    if (/help\.|support\.|\/hc\/|guidelines|articles\/|job-seeker/i.test(s)) return false;
+    return /smartapply|indeedapply|\/viewjob|\/rc\/clk|\/pagead\/clk|applybyapplyablejobid/i.test(s);
+  }
+}
+
+async function noteIndeedHandoffCapture(tabId, url) {
+  const cap = indeedHandoffCapture;
+  if (!cap || Date.now() > (cap.until || 0)) return false;
+  if (!isIndeedHandoffApplyUrl(url)) return false;
+  if (cap.url && /smartapply|indeedapply/i.test(cap.url) && !/smartapply|indeedapply/i.test(url)) {
+    return true; // already have a better URL
+  }
+  indeedHandoffCapture = { ...cap, url, tabId: tabId || cap.tabId || null };
+  // Claim into Indeed apply slot so Glassdoor SERP stays put
+  try {
+    await ensureSinglePlatformTab("indeed", url, { active: true, forceNavigate: true });
+  } catch (_e) {}
+  return true;
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  const pending = tab?.pendingUrl || tab?.url || "";
+  if (indeedHandoffCapture && Date.now() <= (indeedHandoffCapture.until || 0) && pending) {
+    noteIndeedHandoffCapture(tab.id, pending).catch(() => {});
+  }
+  setTimeout(() => enforceOneTabPerPlatform("nouvel onglet").catch(() => {}), 1200);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!changeInfo.url) return;
+  if (indeedHandoffCapture && Date.now() <= (indeedHandoffCapture.until || 0)) {
+    noteIndeedHandoffCapture(tabId, changeInfo.url).catch(() => {});
+  }
   const platform = detectPlatformFromUrl(changeInfo.url || tab?.url || "");
   if (!platform) return;
-  setTimeout(() => enforceOneTabPerPlatform("navigation").catch(() => {}), 500);
+  setTimeout(() => enforceOneTabPerPlatform("navigation").catch(() => {}), 1500);
 });
 
 let reopeningPlatformTab = false;
@@ -1747,13 +2595,36 @@ chrome.tabs.onRemoved.addListener(async () => {
       if (!session?.active) continue;
       if (platform === "indeed" && session.fromGlassdoor) continue;
 
-      // v1.4.0: Don't reopen Glassdoor while an Indeed handoff is in progress.
-      // During handoff, the Glassdoor tab navigates to Indeed Smart Apply, so
-      // listPlatformTabs("glassdoor") returns 0 → the watchdog would reopen
-      // Glassdoor → new run → another handoff → open-crash-close loop.
-      if (platform === "glassdoor" && session.awaitingIndeed) continue;
-
       const searchUrl = session.searchUrl || session.resumeSearchUrl || "";
+
+      // During Glassdoor→Indeed handoff the Glassdoor tab often navigates to Smart Apply
+      // and disappears from listPlatformTabs("glassdoor"). Always restore the SERP tab so
+      // the user still sees Glassdoor running (avoids "crash" / only-Indeed look).
+      if (platform === "glassdoor" && session.awaitingIndeed) {
+        const gdTabs = await listPlatformTabs("glassdoor");
+        if (gdTabs.length === 0 && searchUrl) {
+          const now = Date.now();
+          if (now - lastGlassdoorSerpRestoreAt < 15000) continue;
+          const last = lastPlatformReopenAt.glassdoor || 0;
+          if (now - last > 8000) {
+            lastPlatformReopenAt.glassdoor = now;
+            lastGlassdoorSerpRestoreAt = now;
+            try {
+              await ensureSinglePlatformTab("glassdoor", searchUrl, {
+                active: false,
+                forceNavigate: true,
+              });
+              await appendLog(
+                "SERP Glassdoor restauré pendant Smart Apply (évite onglet disparu)",
+                "info",
+                "glassdoor"
+              );
+            } catch (_e) {}
+          }
+        }
+        continue;
+      }
+
       if (!searchUrl) continue;
 
       // Count ANY platform tab (including Smart Apply) — do not reopen while applying
@@ -1870,6 +2741,7 @@ async function startMultiSession(msg) {
     contracts,
     maxJobs,
     startedAt: new Date().toISOString(),
+    indeedLoginRequired: false,
   };
 
   const updates = { amijobsMeta, enabled: true };
@@ -1916,8 +2788,14 @@ async function startMultiSession(msg) {
     updates.sessionGlassdoor = emptyPlatformSession("glassdoor", {
       ...common,
       searchUrl,
+      deferredUntilIndeedDone: false,
     });
   }
+
+  // Shared Smart Apply mutex — both SERPs run together; wizard turns alternate after each apply.
+  // Do NOT prefer Glassdoor at start (that starved Indeed and looked like "only Glassdoor").
+  updates.amijobsSmartApplyLock = null;
+  updates.amijobsSmartApplyPrefer = null;
 
   await chrome.storage.local.set(updates);
   // Reset reopen storm counters for this run
@@ -1930,39 +2808,64 @@ async function startMultiSession(msg) {
       (contracts.length ? ` [${contracts.join(", ")}]` : ""),
     "success"
   );
+  if (platforms.includes("indeed") && platforms.includes("glassdoor")) {
+    await appendLog(
+      "Mode parallèle Indeed+Glassdoor — les 2 SERP actifs, Smart Apply en alternance",
+      "info"
+    );
+  }
 
-  // Always open/reuse exactly one tab per selected platform
-  await openPlatformTabs(urls, platforms);
+  // Open both boards; kick Indeed + Glassdoor together (no first-board starvation)
+  const openOrder = [...platforms];
+  await openPlatformTabs(urls, openOrder);
 
-  // Kick content scripts (Glassdoor/LinkedIn sometimes miss the first auto-resume)
   setTimeout(() => {
-    kickPlatformSessions(platforms).catch(() => {});
-  }, 2500);
+    // First kick must force-inject — tabs are fresh and may not have content scripts yet
+    kickPlatformSessions(openOrder, { forceInject: true }).catch(() => {});
+  }, 2000);
 
   return { ok: true, urls, platforms };
 }
 
-async function kickPlatformSessions(platforms = []) {
+async function kickPlatformSessions(platforms = [], { forceInject = false } = {}) {
   for (const platform of platforms) {
     try {
       const tabs = await listPlatformTabs(platform);
       for (const tab of tabs.slice(0, 1)) {
         if (!tab?.id) continue;
-        try {
-          if (platform === "glassdoor") {
-            await chrome.scripting.executeScript({
-              target: { tabId: tab.id, allFrames: false },
-              files: ["content/shared-autofill.js", "content/glassdoor.js"],
-            });
-          } else if (platform === "linkedin") {
-            await chrome.scripting.executeScript({
-              target: { tabId: tab.id, allFrames: false },
-              files: ["content/linkedin.js"],
-            });
+        let pingOk = false;
+        if (!forceInject) {
+          try {
+            const st = await chrome.tabs.sendMessage(tab.id, { action: "getContentStatus" });
+            pingOk = !!st;
+          } catch (_e) {
+            pingOk = false;
           }
-        } catch (_e) {
-          /* already injected */
         }
+        if (forceInject || !pingOk) {
+          try {
+            if (platform === "glassdoor") {
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id, allFrames: false },
+                files: ["content/shared-autofill.js", "content/glassdoor.js"],
+              });
+            } else if (platform === "linkedin") {
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id, allFrames: false },
+                files: ["content/linkedin.js"],
+              });
+            } else if (platform === "indeed") {
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id, allFrames: false },
+                files: ["content/shared-autofill.js", "content/indeed.js"],
+              });
+            }
+          } catch (_e) {
+            /* already injected */
+          }
+        }
+        // Small delay after inject so listeners register before startAutoApply
+        if (forceInject || !pingOk) await new Promise((r) => setTimeout(r, 400));
         chrome.tabs.sendMessage(tab.id, { action: "startAutoApply" }).catch(() => {});
       }
     } catch (_e) {
@@ -1972,6 +2875,19 @@ async function kickPlatformSessions(platforms = []) {
 }
 
 function handleMessage(msg, sendResponse, sender = null) {
+  if (msg.action === "uploadCvViaDebugger") {
+    (async () => {
+      const tabId = msg.tabId || sender?.tab?.id;
+      if (!tabId) {
+        sendResponse({ ok: false, reason: "no_tab" });
+        return;
+      }
+      const r = await uploadCvViaDebugger(tabId);
+      sendResponse(r);
+    })();
+    return true;
+  }
+
   if (msg.action === "ping") {
     sendResponse({ ok: true, version: EXT_VERSION });
     return false;
@@ -2076,12 +2992,39 @@ function handleMessage(msg, sendResponse, sender = null) {
   }
 
   if (msg.action === "ensurePlatformTab") {
-    ensureSinglePlatformTab(msg.platform, msg.url, {
-      active: !!msg.active,
-      forceNavigate: msg.forceNavigate !== false,
-    })
-      .then((tabId) => sendResponse({ ok: true, tabId }))
-      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    (async () => {
+      const url = String(msg.url || "");
+      // Never park help/support articles in the Indeed apply slot
+      if (
+        msg.platform === "indeed" &&
+        url &&
+        /help\.|support\.|\/hc\/|guidelines|articles\/|job-seeker/i.test(url)
+      ) {
+        sendResponse({ ok: false, reason: "indeed_help_url_blocked" });
+        return;
+      }
+      if (msg.platform === "indeed" && url && isIndeedLoginWallUrl(url)) {
+        await handleIndeedLoginWall(null, url);
+        sendResponse({ ok: false, reason: "indeed_login_wall" });
+        return;
+      }
+      if (msg.platform === "indeed") {
+        const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+        if (amijobsMeta?.indeedLoginRequired) {
+          sendResponse({ ok: false, reason: "indeed_login_required" });
+          return;
+        }
+      }
+      try {
+        const tabId = await ensureSinglePlatformTab(msg.platform, msg.url, {
+          active: !!msg.active,
+          forceNavigate: msg.forceNavigate !== false,
+        });
+        sendResponse({ ok: true, tabId });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message || e) });
+      }
+    })();
     return true;
   }
 
@@ -2220,7 +3163,7 @@ function handleMessage(msg, sendResponse, sender = null) {
         msg.options,
         msg.jobInfo,
         state.profile,
-        state.cvText
+        msg.cvText || state.cvText || state.profile?.cvText || ""
       );
       sendResponse({ answer });
     })();
@@ -2230,11 +3173,77 @@ function handleMessage(msg, sendResponse, sender = null) {
   if (msg.action === "listIndeedTabs") {
     listPlatformTabs("indeed")
       .then((tabs) => {
-        const hasSmartApply = tabs.some((t) => /smartapply|indeedapply/i.test(t.url || ""));
-        const hasSerp = tabs.some((t) => /\/jobs|viewjob/i.test(t.url || "") && !/smartapply/i.test(t.url || ""));
-        sendResponse({ ok: true, count: tabs.length, hasSmartApply, hasSerp });
+        const hasSmartApply = tabs.some((t) =>
+          /smartapply|indeedapply|applybyapplyablejobid/i.test(t.url || "")
+        );
+        // Glassdoor Easy Apply often lands on viewjob / rc/clk before smartapply
+        // Do NOT count SERP /jobs?vjk= — Indeed always has a panel open while browsing
+        const hasApplyTab = tabs.some((t) =>
+          /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk|\/apply\b/i.test(
+            t.url || ""
+          )
+        );
+        const hasSerp = tabs.some(
+          (t) => /\/jobs\b/i.test(t.url || "") && !/smartapply|indeedapply|\/viewjob|\/rc\/clk/i.test(t.url || "")
+        );
+        sendResponse({ ok: true, count: tabs.length, hasSmartApply, hasApplyTab, hasSerp });
       })
       .catch((e) => sendResponse({ ok: false, reason: e.message }));
+    return true;
+  }
+
+  if (msg.action === "nudgeIndeedSmartApply") {
+    (async () => {
+      try {
+        const tabs = await listPlatformTabs("indeed");
+        const apply = tabs.find((t) =>
+          /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(t.url || "")
+        );
+        if (apply?.id) {
+          await chrome.tabs.update(apply.id, { active: true }).catch(() => {});
+          await chrome.tabs.sendMessage(apply.id, { action: "startAutoApply" }).catch(() => {});
+        }
+        sendResponse({ ok: true, nudged: !!apply?.id });
+      } catch (e) {
+        sendResponse({ ok: false, reason: e.message });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.action === "peekSmartApplyLock") {
+    peekSmartApplyLock(msg.ttlMs || SMART_APPLY_LOCK_TTL_MS)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, reason: e.message }));
+    return true;
+  }
+  if (msg.action === "acquireSmartApplyLock") {
+    acquireSmartApplyLock(msg.owner || "", msg.ttlMs || SMART_APPLY_LOCK_TTL_MS, !!msg.handoff)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, reason: e.message }));
+    return true;
+  }
+  if (msg.action === "releaseSmartApplyLock") {
+    releaseSmartApplyLock(msg.owner || "", { fair: !!msg.fair })
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, reason: e.message }));
+    return true;
+  }
+
+  if (msg.action === "closeIndeedSmartApplyTabs") {
+    (async () => {
+      try {
+        const tabs = await listPlatformTabs("indeed");
+        const applyTabs = tabs.filter((t) => /smartapply|indeedapply/i.test(t.url || ""));
+        for (const t of applyTabs) {
+          if (t?.id) await chrome.tabs.remove(t.id).catch(() => {});
+        }
+        await chrome.storage.local.set({ indeedWizardBusy: null, glassdoorSmartApply: null });
+        sendResponse({ ok: true, closed: applyTabs.length });
+      } catch (e) {
+        sendResponse({ ok: false, reason: e.message });
+      }
+    })();
     return true;
   }
 
@@ -2248,6 +3257,7 @@ function handleMessage(msg, sendResponse, sender = null) {
         data: msg.data || msg.cData || "",
         pagedata: msg.pagedata || msg.chlPageData || msg.pageData || "",
         userAgent: msg.userAgent || "",
+        apiDomain: msg.apiDomain || "",
         isEnterprise: !!msg.isEnterprise || /enterprise/i.test(String(msg.type || "")),
         isInvisible: !!msg.isInvisible,
       });
@@ -2461,15 +3471,40 @@ function handleMessage(msg, sendResponse, sender = null) {
   if (msg.action === "markApplied") {
     (async () => {
       const platform = msg.platform || "hellowork";
-      const { appliedJobs = {}, stats = { applied: 0, skipped: 0, errors: 0, lastRun: null } } =
-        await chrome.storage.local.get(["appliedJobs", "stats"]);
+      const keyName =
+        platform === "indeed"
+          ? "sessionIndeed"
+          : platform === "glassdoor"
+            ? "sessionGlassdoor"
+            : platform === "linkedin"
+              ? "sessionLinkedin"
+              : "sessionHellowork";
+      const data = await chrome.storage.local.get([keyName, "appliedJobs", "stats"]);
+      const session = data[keyName];
+      const maxJobs = session?.maxJobs || 25;
+      // Refuse to count past session quota (stops dual-handoff double-fire)
+      if (session?.active && (session.applied || 0) >= maxJobs) {
+        await appendLog(
+          `Quota atteint — ignore markApplied: ${msg.title || ""}`,
+          "warn",
+          platform
+        );
+        sendResponse({ ok: false, reason: "max_jobs" });
+        return;
+      }
+      const { appliedJobs = {}, stats = { applied: 0, skipped: 0, errors: 0, lastRun: null } } = data;
       const prefix = jobKeyPrefix(platform);
       const key = prefix + (msg.jobId || `job_${Date.now()}`);
+      if (appliedJobs[key]) {
+        sendResponse({ ok: true, duplicate: true });
+        return;
+      }
       appliedJobs[key] = {
         platform,
         title: msg.title || "",
         company: msg.company || "",
         url: msg.url || "",
+        page: Number.isFinite(msg.page) ? msg.page : undefined,
         ts: new Date().toISOString(),
       };
       stats.applied = (stats.applied || 0) + 1;
@@ -2560,9 +3595,68 @@ function handleMessage(msg, sendResponse, sender = null) {
     return true;
   }
 
+  if (msg.action === "indeedLoginWall") {
+    handleIndeedLoginWall(msg.tabId ?? null, msg.url || "")
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+
   if (msg.action === "watchIndeedApplyFromGlassdoor") {
     watchingIndeedFromGlassdoor = msg.jobInfo || {};
     sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.action === "armIndeedHandoffCapture") {
+    const ms = Math.max(3000, Math.min(30000, Number(msg.ms) || 12000));
+    indeedHandoffCapture = { at: Date.now(), until: Date.now() + ms, url: "", tabId: null };
+    sendResponse({ ok: true, until: indeedHandoffCapture.until });
+    return true;
+  }
+
+  if (msg.action === "peekIndeedHandoffCapture") {
+    const cap = indeedHandoffCapture;
+    if (!cap || Date.now() > (cap.until || 0)) {
+      sendResponse({ ok: false, url: "", expired: true });
+      return true;
+    }
+    sendResponse({ ok: !!cap.url, url: cap.url || "", tabId: cap.tabId || null });
+    return true;
+  }
+
+  if (msg.action === "restoreGlassdoorSerp") {
+    (async () => {
+      try {
+        const now = Date.now();
+        if (now - lastGlassdoorSerpRestoreAt < 15000) {
+          sendResponse({ ok: true, throttled: true });
+          return;
+        }
+        const { sessionGlassdoor } = await chrome.storage.local.get(["sessionGlassdoor"]);
+        const url =
+          msg.searchUrl ||
+          sessionGlassdoor?.searchUrl ||
+          sessionGlassdoor?.resumeSearchUrl ||
+          "";
+        if (!sessionGlassdoor?.active || !url) {
+          sendResponse({ ok: false, reason: "no_session" });
+          return;
+        }
+        const gdTabs = await listPlatformTabs("glassdoor");
+        if (gdTabs.length === 0) {
+          lastGlassdoorSerpRestoreAt = now;
+          await ensureSinglePlatformTab("glassdoor", url, {
+            active: false,
+            forceNavigate: true,
+          });
+          await appendLog("SERP Glassdoor restauré après handoff Indeed", "info", "glassdoor");
+        }
+        sendResponse({ ok: true, restored: gdTabs.length === 0 });
+      } catch (e) {
+        sendResponse({ ok: false, reason: e.message });
+      }
+    })();
     return true;
   }
 
@@ -2580,7 +3674,8 @@ function handleMessage(msg, sendResponse, sender = null) {
           sessionGlassdoor: {
             ...sessionGlassdoor,
             awaitingIndeed: false,
-            indeedHandoffDone: false,
+            // Keep handoffDone so Glassdoor wait loop can match success before clearing
+            indeedHandoffDone: fromGlassdoor ? !!sessionGlassdoor.indeedHandoffDone : false,
           },
           glassdoorSmartApply: null,
         });
@@ -2606,21 +3701,42 @@ function handleMessage(msg, sendResponse, sender = null) {
       } else if (resumeUrl) {
         await ensureSinglePlatformTab("indeed", resumeUrl, { active: true, forceNavigate: true });
       } else if (tabId && fromGlassdoor) {
-        // Glassdoor handoff finished: if Indeed session still needs SERP, go there in this tab;
-        // otherwise close only when another Indeed tab already exists.
-        const others = (await listPlatformTabs("indeed")).filter((t) => t.id !== tabId);
+        // Glassdoor handoff finished: never leave a zombie Smart Apply tab — it blocks
+        // Glassdoor resume (hasSmartApply) and causes false "assumed handoff" waits.
         if (sessionIndeed?.active && !sessionIndeed.fromGlassdoor && sessionIndeed.searchUrl) {
           try {
             await chrome.tabs.update(tabId, { url: sessionIndeed.searchUrl, active: false });
           } catch (_e) {
-            /* ignore */
+            try {
+              await chrome.tabs.remove(tabId);
+            } catch (_e2) {
+              /* ignore */
+            }
           }
-        } else if (others.length) {
+        } else {
           try {
             await chrome.tabs.remove(tabId);
           } catch (_e) {
             /* ignore */
           }
+        }
+      }
+
+      // Sweep any leftover Indeed apply tabs after Glassdoor handoff
+      if (fromGlassdoor) {
+        try {
+          const leftovers = (await listPlatformTabs("indeed")).filter((t) =>
+            /smartapply|indeedapply/i.test(t.url || "")
+          );
+          for (const t of leftovers) {
+            try {
+              await chrome.tabs.remove(t.id);
+            } catch (_e) {
+              /* ignore */
+            }
+          }
+        } catch (_e) {
+          /* ignore */
         }
       }
 

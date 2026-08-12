@@ -1,5 +1,6 @@
-// AmiJobs — Google reCAPTCHA: click + 2captcha token inject (v1.4.5)
-// Token MUST be applied in the page MAIN world (grecaptcha.getResponse), not only isolated DOM.
+// AmiJobs — Google reCAPTCHA: 2captcha token inject (v1.4.17)
+// Indeed Smart Apply: RecaptchaV2TaskProxyless only. Tokens expire ~120s — never
+// pre-solve early in the wizard, and re-solve when UI shows "expiré".
 (function () {
   if (window.__AmijobsRecaptchaLoaded) return;
   window.__AmijobsRecaptchaLoaded = true;
@@ -7,6 +8,11 @@
   let solving = false;
   let lastSolveAt = 0;
   let lastInjected = "";
+  let lastInjectedAt = 0;
+
+  // Known Indeed Smart Apply checkbox key (from live HAR /enterprise/anchor?k=…)
+  const INDEED_SMARTAPPLY_SITEKEY = "6Lcr30spAAAAANOd2aQVyfNwAwHyAW6WsatMvrqU";
+  const TOKEN_MAX_AGE_MS = 90000; // reCAPTCHA v2 tokens die ~2min; stay under 90s
 
   function clickEl(el) {
     if (!el) return false;
@@ -59,6 +65,67 @@
     }
   }
 
+  function pageText() {
+    try {
+      return String(document.body?.innerText || document.documentElement?.innerText || "");
+    } catch (_e) {
+      return "";
+    }
+  }
+
+  /** Indeed FR: "Le test de validation a expiré. Cochez à nouveau la case." */
+  function isRecaptchaExpiredUi() {
+    const t = pageText();
+    return /test de validation a expir[ée]|validation a expir[ée]|expir[ée].*case|expired\.?\s*check|verification expired|timed out|a expir[ée]/i.test(
+      t
+    );
+  }
+
+  function readToken() {
+    return String(
+      window.__AmijobsRecaptchaToken ||
+        lastInjected ||
+        document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
+        document.querySelector("#g-recaptcha-response")?.value ||
+        ""
+    );
+  }
+
+  function clearToken(reason = "") {
+    lastInjected = "";
+    lastInjectedAt = 0;
+    window.__AmijobsRecaptchaToken = "";
+    try {
+      window.__AmijobsRecaptchaFreshLogged = false;
+    } catch (_e) {}
+    try {
+      for (const a of document.querySelectorAll(
+        'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
+      )) {
+        a.value = "";
+        a.innerHTML = "";
+      }
+    } catch (_e) {}
+    try {
+      document.documentElement.removeAttribute("data-amijobs-recaptcha-token");
+    } catch (_e) {}
+    if (reason) {
+      try {
+        chrome.runtime
+          .sendMessage({ action: "appendLog", message: `reCAPTCHA reset: ${reason}`, level: "warn" })
+          .catch(() => {});
+      } catch (_e) {}
+    }
+  }
+
+  function hasFreshToken(maxAgeMs = TOKEN_MAX_AGE_MS) {
+    if (isRecaptchaExpiredUi()) return false;
+    const t = readToken();
+    if (t.length < 40) return false;
+    if (!lastInjectedAt) return false; // unknown age → treat as stale
+    return Date.now() - lastInjectedAt < maxAgeMs;
+  }
+
   function collectSiteKeys(doc = document) {
     const keys = [];
     const push = (k, score = 0) => {
@@ -71,37 +138,41 @@
     const href = doc.location?.href || location.href || "";
     const params = new URLSearchParams(doc.location?.search || location.search || "");
     const fromQuery = params.get("k") || params.get("sitekey");
-    const isImage = /[?&]type=image\b/i.test(href);
+    const isImage = /[?&]type=image\b|\/bframe/i.test(href);
     const isAnchor = /\/anchor|anchor\?/i.test(href) || /[?&]size=normal\b/i.test(href);
-    // Prefer checkbox/anchor keys — image/bframe keys often yield "Workers could not solve"
-    push(fromQuery, isImage ? 5 : isAnchor ? 90 : 50);
+    push(fromQuery, isImage ? 1 : isAnchor ? 95 : 40);
 
     for (const el of doc.querySelectorAll("[data-sitekey], .g-recaptcha[data-sitekey], [data-recaptcha-sitekey]")) {
-      push(el.getAttribute("data-sitekey") || el.getAttribute("data-recaptcha-sitekey"), 80);
+      push(el.getAttribute("data-sitekey") || el.getAttribute("data-recaptcha-sitekey"), 85);
     }
     for (const iframe of doc.querySelectorAll('iframe[src*="recaptcha"]')) {
       const src = iframe.getAttribute("src") || "";
       const m = src.match(/[?&]k=(6L[^&]+)/);
       if (!m) continue;
       const k = decodeURIComponent(m[1]);
-      let score = 45;
-      if (/[?&]type=image\b|\/bframe/i.test(src)) score = 5;
-      else if (/\/enterprise\/.+anchor|\/anchor/i.test(src)) score = 95;
-      else if (/\/enterprise\//i.test(src)) score = 70;
-      else if (/\/api2\/anchor/i.test(src)) score = 90;
+      let score = 40;
+      if (/[?&]type=image\b|\/bframe/i.test(src)) score = 1;
+      else if (/\/enterprise\/.+anchor|\/api2\/anchor|\/anchor/i.test(src)) score = 100;
+      else if (/\/enterprise\//i.test(src)) score = 60;
       push(k, score);
     }
+
+    if (/smartapply\.indeed|indeed\.(com|fr)/i.test(href + " " + (document.referrer || ""))) {
+      push(INDEED_SMARTAPPLY_SITEKEY, 110);
+    }
+
     keys.sort((a, b) => b.score - a.score);
     return keys.map((x) => x.key);
   }
 
-  function extractEnterpriseFromDoc(doc = document) {
+  function detectApiDomain(doc = document) {
     const href = doc.location?.href || location.href || "";
-    if (/\/enterprise\//i.test(href)) return true;
+    if (/recaptcha\.net/i.test(href)) return "www.recaptcha.net";
     for (const iframe of doc.querySelectorAll('iframe[src*="recaptcha"]')) {
-      if (/\/enterprise\//i.test(iframe.getAttribute("src") || "")) return true;
+      const src = iframe.getAttribute("src") || "";
+      if (/recaptcha\.net/i.test(src)) return "www.recaptcha.net";
     }
-    return /smartapply\.indeed|indeed\.(com|fr)|glassdoor\./i.test(href + " " + (document.referrer || ""));
+    return "www.google.com";
   }
 
   function hostPageUrl() {
@@ -109,9 +180,7 @@
       if (window.top && window.top !== window) {
         try {
           return window.top.location.href;
-        } catch (_e) {
-          /* cross-origin */
-        }
+        } catch (_e) {}
       }
     } catch (_e) {}
     const params = new URLSearchParams(location.search || "");
@@ -123,7 +192,6 @@
     return location.href;
   }
 
-  /** Run code in the page MAIN world so grecaptcha callbacks/getResponse work. */
   function runInPage(fnSource, arg) {
     try {
       const script = document.createElement("script");
@@ -181,7 +249,6 @@
         } catch (_e) {}
       };
       patchApi(window.grecaptcha);
-      if (window.grecaptcha) patchApi(window.grecaptcha);
 
       const walk = (obj, depth) => {
         if (!obj || depth > 10) return;
@@ -212,8 +279,6 @@
           } catch (_e) {}
         }
       }
-
-      // Nudge React/Indeed listeners
       try {
         document.dispatchEvent(new CustomEvent("amijobs-recaptcha-solved", { detail: { token } }));
       } catch (_e) {}
@@ -221,11 +286,10 @@
   };
 
   function injectToken(token) {
-    if (!token) return false;
+    if (!token || String(token).length < 40) return false;
     lastInjected = token;
+    lastInjectedAt = Date.now();
     window.__AmijobsRecaptchaToken = token;
-
-    // Isolated-world DOM fill (shared DOM)
     try {
       let area =
         document.querySelector('textarea[name="g-recaptcha-response"]') ||
@@ -246,7 +310,6 @@
       }
     } catch (_e) {}
 
-    // MAIN world: patch getResponse + fire callbacks (critical for Indeed Smart Apply)
     runInPage(PAGE_INJECT_FN.toString(), token);
 
     try {
@@ -254,19 +317,54 @@
         window.parent.postMessage({ source: "amijobs-recaptcha", token }, "*");
       }
     } catch (_e) {}
-
     try {
       document.documentElement.setAttribute("data-amijobs-recaptcha-token", "1");
+      document.documentElement.setAttribute("data-amijobs-recaptcha-at", String(lastInjectedAt));
     } catch (_e) {}
     return true;
   }
 
   window.__AmijobsInjectRecaptchaToken = injectToken;
   window.__AmijobsClickRecaptcha = clickRecaptcha;
+  window.__AmijobsClearRecaptcha = clearToken;
+  window.__AmijobsRecaptchaExpired = isRecaptchaExpiredUi;
+  window.__AmijobsHasFreshRecaptchaToken = hasFreshToken;
+
+  const onRecaptchaHost = /google\.com\/recaptcha|recaptcha\.net/i.test(location.href);
+  const onApplyHost = /smartapply\.indeed|indeed\.(com|fr)|glassdoor\./i.test(location.href);
 
   async function solveVia2Captcha(force = false) {
-    if (solving) return false;
-    if (!force && Date.now() - lastSolveAt < 25000) return !!lastInjected;
+    // Never burn 2captcha from inside google/recaptcha iframes — host page owns solves.
+    if (onRecaptchaHost) {
+      try {
+        const params = new URLSearchParams(location.search || "");
+        const k = params.get("k") || "";
+        if (k && !/[?&]type=image\b/i.test(location.href)) {
+          window.parent.postMessage(
+            { source: "amijobs-recaptcha-sitekey", sitekey: k, href: location.href },
+            "*"
+          );
+        }
+      } catch (_e) {}
+      return false;
+    }
+
+    if (isRecaptchaExpiredUi()) {
+      clearToken("ui_expired");
+      force = true;
+    }
+
+    if (hasFreshToken() && !force) return true;
+
+    if (solving) return hasFreshToken();
+    // Cooldown only when we already have a fresh token; failures retry quickly
+    if (!force && Date.now() - lastSolveAt < 5000 && !hasFreshToken()) {
+      /* allow */
+    } else if (!force && hasFreshToken()) {
+      return true;
+    } else if (!force && Date.now() - lastSolveAt < 8000) {
+      return hasFreshToken();
+    }
 
     const keys = collectSiteKeys(document);
     if (!keys.length) {
@@ -274,26 +372,40 @@
       const m = (iframe?.getAttribute("src") || "").match(/[?&]k=(6L[^&]+)/);
       if (m) keys.push(decodeURIComponent(m[1]));
     }
+    if (!keys.length && /smartapply\.indeed|indeed\.(com|fr)/i.test(location.href)) {
+      keys.push(INDEED_SMARTAPPLY_SITEKEY);
+    }
     if (!keys.length) return false;
 
     solving = true;
     lastSolveAt = Date.now();
+    // Drop stale token before requesting a new one
+    if (force || isRecaptchaExpiredUi() || !hasFreshToken()) clearToken();
+
     try {
       const pageUrl = hostPageUrl();
-      const isEnterprise = extractEnterpriseFromDoc(document);
+      const apiDomain = detectApiDomain(document);
       let lastErr = "";
-      // Try preferred keys; for each try enterprise then classic v2
+
+      // Classic v2 ONLY for Indeed — enterprise burns time then fails with same sitekey
+      const attempts = /smartapply\.indeed|indeed\.(com|fr)/i.test(pageUrl)
+        ? [{ type: "recaptcha_v2", isEnterprise: false }]
+        : [
+            { type: "recaptcha_v2", isEnterprise: false },
+            { type: "recaptcha_enterprise", isEnterprise: true },
+          ];
+
       for (const key of keys.slice(0, 2)) {
-        const attempts = isEnterprise
-          ? [
-              { type: "recaptcha_enterprise", isEnterprise: true },
-              { type: "recaptcha_v2", isEnterprise: false },
-            ]
-          : [
-              { type: "recaptcha_v2", isEnterprise: false },
-              { type: "recaptcha_enterprise", isEnterprise: true },
-            ];
         for (const attempt of attempts) {
+          try {
+            chrome.runtime
+              .sendMessage({
+                action: "appendLog",
+                message: `2captcha reCAPTCHA ${attempt.type} key=${key.slice(0, 12)}…`,
+                level: "warn",
+              })
+              .catch(() => {});
+          } catch (_e) {}
           try {
             const res = await chrome.runtime.sendMessage({
               action: "solveCaptcha",
@@ -301,17 +413,15 @@
               websiteURL: pageUrl,
               websiteKey: key,
               isEnterprise: attempt.isEnterprise,
+              apiDomain,
               injectInTab: true,
             });
             if (res?.ok && res.token) {
               injectToken(res.token);
+              // Do NOT click the checkbox after inject — that resets/expires the token
               return true;
             }
             lastErr = res?.reason || "no_token";
-            // Wrong sitekey → try next mode/key (image/bframe keys often fail)
-            if (/workers could not solve|unsolvable|ERROR_CAPTCHA_UNSOLVABLE/i.test(String(lastErr))) {
-              continue;
-            }
           } catch (e) {
             lastErr = e?.message || "send_failed";
           }
@@ -325,22 +435,22 @@
     } finally {
       solving = false;
     }
-    return false;
+    return hasFreshToken();
   }
 
   window.__AmijobsSolveRecaptcha = solveVia2Captcha;
-  window.__AmijobsHasRecaptchaToken = () => {
-    const t =
-      window.__AmijobsRecaptchaToken ||
-      document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
-      "";
-    return String(t).length > 40;
-  };
+  window.__AmijobsHasRecaptchaToken = () => hasFreshToken() || readToken().length > 40;
 
   window.addEventListener("message", (ev) => {
     const d = ev?.data;
     if (d && d.source === "amijobs-recaptcha" && d.token) {
       injectToken(d.token);
+    }
+    if (d && d.source === "amijobs-recaptcha-sitekey" && d.sitekey && onApplyHost) {
+      // Only remember sitekey — do NOT auto-solve (tokens expire before review)
+      try {
+        window.__AmijobsRecaptchaSitekey = d.sitekey;
+      } catch (_e) {}
     }
   });
 
@@ -351,33 +461,36 @@
       return;
     }
     if (msg.action === "solveRecaptchaNow") {
-      solveVia2Captcha(true).then((ok) => sendResponse({ ok }));
+      solveVia2Captcha(true).then((ok) => sendResponse({ ok, fresh: hasFreshToken() }));
       return true;
+    }
+    if (msg.action === "clearRecaptchaToken") {
+      clearToken(msg.reason || "msg");
+      sendResponse({ ok: true });
+      return;
     }
   });
 
-  const onRecaptchaHost = /google\.com\/recaptcha|recaptcha\.net/i.test(location.href);
-  const onApplyHost = /smartapply\.indeed|indeed\.(com|fr)|glassdoor\./i.test(location.href);
-
   if (onRecaptchaHost) {
-    setTimeout(() => clickRecaptcha(), 600);
-    setTimeout(() => clickRecaptcha(), 1600);
+    // Inside widget iframe: forward sitekey only (host solves on review)
     setTimeout(() => {
-      solveVia2Captcha(true).catch(() => {});
-    }, 2200);
+      try {
+        const params = new URLSearchParams(location.search || "");
+        const k = params.get("k") || "";
+        if (k && !/[?&]type=image\b/i.test(location.href)) {
+          window.parent.postMessage(
+            { source: "amijobs-recaptcha-sitekey", sitekey: k, href: location.href },
+            "*"
+          );
+        }
+      } catch (_e) {}
+    }, 800);
   } else if (onApplyHost) {
-    const kick = () => {
-      if (document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey]')) {
-        solveVia2Captcha(false).catch(() => {});
+    // Watch for expiry UI and clear stale tokens — do NOT auto-burn 2captcha credits
+    setInterval(() => {
+      if (isRecaptchaExpiredUi() && readToken().length > 40) {
+        clearToken("ui_expired_watch");
       }
-    };
-    setTimeout(kick, 1500);
-    setTimeout(kick, 5000);
-    setTimeout(kick, 12000);
-    try {
-      const mo = new MutationObserver(() => kick());
-      mo.observe(document.documentElement, { childList: true, subtree: true });
-      setTimeout(() => mo.disconnect(), 120000);
-    } catch (_e) {}
+    }, 2000);
   }
 })();

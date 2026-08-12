@@ -14,7 +14,7 @@
   window.__AmijobsExternalApplyLoaded = true;
 
   const PLATFORM = "external";
-  const VERSION = "1.4.6";
+  const VERSION = "1.4.8";
   let running = false;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -212,29 +212,16 @@
   }
 
   async function clickRecaptcha() {
+    // Prefer 2captcha token inject — clicking the box alone often expires / fails
     try {
-      if (typeof window.__AmijobsClickRecaptcha === "function") window.__AmijobsClickRecaptcha();
+      if (typeof window.__AmijobsSolveRecaptcha === "function") {
+        const ok = await window.__AmijobsSolveRecaptcha(true);
+        if (ok) return;
+      }
     } catch (_e) {}
     try {
-      await chrome.runtime.sendMessage({ action: "clickRecaptcha" });
+      await chrome.runtime.sendMessage({ action: "solveRecaptchaNow" });
     } catch (_e) {}
-    for (const frame of document.querySelectorAll('iframe[src*="recaptcha"]')) {
-      try {
-        const r = frame.getBoundingClientRect();
-        const o = {
-          bubbles: true,
-          cancelable: true,
-          clientX: r.left + 28,
-          clientY: r.top + r.height / 2,
-          view: window,
-          buttons: 1,
-        };
-        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-          frame.dispatchEvent(new MouseEvent(type, o));
-        }
-        frame.click();
-      } catch (_e) {}
-    }
     await sleep(1500);
   }
 

@@ -4,11 +4,20 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.6";
+  const VERSION = "1.4.45";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
   let lastIndeedRunAt = 0;
+
+  /** Nested indeed iframes must not run a second wizard (race on Continuer / CV). */
+  function isTopAutomationFrame() {
+    try {
+      return window === window.top;
+    } catch (_e) {
+      return true;
+    }
+  }
 
   // Keep SERP intact: Smart Apply opens in its own tab (never navigate the jobs list away)
   try {
@@ -61,21 +70,36 @@
 
   function isSmartApplyPage(url = window.location.href) {
     // v1.4.0: Ignore service worker iframes — they match smartapply but have no form
-    const path = (() => {
-      try {
-        return new URL(url, location.href).pathname;
-      } catch (_e) {
-        return url;
-      }
-    })();
+    let parsed = null;
+    try {
+      parsed = new URL(url, location.href);
+    } catch (_e) {
+      parsed = null;
+    }
+    const path = parsed ? parsed.pathname : url;
     if (/^\/_\/service_worker/i.test(path) || /^\/_\/scripts\//i.test(path) || /^\/sw_iframe/i.test(path)) {
       return false;
     }
+    // Login walls carry the wizard URL inside ?continue= — matching the raw URL made
+    // /auth look like a wizard and burned the full wizard timeout.
+    if (isLoginWallPage(url)) return false;
+    const host = parsed ? parsed.hostname : "";
+    const target = host ? `${host}${path}` : url;
     return (
-      /smartapply\.indeed\.com/i.test(url) ||
-      /indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(url) ||
-      /indeed\.(com|fr)\/apply/i.test(url)
+      /smartapply\.indeed\.com/i.test(target) ||
+      /indeed\.(com|fr)\/(?:beta\/)?indeedapply/i.test(target) ||
+      /indeed\.(com|fr)\/apply/i.test(target)
     );
+  }
+
+  /** secure.indeed.com/auth — Indeed asks to re-login; no wizard will ever mount here. */
+  function isLoginWallPage(url = window.location.href) {
+    try {
+      const u = new URL(url, location.href);
+      return /(^|\.)secure\.indeed\.com$/i.test(u.hostname) && /^\/(auth|account)/i.test(u.pathname);
+    } catch (_e) {
+      return false;
+    }
   }
 
   function buildSearchUrl(keywords, location, page = 0, session = null) {
@@ -107,10 +131,9 @@
     if (!/^[a-z0-9_-]+$/i.test(key)) return false;
 
     const lower = key.toLowerCase();
-    // Reject sequential / demo hex runs (cause "Page introuvable")
-    if (/abcdef|fedcba|01234567|89abcdef|abcdef01|deadbeef|cafebabe/i.test(lower)) return false;
+    // Reject known demo keys only (substring abcdef was too aggressive on real jk)
     if (
-      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|123456789abcdef0|fedcba9876543210|890abcdef0123456)$/i.test(
+      /^(a1b2c3d4e5f67890|0123456789abcdef|abcdef0123456789|123456789abcdef0|fedcba9876543210|890abcdef0123456|deadbeefdeadbeef|cafebabecafebabe)$/i.test(
         lower
       )
     ) {
@@ -133,9 +156,12 @@
       el.closest("[data-jk]")?.getAttribute("data-jk") ||
       el.closest("[data-jobkey]")?.getAttribute("data-jobkey");
     if (direct && isValidIndeedJobKey(direct)) return direct;
+    // data-jk often lives on the title <a>, while href is /pagead/clk without jk=
     const link =
-      el.querySelector?.('a[href*="jk="], a[href*="viewjob"], a[data-jk]') ||
-      (el.matches?.('a[href*="jk="]') ? el : null);
+      el.querySelector?.('a[data-jk], a[href*="jk="], a[href*="viewjob"], a.jcs-JobTitle') ||
+      (el.matches?.('a[data-jk], a[href*="jk="], a.jcs-JobTitle') ? el : null);
+    const fromLink = link?.getAttribute?.("data-jk") || link?.getAttribute?.("data-jobkey");
+    if (fromLink && isValidIndeedJobKey(fromLink)) return fromLink;
     const href = link?.getAttribute?.("href") || el.getAttribute?.("href") || "";
     const m = href.match(/[?&]jk=([^&]+)/) || href.match(/[?&]vjk=([^&]+)/);
     if (m) {
@@ -143,7 +169,7 @@
       if (isValidIndeedJobKey(jk)) return jk;
     }
     const id = el.getAttribute?.("id") || "";
-    const idMatch = id.match(/job_([a-f0-9]+)/i);
+    const idMatch = id.match(/^(?:job_|sj_)([a-f0-9]+)$/i) || id.match(/job_([a-f0-9]+)/i);
     if (idMatch && isValidIndeedJobKey(idMatch[1])) return idMatch[1];
     return null;
   }
@@ -159,6 +185,44 @@
     const next = { ...session, ...updates, lastRunAt: Date.now() };
     await chrome.storage.local.set({ sessionIndeed: next });
     return next;
+  }
+
+  function searchReturnUrl(session) {
+    if (!session) return location.href;
+    return buildSearchUrl(
+      session.keywords,
+      session.location,
+      session.currentPage || 0,
+      session
+    );
+  }
+
+  /** After N successful applies on this SERP page, flip to next page (mass-apply pagination). */
+  async function maybeFlipIndeedPage(session, settings, maxJobs, { navigate = true } = {}) {
+    const perPage = settings?.maxJobsPerPage || 0;
+    if (!perPage || perPage <= 0) return null;
+    const pageApplied = session?.pageApplied || 0;
+    const total = session?.applied || 0;
+    if (pageApplied < perPage) return null;
+    if (total >= maxJobs) return null;
+    const nextPage = (session.currentPage || 0) + 1;
+    if (nextPage > 12) return null;
+    const nextUrl = buildSearchUrl(session.keywords, session.location, nextPage, session);
+    S().log(
+      PLATFORM,
+      `Page suivante Indeed (${nextPage + 1}) — ${pageApplied} postulé(s) sur cette page`,
+      "warn"
+    );
+    await setSession({
+      currentPage: nextPage,
+      pageApplied: 0,
+      queue: [],
+      qIndex: 0,
+      phase: "search",
+      searchUrl: nextUrl,
+    });
+    if (navigate) window.location.href = nextUrl;
+    return nextUrl;
   }
 
   async function endSession(reason) {
@@ -304,6 +368,8 @@
   }
 
   function detectLoginWall() {
+    // Hostname path is authoritative (never trust body copy alone on SERP)
+    if (isLoginWallPage()) return true;
     const text = document.body?.innerText?.toLowerCase() || "";
     // Header "Se connecter" links exist even when logged in — require a real gate
     const hardGate =
@@ -320,6 +386,13 @@
     if (isSearchPage() && S().$("#mosaic-provider-jobcards, .jobsearch-ResultsList, ul#job-results-list")) {
       return false;
     }
+    // Avoid false positives on normal Indeed chrome — only secure/auth-like pages
+    try {
+      const host = location.hostname || "";
+      if (!/(^|\.)secure\.indeed\.com$/i.test(host) && !/\/(auth|login|account)\b/i.test(location.pathname || "")) {
+        return false;
+      }
+    } catch (_e) {}
     return true;
   }
 
@@ -357,8 +430,8 @@
 
   function collectJobCards() {
     const selectors = [
-      "#mosaic-provider-jobcards li",
       "#mosaic-provider-jobcards .cardOutline",
+      "#mosaic-provider-jobcards [data-testid='slider_item']",
       ".job_seen_beacon",
       "div.job_seen_beacon",
       "li[data-jk]",
@@ -369,17 +442,20 @@
       ".jobsearch-ResultsList > li",
       '[data-testid="slider_item"]',
       '[data-testid="job-card"]',
-      ".mosaic-provider-jobcards li",
       ".jobsearch-SerpJobCard",
       "div.slider_item",
-      "a.jcs-JobTitle",
-      "h2.jobTitle a",
+      "a.jcs-JobTitle[data-jk]",
+      "h2.jobTitle a[data-jk]",
+      "a[data-jk]",
     ];
     const nodes = new Set();
     for (const sel of selectors) {
       for (const el of S().$$(sel)) {
+        // Prefer real card shells — bare <li> matches mosaic chrome without data-jk
         const card =
-          el.closest("[data-jk], .job_seen_beacon, .cardOutline, li, [data-testid='slider_item']") || el;
+          el.closest(".job_seen_beacon, .cardOutline, [data-testid='slider_item'], [data-testid='job-card'], li[data-jk], div[data-jk]") ||
+          (el.matches?.("a[data-jk], a.jcs-JobTitle") ? el : null) ||
+          el;
         nodes.add(card);
       }
     }
@@ -388,20 +464,35 @@
     for (const el of nodes) {
       const jk = extractJobKey(el);
       if (!jk || seen.has(jk)) continue;
-      const title =
-        el.querySelector("h2.jobTitle span, h2.jobTitle a, .jobTitle, [data-testid='job-title'], a.jcs-JobTitle")
-          ?.textContent?.trim() || "";
+      const titleEl =
+        (el.matches?.("a.jcs-JobTitle, a[data-jk], h2 a") ? el : null) ||
+        el.querySelector?.(
+          "h2.jobTitle span, h2.jobTitle a, .jobTitle, [data-testid='job-title'], a.jcs-JobTitle, a[data-jk]"
+        );
+      const title = (titleEl?.textContent || "").trim();
       // Ghost / ad shells often expose fake jk without a real title
       if (!title || title.length < 3) continue;
       if (/page introuvable|not found|job expired/i.test(title)) continue;
       seen.add(jk);
       const company =
-        el.querySelector("[data-testid='company-name'], .companyName, .company, span.companyName")
-          ?.textContent?.trim() || "";
-      // Prefer Easy Apply cards when filter is on; keep others only if no badge info
-      const easy = cardLooksLikeEasyApply(el);
-      out.push({ element: el, jobId: jk, title, company, easyApply: easy });
+        el.querySelector?.("[data-testid='company-name'], .companyName, .company, span.companyName")
+          ?.textContent?.trim() ||
+        el.closest?.(".job_seen_beacon, .cardOutline, li, [data-testid='slider_item']")
+          ?.querySelector?.("[data-testid='company-name'], .companyName, span.companyName")
+          ?.textContent?.trim() ||
+        "";
+      const shell =
+        el.closest?.(".job_seen_beacon, .cardOutline, [data-testid='slider_item'], li") || el;
+      const easy = cardLooksLikeEasyApply(shell) || cardLooksLikeEasyApply(el);
+      out.push({ element: shell || el, jobId: jk, title, company, easyApply: easy });
     }
+    // SERP already filtered with applicationType=1 / iafilter=1 — keep all cards
+    try {
+      const u = new URL(location.href);
+      if (u.searchParams.get("applicationType") === "1" || u.searchParams.get("iafilter") === "1") {
+        return out.map((c) => ({ ...c, easyApply: true }));
+      }
+    } catch (_e) {}
     // If any card has Easy Apply badge, drop cards without it
     if (out.some((c) => c.easyApply)) {
       return out.filter((c) => c.easyApply);
@@ -409,33 +500,59 @@
     return out;
   }
 
-  async function waitForJobCards(maxWaitMs = 45000) {
+  async function waitForJobCards(maxWaitMs = 45000, { minCards = 3 } = {}) {
     const start = Date.now();
     let attempt = 0;
+    let best = [];
+    let stableCount = 0;
+    let lastLen = -1;
+    await dismissIndeedPopups().catch(() => {});
     while (Date.now() - start < maxWaitMs) {
       attempt++;
-      if (detectBlockedPage()) return [];
-      if (detectNoResultsPage() && attempt > 3) return [];
+      if (detectBlockedPage()) return best;
+      if (detectNoResultsPage() && attempt > 3) return best;
       const scrollRoot =
         S().$("#mosaic-provider-jobcards") ||
         S().$(".jobsearch-ResultsList") ||
+        S().$('[class*="JobCard"]')?.closest("ul, div") ||
         S().$("main") ||
         document.scrollingElement;
       if (scrollRoot) {
-        scrollRoot.scrollTop = Math.min((scrollRoot.scrollTop || 0) + 500, scrollRoot.scrollHeight || 5000);
+        scrollRoot.scrollTop = Math.min((scrollRoot.scrollTop || 0) + 700, scrollRoot.scrollHeight || 8000);
       } else {
-        window.scrollBy(0, 500);
+        window.scrollBy(0, 700);
       }
-      await S().sleep(500);
+      await S().sleep(450);
       const cards = collectJobCards();
-      if (cards.length > 0) {
+      if (cards.length > best.length) best = cards;
+      if (cards.length === lastLen && cards.length > 0) stableCount++;
+      else stableCount = 0;
+      lastLen = cards.length;
+      // Keep scrolling until a usable SERP batch is loaded
+      if (cards.length >= minCards) {
         S().log(PLATFORM, `${cards.length} offres détectées (tentative ${attempt})`);
         window.scrollTo(0, 0);
         return cards;
       }
-      await S().sleep(1200);
+      // Stable partial page — don't burn the full timeout
+      if (cards.length > 0 && (stableCount >= 3 || Date.now() - start > maxWaitMs * 0.55)) {
+        S().log(PLATFORM, `${cards.length} offres détectées (partiel, tentative ${attempt})`, "warn");
+        window.scrollTo(0, 0);
+        return cards;
+      }
+      await S().sleep(900);
     }
-    return collectJobCards();
+    if (best.length) {
+      S().log(PLATFORM, `${best.length} offres détectées (timeout)`, "warn");
+    } else {
+      S().log(
+        PLATFORM,
+        `0 offre détectée après ${Math.round(maxWaitMs / 1000)}s (URL=${location.pathname}${location.search.slice(0, 80)})`,
+        "warn"
+      );
+    }
+    window.scrollTo(0, 0);
+    return best.length ? best : collectJobCards();
   }
 
   function getJobInfoFromPage(jobId) {
@@ -512,13 +629,29 @@
           /\s+/g,
           " "
         );
-        if (/postuler sur indeed|indeed apply|apply with indeed|candidature simplifiée/i.test(text)) {
+        // Badge / filter label — not an apply CTA
+        if (/^\s*candidature simplifi[ée]e\s*$/i.test(text.trim())) continue;
+        // Reject huge containers (job cards / panels) that merely contain the word somewhere
+        if (text.trim().length > 64) continue;
+        if (
+          /postuler sur indeed|indeed apply|apply with indeed|postuler facilement|candidature facile/i.test(
+            text
+          ) ||
+          /^\s*postuler\s*$/i.test(text)
+        ) {
           return el;
         }
       }
       for (const span of root.querySelectorAll("span, div")) {
         const t = (span.textContent || "").trim();
-        if (!/^postuler sur indeed$/i.test(t) && !/^indeed apply$/i.test(t)) continue;
+        // Never match SERP filter chips — only real apply CTAs in the job panel
+        if (
+          !/^postuler sur indeed$/i.test(t) &&
+          !/^indeed apply$/i.test(t) &&
+          !/^postuler$/i.test(t) &&
+          !/^candidature facile$/i.test(t)
+        )
+          continue;
         const clickable = span.closest("button, a, [role='button']") || span.parentElement;
         if (clickable && S().isVisible(clickable) && !isCompanySiteApplyButton(clickable)) return clickable;
       }
@@ -578,10 +711,58 @@
     }
   }
 
+  function detectApplySuccess() {
+    const path = window.location.pathname || "";
+    if (/\/post-apply/i.test(path) || /application-submitted/i.test(path)) return true;
+    const body = document.body?.innerText?.toLowerCase() || "";
+    return (
+      body.includes("application submitted") ||
+      body.includes("your application has been submitted") ||
+      body.includes("vous avez postulé") ||
+      body.includes("candidature a été envoyée") ||
+      body.includes("we have received your application") ||
+      body.includes("nous avons bien reçu") ||
+      body.includes("votre candidature a bien été") ||
+      !!S().$('[data-testid="apply-success"], .ia-BasePage-heading, [data-testid="post-apply"]')
+    );
+  }
+
+  /** Job detail already applied (panel shows status, no Postuler button). */
+  function detectAlreadyAppliedUi() {
+    const t = (document.body?.innerText || "").toLowerCase();
+    if (
+      t.includes("vous avez déjà postulé") ||
+      t.includes("vous avez deja poste") ||
+      t.includes("you applied") ||
+      t.includes("you have already applied") ||
+      t.includes("already applied to this job") ||
+      t.includes("candidature déjà envoyée") ||
+      t.includes("candidature deja envoyee")
+    ) {
+      return true;
+    }
+    // Indeed FR often shows a status chip "Candidature envoyée" on the job panel
+    // without being on /post-apply — do not treat SERP badge-only pages as applied.
+    const panel =
+      S().$(
+        '#jobsearch-ViewjobPaneWrapper, [data-testid="jobsearch-JobComponent"], .jobsearch-JobComponent, #viewJobSSRRoot, .jobsearch-RightPane'
+      ) || document.body;
+    const panelText = (panel?.innerText || "").toLowerCase();
+    if (/candidature envoyée/.test(panelText) && !findIndeedEasyApplyButton()) return true;
+    return !!S().$(
+      '[data-testid*="already-applied" i], [aria-label*="déjà postulé" i], [aria-label*="already applied" i]'
+    );
+  }
+
   async function waitForApplyButton(timeoutMs = 14000) {
     // Easy Apply / candidature simplifiée only — ignore "Continuer pour postuler"
     const start = Date.now();
+    let dismissed = false;
     while (Date.now() - start < timeoutMs) {
+      if (!dismissed || Date.now() - start < 2500) {
+        dismissed = (await dismissIndeedPopups().catch(() => false)) || dismissed;
+      }
+      if (detectAlreadyAppliedUi()) return null;
       const easy = findIndeedEasyApplyButton();
       if (easy) return easy;
       await S().sleep(400);
@@ -599,26 +780,29 @@
     return false;
   }
 
-  function detectApplySuccess() {
-    const path = window.location.pathname || "";
-    if (/\/post-apply/i.test(path) || /application-submitted/i.test(path)) return true;
-    const body = document.body?.innerText?.toLowerCase() || "";
-    return (
-      body.includes("application submitted") ||
-      body.includes("candidature envoyée") ||
-      body.includes("your application has been submitted") ||
-      body.includes("vous avez postulé") ||
-      body.includes("candidature a été envoyée") ||
-      body.includes("we have received your application") ||
-      body.includes("nous avons bien reçu") ||
-      body.includes("votre candidature a bien été") ||
-      !!S().$('[data-testid="apply-success"], .ia-BasePage-heading, [data-testid="post-apply"]')
-    );
-  }
-
   async function alreadyApplied(appliedJobs, jobId) {
     if (!jobId) return false;
     return !!(appliedJobs[jobId] || appliedJobs[`ind_${jobId}`]);
+  }
+
+  async function alreadyHandled(jobId) {
+    if (!jobId) return false;
+    const { appliedJobs = {}, skippedJobs = {}, errorJobs = {} } = await chrome.storage.local.get([
+      "appliedJobs",
+      "skippedJobs",
+      "errorJobs",
+    ]);
+    const keys = [jobId, `ind_${jobId}`];
+    // Do NOT treat seenJobIds as terminal — a failed open / interrupted viewjob must retry
+    return keys.some((k) => appliedJobs[k] || skippedJobs[k] || errorJobs[k]);
+  }
+
+  async function markSeenJob(jobId) {
+    if (!jobId) return;
+    const session = await getSession();
+    if (!session) return;
+    const seenJobIds = { ...(session.seenJobIds || {}), [jobId]: Date.now() };
+    await setSession({ seenJobIds });
   }
 
   async function shouldSkipCompany(company) {
@@ -653,7 +837,132 @@
     }
   }
 
+  function resumePageText() {
+    return (document.body?.innerText || "").replace(/\s+/g, " ");
+  }
+
+  /** Indeed CV service down → only file upload works ("Importer un CV"). */
+  function needsForcedCvUpload() {
+    const t = resumePageText();
+    if (
+      /Indeed CV est actuellement indisponible|Importer un CV|Types de fichiers acceptés|use an uploaded resume|Sélectionnez un fichier pour continuer|Select a file to continue/i.test(
+        t
+      )
+    ) {
+      return true;
+    }
+    // Upload button visible on resume step
+    const uploadBtn = [...S().$$("button, [role='button'], label")].some(
+      (b) => S().isVisible(b) && /S[ée]lectionner un fichier|Choose file|Upload (a )?resume/i.test(b.textContent || "")
+    );
+    return uploadBtn && !!S().$('input[type="file"]');
+  }
+
+  function resumeUploadErrorVisible() {
+    return /Sélectionnez un fichier pour continuer|Select a file to continue/i.test(resumePageText());
+  }
+
+  /** Indeed only advances when the uploaded filename is visible — input.files alone is a false positive. */
+  function resumeFileUiAccepted(cvName = "") {
+    if (resumeUploadErrorVisible()) {
+      window.__AmijobsResumeUploadedAt = 0;
+      return false;
+    }
+    const t = resumePageText();
+    const name = String(cvName || window.__AmijobsResumeFileName || "").trim();
+    const stem = name.replace(/\.[^.]+$/, "").slice(0, 40);
+    if (stem.length >= 5 && t.toLowerCase().includes(stem.toLowerCase())) return true;
+    if (name && t.toLowerCase().includes(name.toLowerCase())) return true;
+
+    // Explicit filename chip (not the radio card / help text)
+    const chip = [...S().$$("[data-testid], [class*='FileName'], [class*='fileName'], [class*='ia-File'], span, p")].find(
+      (el) => {
+        if (!S().isVisible(el)) return false;
+        const tx = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!/\.(pdf|docx?|rtf|txt)$/i.test(tx) || tx.length > 140) return false;
+        if (/Types de fichiers|acceptés|PDF,\s*DOC/i.test(tx)) return false;
+        const tid = `${el.getAttribute("data-testid") || ""} ${el.className || ""}`;
+        if (/radio|resume-selection-file-resume|card-group/i.test(tid)) return false;
+        return true;
+      }
+    );
+    return !!chip;
+  }
+
+  function resumeLooksReady() {
+    if (resumeUploadErrorVisible()) {
+      window.__AmijobsResumeUploadedAt = 0;
+      return false;
+    }
+
+    // Forced upload path (Indeed CV down): never trust radios or bare input.files
+    if (needsForcedCvUpload() || /resume-selection/i.test(smartApplyPath())) {
+      if (window.__AmijobsResumeUploadedAt && Date.now() - window.__AmijobsResumeUploadedAt < 120000) {
+        return resumeFileUiAccepted(window.__AmijobsResumeFileName || "");
+      }
+      return resumeFileUiAccepted(window.__AmijobsResumeFileName || "");
+    }
+
+    if (window.__AmijobsResumeUploadedAt && Date.now() - window.__AmijobsResumeUploadedAt < 120000) {
+      return true;
+    }
+
+    for (const input of S().$$('input[type="file"]')) {
+      if (input.files && input.files.length > 0) return true;
+    }
+
+    if (resumeFileUiAccepted()) return true;
+
+    const checked =
+      S().$('input[type="radio"][name*="resume"]:checked') ||
+      S().$('[data-testid*="resume"][aria-checked="true"]');
+    return !!checked;
+  }
+
+  function resumeOptionalWithoutCv() {
+    const t = resumePageText();
+    return /Postuler sans CV|Apply without (a )?resume|CV est facultatif|resume is optional/i.test(t);
+  }
+
   async function clickResumeIfNeeded() {
+    if (resumeLooksReady()) return true;
+
+    // Some Glassdoor→Indeed offers allow continue without a file
+    if (resumeOptionalWithoutCv() && !resumeUploadErrorVisible()) {
+      const opt =
+        S().$('[data-testid*="no-resume"], [data-testid*="without-resume"], [data-testid*="optional-resume"]') ||
+        [...S().$$("button, label, [role='button'], [role='radio']")].find((b) =>
+          S().isVisible(b) && /Postuler sans CV|Apply without (a )?resume|sans CV/i.test(b.textContent || "")
+        );
+      if (opt) {
+        await S().humanClick(opt);
+        await S().sleep(400);
+        window.__AmijobsResumeUploadedAt = Date.now();
+        window.__AmijobsResumeFileName = window.__AmijobsResumeFileName || "optional-no-cv";
+        S().log(PLATFORM, "CV facultatif — Postuler sans CV", "warn");
+        return true;
+      }
+      // Continuer alone is enough when Indeed says CV is optional and no validation error
+      if (!needsForcedCvUpload() || /CV est facultatif|resume is optional/i.test(resumePageText())) {
+        window.__AmijobsResumeUploadedAt = Date.now();
+        window.__AmijobsResumeFileName = "optional-no-cv";
+        return true;
+      }
+    }
+
+    // When Indeed CV is down, skip radios and upload AmiJobs CV immediately
+    if (needsForcedCvUpload()) {
+      const ok = await uploadCvFallback();
+      if (ok) return true;
+      const cv = await S().getCvFile();
+      if (!cv?.base64) {
+        S().log(PLATFORM, "CV fichier manquant (Options → CV) — upload requis", "error");
+      } else {
+        S().log(PLATFORM, "Échec upload CV sur resume-selection", "warn");
+      }
+      return false;
+    }
+
     // Live DOM: resume-selection-file-resume-radio-card (+ label/input)
     const label =
       S().$('[data-testid="resume-selection-file-resume-radio-card-label"]') ||
@@ -663,9 +972,9 @@
     if (label && S().isVisible(label)) {
       await S().humanClick(label);
       await S().sleep(400);
-      // v1.4.0: after selecting existing resume radio, also try uploading CV file
+      if (resumeLooksReady()) return true;
       await uploadCvFallback();
-      return true;
+      return resumeLooksReady();
     }
     const radio =
       S().$('[data-testid="resume-selection-file-resume-radio-card-input"]') ||
@@ -682,32 +991,171 @@
         /* ignore */
       }
       await S().sleep(400);
-      // v1.4.0: also try uploading CV file after radio selection
+      if (resumeLooksReady()) return true;
       await uploadCvFallback();
-      return true;
+      return resumeLooksReady();
     }
 
-    // v1.4.0: No radio/label — try uploading CV directly to a file input
     return await uploadCvFallback();
   }
 
-  // v1.4.0: Upload CV file to any file input on resume-selection step.
-  // File inputs are often display:none (hidden by design) but still
-  // accept programmatic file assignment via DataTransfer.
+  // Upload AmiJobs CV to hidden file inputs (Indeed FR "Sélectionner un fichier").
+  // DataTransfer alone is often ignored by React — CDP file-chooser is the reliable path.
   async function uploadCvFallback() {
-    const fileInputs = S().$$(
-      'input[type="file"][accept*="pdf"], input[type="file"][accept*="doc"], input[type="file"], [data-testid*="resume-upload"], [data-testid*="file-upload"]'
-    );
-    for (const input of fileInputs) {
-      // File inputs are intentionally hidden — don't use isVisible() here
-      const ok = await S().uploadCvToFileInput(input);
-      if (ok) {
-        S().log(PLATFORM, "CV importé (upload fichier)", "success");
-        await S().sleep(800);
-        return true;
+    // Never burn CDP on preload / contact / questions — file input only exists on resume-selection
+    const path = smartApplyPath();
+    if (path && !/resume-selection|resume\/|\/resume/i.test(path) && !resumeUploadErrorVisible()) {
+      return false;
+    }
+    const cv = await S().getCvFile();
+    if (!cv?.base64) return false;
+    window.__AmijobsResumeFileName = cv.name || "cv.pdf";
+
+    // Already accepted for this wizard — never re-download/upload the same CV in a loop
+    if (resumeFileUiAccepted(cv.name) && !resumeUploadErrorVisible()) {
+      window.__AmijobsResumeUploadedAt = Date.now();
+      return true;
+    }
+    const cdpTries = window.__AmijobsCvCdpTries || 0;
+    if (cdpTries >= 2 && resumeFileUiAccepted(cv.name)) {
+      S().log(PLATFORM, "CV déjà présent — skip re-upload", "warn");
+      return true;
+    }
+
+    // Indeed mounts the file input a beat after the resume step renders. Calling CDP
+    // before it exists always returned no_file_input and cost ~8s per job.
+    const hasFileInput = () => !!S().$('input[type="file"]');
+    if (!hasFileInput()) {
+      for (let i = 0; i < 8 && !hasFileInput(); i++) await S().sleep(400);
+      if (!hasFileInput()) return false;
+    }
+
+    const markAccepted = (label) => {
+      window.__AmijobsResumeUploadedAt = Date.now();
+      window.__AmijobsResumeFileName = cv.name || window.__AmijobsResumeFileName;
+      S().log(PLATFORM, label, "success");
+      return true;
+    };
+
+    // CDP first when Indeed CV is down — DataTransfer leaves a fake checkmark + red error
+    if (needsForcedCvUpload() || resumeUploadErrorVisible()) {
+      if (cdpTries >= 2) {
+        S().log(PLATFORM, "CDP CV déjà tenté 2× — pas de nouvel upload", "warn");
+        return resumeFileUiAccepted(cv.name);
+      }
+      window.__AmijobsCvCdpTries = cdpTries + 1;
+      try {
+        S().log(PLATFORM, "Upload CV via debugger (CDP)…", "warn");
+        const res = await chrome.runtime.sendMessage({ action: "uploadCvViaDebugger" });
+        S().log(
+          PLATFORM,
+          `CDP: ok=${!!res?.ok} accepted=${!!res?.accepted} name=${res?.hasName ? "yes" : "no"} err=${!!res?.stillError} chooser=${!!res?.viaChooser} reason=${res?.reason || "-"}`,
+          res?.accepted ? "success" : "warn"
+        );
+        if (res?.accepted || (res?.ok && !res?.stillError && res?.hasName)) {
+          for (let i = 0; i < 10; i++) {
+            if (resumeFileUiAccepted(cv.name)) return markAccepted(`CV importé CDP (${res.name || cv.name})`);
+            await S().sleep(400);
+          }
+          if (!resumeUploadErrorVisible() && res?.hasName) {
+            return markAccepted(`CV accepté CDP (${res.name || cv.name})`);
+          }
+        }
+      } catch (e) {
+        S().log(PLATFORM, `Upload CDP erreur: ${e?.message || e}`, "warn");
       }
     }
-    return false;
+
+    // Prefer real file inputs; some testids wrap a hidden input
+    const candidates = [
+      ...S().$$('input[type="file"]'),
+      ...S().$$('[data-testid*="resume-upload"], [data-testid*="file-upload"], [data-testid*="FileUpload"]'),
+    ];
+    const seen = new Set();
+    for (const node of candidates) {
+      const input =
+        node.tagName === "INPUT" && (node.getAttribute("type") || "").toLowerCase() === "file"
+          ? node
+          : node.querySelector?.('input[type="file"]');
+      if (!input || seen.has(input)) continue;
+      seen.add(input);
+      const ok = await S().uploadCvToFileInput(input);
+      if (ok) {
+        // Indeed renders the filename async — a single short check fell through to CDP
+        // and cost ~40s per job even though this upload had actually worked.
+        for (let i = 0; i < 12; i++) {
+          await S().sleep(400);
+          if (resumeFileUiAccepted(cv.name) && !resumeUploadErrorVisible()) {
+            return markAccepted(`CV importé (${cv.name || "fichier"})`);
+          }
+        }
+      }
+    }
+
+    // Drop onto upload zone (some Indeed UIs listen for drop, not change)
+    try {
+      const file = await cvToFile(cv);
+      if (file) {
+        const zones = [
+          ...S().$$("[data-testid*='upload'], [class*='Upload'], [class*='upload']"),
+          ...[...S().$$("button, [role='button']")].filter((b) =>
+            /^S[ée]lectionner un fichier|Choose (a )?file|Upload/i.test((b.textContent || "").replace(/\s+/g, " ").trim())
+          ),
+        ];
+        for (const zone of zones.slice(0, 4)) {
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          for (const type of ["dragenter", "dragover", "drop"]) {
+            zone.dispatchEvent(
+              new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt })
+            );
+          }
+          await S().sleep(700);
+          if (resumeFileUiAccepted(cv.name) && !resumeUploadErrorVisible()) {
+            return markAccepted(`CV déposé (${cv.name || "fichier"})`);
+          }
+        }
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+
+    // Final CDP attempt if not already tried / previous attempt failed UI check
+    if (!resumeFileUiAccepted(cv.name) && (window.__AmijobsCvCdpTries || 0) < 2) {
+      window.__AmijobsCvCdpTries = (window.__AmijobsCvCdpTries || 0) + 1;
+      try {
+        S().log(PLATFORM, "Upload CV via debugger (CDP) retry…", "warn");
+        const res = await chrome.runtime.sendMessage({ action: "uploadCvViaDebugger" });
+        S().log(
+          PLATFORM,
+          `CDP retry: ok=${!!res?.ok} accepted=${!!res?.accepted} err=${!!res?.stillError} reason=${res?.reason || "-"}`,
+          res?.accepted ? "success" : "warn"
+        );
+        for (let i = 0; i < 12; i++) {
+          if (resumeFileUiAccepted(cv.name)) return markAccepted(`CV importé CDP (${res?.name || cv.name})`);
+          await S().sleep(450);
+        }
+      } catch (e) {
+        S().log(PLATFORM, `Upload CDP erreur: ${e?.message || e}`, "warn");
+      }
+    }
+
+    return resumeFileUiAccepted(cv.name);
+  }
+
+  async function cvToFile(cv) {
+    if (!cv?.base64) return null;
+    try {
+      const bin = atob(cv.base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new File([bytes], cv.name || "cv.pdf", {
+        type: cv.mime || "application/pdf",
+        lastModified: Date.now(),
+      });
+    } catch (_e) {
+      return null;
+    }
   }
 
   async function fillRelevantExperienceStep() {
@@ -726,26 +1174,7 @@
     );
   }
 
-  function findVisibleContinueOrSubmit() {
-    // Prefer Indeed Smart Apply testids observed in live browser
-    const testIds = [
-      '[data-testid="continue-button"]',
-      '[data-testid^="hp-continue-button"]',
-      '[data-testid="resume-selection-continue-button"]',
-      '[data-testid="submit-application"]',
-      '[data-testid="submit-button"]',
-      '[data-testid="indeed-apply-submit"]',
-      'button[data-testid*="submit"]',
-    ];
-    for (const sel of testIds) {
-      for (const el of S().$$(sel)) {
-        if (!S().isVisible(el) || el.disabled) continue;
-        const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase();
-        if (/d[ée]poser|soumettre|submit|envoyer/.test(text)) return { el, kind: "submit" };
-        return { el, kind: "next" };
-      }
-    }
-
+  function findSubmitButton(includeDisabled = true) {
     const submitRe = [
       /d[ée]poser\s*(ma|votre)?\s*candidature/i,
       /submit (my )?application/i,
@@ -755,7 +1184,50 @@
       /^soumettre$/i,
       /finalize/i,
       /^d[ée]poser$/i,
+      /postuler maintenant/i,
+      /^apply now$/i,
     ];
+    const testIds = [
+      '[data-testid="submit-application"]',
+      '[data-testid="submit-button"]',
+      '[data-testid="indeed-apply-submit"]',
+      'button[data-testid*="submit"]',
+      'button[type="submit"]',
+    ];
+    for (const sel of testIds) {
+      for (const el of S().$$(sel)) {
+        if (!S().isVisible(el)) continue;
+        if (!includeDisabled && (el.disabled || el.getAttribute("aria-disabled") === "true")) continue;
+        return el;
+      }
+    }
+    for (const btn of S().$$("button, a[role='button'], input[type='submit'], [role='button']")) {
+      if (!S().isVisible(btn)) continue;
+      if (!includeDisabled && (btn.disabled || btn.getAttribute("aria-disabled") === "true")) continue;
+      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
+      if (!text || /signaler|fermer|close|exit|options de cv/i.test(text)) continue;
+      if (submitRe.some((p) => p.test(text))) return btn;
+    }
+    return null;
+  }
+
+  function findVisibleContinueOrSubmit() {
+    // Prefer Indeed Smart Apply testids observed in live browser
+    const submitEl = findSubmitButton(true);
+    if (submitEl) return { el: submitEl, kind: "submit" };
+
+    const testIds = [
+      '[data-testid="continue-button"]',
+      '[data-testid^="hp-continue-button"]',
+      '[data-testid="resume-selection-continue-button"]',
+    ];
+    for (const sel of testIds) {
+      for (const el of S().$$(sel)) {
+        if (!S().isVisible(el) || el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+        return { el, kind: "next" };
+      }
+    }
+
     const nextRe = [
       /^continue$/i,
       /^continuer$/i,
@@ -769,15 +1241,6 @@
     ];
 
     const buttons = S().$$("button, a[role='button'], input[type='submit'], [role='button']");
-    // Submit may stay "enabled" while captcha unchecked — still treat as submit
-    for (const btn of buttons) {
-      if (!S().isVisible(btn)) continue;
-      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
-      if (!text || /signaler|fermer|close|exit|options de cv/i.test(text)) continue;
-      // Never treat job-page "Continuer pour postuler" as Smart Apply wizard next
-      if (/continuer (pour |à )?postuler|continue (to )?apply/i.test(text)) continue;
-      if (submitRe.some((p) => p.test(text))) return { el: btn, kind: "submit" };
-    }
     for (const btn of buttons) {
       if (!S().isVisible(btn) || btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
       const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
@@ -785,55 +1248,321 @@
       if (/continuer (pour |à )?postuler|continue (to )?apply/i.test(text)) continue;
       if (nextRe.some((p) => p.test(text))) return { el: btn, kind: "next" };
     }
-
-    // Last resort on review: any purple primary with "candidature"
-    if (/review/i.test(smartApplyPath())) {
-      for (const btn of buttons) {
-        if (!S().isVisible(btn)) continue;
-        const text = (btn.textContent || "").replace(/\s+/g, " ").trim();
-        if (/candidature/i.test(text) && /d[ée]poser|soumettre|envoyer/i.test(text)) {
-          return { el: btn, kind: "submit" };
-        }
-      }
-    }
     return null;
+  }
+
+  function forceEnableClickable(el) {
+    if (!el) return;
+    try {
+      el.disabled = false;
+      el.removeAttribute("disabled");
+      el.removeAttribute("aria-disabled");
+      el.setAttribute("aria-disabled", "false");
+      if (el.style) el.style.pointerEvents = "auto";
+    } catch (_e) {}
   }
 
   async function answerFromCvOrAi(label, fieldType, el) {
     const profile = await S().getProfile();
     const fromProfile = String(profile.experience || "").match(/(\d+(?:[.,]\d+)?)/);
     const isExp =
-      /antiquit|anciennet[ée]|exp[eé]rience|seniority|années?|ans\b|years?\s*(of\s*)?exp|combien d['’]?ann/i.test(
+      /antiquit|anciennet[ée]|exp[eé]rience|seniority|années?|ans\b|years?\s*(of\s*)?exp|combien d['’]?ann|de combien/i.test(
         label
       ) || fieldType === "number";
-    if (isExp && fromProfile) {
-      return fieldType === "number" || /nombre|combien|ans\b|years?\b/i.test(label)
-        ? fromProfile[1]
-        : `${fromProfile[1]} ans`;
+    const forceNumber =
+      fieldType === "number" ||
+      (S().wantsNumericAnswer && S().wantsNumericAnswer(label, el)) ||
+      /nombre|combien|années?|year|ans\b|de combien/i.test(label || "");
+    // Credential yes/no from CV text first (before AI invents Oui)
+    if (fieldType === "radio" || /avez-vous|dipl[oô]me|certificat|infirmier|titulaire/i.test(label || "")) {
+      const yn = S().answerYesNoFromCv?.(label, profile.cvText || "", profile);
+      if (yn) return yn;
+    }
+    if (isExp && fromProfile && Number(fromProfile[1]) > 0) {
+      // Never return "1 an" — Indeed FR rejects non-numeric screening answers
+      return forceNumber
+        ? (S().coerceNumericAnswer ? S().coerceNumericAnswer(fromProfile[1], "3") : fromProfile[1].replace(/\D.*/, ""))
+        : fromProfile[1];
     }
     try {
       const res = await chrome.runtime.sendMessage({
         action: "generateAnswer",
         question: label,
-        fieldType: fieldType || (el?.type === "number" ? "number" : "text"),
+        fieldType: forceNumber ? "number" : fieldType || (el?.type === "number" ? "number" : "text"),
         options: [],
         jobInfo: { title: document.title || "", company: "" },
+        cvText: profile.cvText || "",
       });
-      const ans = String(res?.answer || "").trim();
+      let ans = String(res?.answer || "").trim();
+      if (forceNumber && ans) {
+        ans = S().coerceNumericAnswer ? S().coerceNumericAnswer(ans, "3") : (ans.match(/\d+/) || ["3"])[0];
+      }
       if (ans && !/^(oui|yes|we|n\/?a|na|none|null)\.?$/i.test(ans)) return ans;
-      if (isExp && fromProfile) return fromProfile[1];
+      if (isExp && fromProfile && Number(fromProfile[1]) > 0) {
+        return S().coerceNumericAnswer ? S().coerceNumericAnswer(fromProfile[1], "3") : fromProfile[1];
+      }
       if (isExp) return "3";
+      // Don't default bare Oui on credential questions
+      if (/avez-vous|dipl[oô]me|certificat|infirmier/i.test(label || "")) return "Non";
       return ans || "";
     } catch (_e) {
-      return isExp ? fromProfile?.[1] || "3" : "";
+      if (/avez-vous|dipl[oô]me|certificat|infirmier/i.test(label || "")) return "Non";
+      return isExp ? "3" : "";
     }
+  }
+
+  function isPlaceholderOptionText(text) {
+    const t = String(text || "").trim();
+    if (!t) return true;
+    return /sélectionn|selectionn|select(\s+an)?\s*option|choisir|veuillez|please select|^[-—–·•.\s]+$/i.test(t);
+  }
+
+  function selectLooksUnfilled(sel) {
+    if (!sel?.options?.length) return true;
+    const opt = sel.options[sel.selectedIndex];
+    const text = (opt?.label || opt?.text || opt?.textContent || "").trim();
+    const val = String(sel.value ?? "").trim();
+    if (isPlaceholderOptionText(text)) return true;
+    if (!val && sel.selectedIndex <= 0) return true;
+    return false;
+  }
+
+  function fieldLabelFor(el) {
+    if (!el) return "";
+    const byFor =
+      (el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`)?.textContent) || "";
+    const wrap = el.closest("label")?.textContent || "";
+    const aria = el.getAttribute("aria-label") || "";
+    const block = el.closest(
+      '[class*="question"], [data-testid*="question"], fieldset, .ia-Questions-item, [class*="Question"]'
+    );
+    // Prefer the visible question heading (Indeed screening modules)
+    const heading =
+      block?.querySelector?.("h1, h2, h3, legend, [data-testid*='label'], label")?.textContent || "";
+    const named = block?.querySelector?.("label, legend, [id*='label'], span")?.textContent || "";
+    const pageH1 = /questions|présélection|prescreen/i.test(document.title || "")
+      ? S().$("h1, h2")?.textContent || ""
+      : "";
+    return (heading || byFor || wrap || aria || named || pageH1 || el.getAttribute("name") || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function questionHasNumericError(el) {
+    const scope =
+      el?.closest?.('[class*="question"], [data-testid*="question"], fieldset, [class*="FormField"], label') ||
+      el?.parentElement;
+    const text = `${scope?.innerText || ""} ${el?.validationMessage || ""}`;
+    return /nombre valide|nombre entier|aucune décimale|doit être un nombre|numeric value|enter a number|decimal number|num[ée]ro d[ée]cimal/i.test(
+      text
+    );
+  }
+
+  async function fixNumericQuestionErrors() {
+    let fixed = 0;
+    for (const el of S().$$(
+      "input[type='text'], input[type='number'], input[type='tel'], input:not([type]), textarea"
+    )) {
+      if (!S().isVisible(el)) continue;
+      const label = fieldLabelFor(el);
+      const badVal = String(el.value || "").trim();
+      const needsFix =
+        questionHasNumericError(el) ||
+        (S().wantsNumericAnswer?.(label, el) && badVal && !/^\d+(\.\d+)?$/.test(badVal)) ||
+        (/\d+\s*ans?/i.test(badVal) &&
+          /exp[eé]rience|année|year|combien|anciennet|antiquit/i.test(label));
+      if (!needsFix) continue;
+      const num =
+        (S().coerceNumericAnswer && S().coerceNumericAnswer(badVal || (await S().getProfile()).experience || "3")) ||
+        (badVal.match(/\d+/) || ["3"])[0];
+      S().log(PLATFORM, `Correction nombre: "${badVal}" → "${num}" (${label.slice(0, 40)})`, "warn");
+      try {
+        el.focus();
+        S().setNativeValue(el, "");
+        await S().humanType(el, String(num));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+        fixed++;
+      } catch (_e) {
+        S().setNativeValue(el, String(num));
+        fixed++;
+      }
+      await S().sleep(200);
+    }
+    return fixed;
+  }
+
+  function pickSelectOptionText(options, label, profile, preferredAnswer = "") {
+    const opts = (options || []).map((o) => String(o || "").trim()).filter(Boolean);
+    const real = opts.filter((o) => !isPlaceholderOptionText(o));
+    if (!real.length) return opts[0] || "";
+    const want = String(preferredAnswer || "").trim();
+    const l = String(label || "").toLowerCase();
+    const edu = String(profile?.education || want || "").toLowerCase();
+
+    const tryMatch = (candidates) => {
+      for (const c of candidates) {
+        const hit = real.find((o) => o.toLowerCase() === c) || real.find((o) => o.toLowerCase().includes(c) || c.includes(o.toLowerCase()));
+        if (hit) return hit;
+      }
+      return null;
+    };
+
+    if (want) {
+      const exact = tryMatch([want.toLowerCase()]);
+      if (exact) return exact;
+    }
+
+    // Education / diplôme / niveau d'études — prefer Bac+5 / Master
+    if (/niveau|[ée]tudes|dipl[oô]me|education|degree|formation|scolaire/i.test(l) || /bac\+|master|licence|dipl[oô]me/i.test(edu)) {
+      const prefs = [];
+      if (/doctorat|phd/i.test(edu)) prefs.push("doctorat", "phd", "bac+8");
+      if (/bac\s*\+?\s*5|master|ingénieur|ingenieur|mba/i.test(edu)) prefs.push("bac +5", "bac+5", "master", "ingénieur", "ingenieur");
+      if (/bac\s*\+?\s*4|maîtrise|maitrise/i.test(edu)) prefs.push("bac +4", "bac+4", "maîtrise", "maitrise");
+      if (/bac\s*\+?\s*3|licence|bachelor/i.test(edu)) prefs.push("bac +3", "bac+3", "licence", "bachelor");
+      if (/bac\s*\+?\s*2|bts|dut|deug/i.test(edu)) prefs.push("bac +2", "bac+2", "bts", "dut");
+      if (/bac(?!\s*\+)/i.test(edu)) prefs.push("baccalauréat", "baccalaureat", "bac");
+      if (!prefs.length) prefs.push("bac +5", "bac+5", "master", "bac +4", "bac +3", "licence", "bac +2");
+      const eduHit = tryMatch(prefs);
+      if (eduHit) return eduHit;
+      // Prefer highest common degree among options
+      const rank = (o) => {
+        const t = o.toLowerCase();
+        if (/doctorat|phd|bac\s*\+?\s*8/.test(t)) return 80;
+        if (/bac\s*\+?\s*5|master|ingénieur|ingenieur|mba/.test(t)) return 50;
+        if (/bac\s*\+?\s*4|maîtrise|maitrise/.test(t)) return 40;
+        if (/bac\s*\+?\s*3|licence|bachelor/.test(t)) return 30;
+        if (/bac\s*\+?\s*2|bts|dut/.test(t)) return 20;
+        if (/baccalauréat|baccalaureat|\bbac\b/.test(t)) return 10;
+        return 0;
+      };
+      const ranked = [...real].sort((a, b) => rank(b) - rank(a));
+      if (rank(ranked[0]) > 0) return ranked[0];
+    }
+
+    if (/antiquit|anciennet|exp[eé]rience|années|seniority|ans\b/i.test(l) && want) {
+      const n = want.match(/(\d+)/)?.[1];
+      if (n) {
+        const hit =
+          real.find((o) => new RegExp(`\\b${n}\\b`).test(o)) ||
+          real.find((o) => o.includes(n));
+        if (hit) return hit;
+      }
+    }
+
+    return real[0];
+  }
+
+  function applyNativeSelectValue(sel, optionText) {
+    if (!sel || !optionText) return false;
+    const opt = [...sel.options].find((o) => (o.text || o.label || "").trim() === optionText);
+    if (!opt) return false;
+    try {
+      const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+      if (desc?.set) desc.set.call(sel, opt.value);
+      else sel.value = opt.value;
+    } catch (_e) {
+      sel.value = opt.value;
+    }
+    opt.selected = true;
+    sel.selectedIndex = opt.index;
+    sel.dispatchEvent(new Event("input", { bubbles: true }));
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return !selectLooksUnfilled(sel);
+  }
+
+  async function fillComboboxTriggers(profile) {
+    const triggers = S().$$(
+      'button[role="combobox"], [role="combobox"]:not(select), [aria-haspopup="listbox"]'
+    );
+    for (const trigger of triggers) {
+      if (!S().isVisible(trigger)) continue;
+      const current = (trigger.textContent || trigger.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      if (current && !isPlaceholderOptionText(current) && trigger.getAttribute("aria-expanded") !== "true") {
+        // Already shows a real value
+        if (!/sélectionn|select an option|choisir/i.test(current)) continue;
+      }
+      const label = fieldLabelFor(trigger) || current;
+      await S().humanClick(trigger);
+      await S().sleep(350);
+      let listbox =
+        document.querySelector(`[role="listbox"][id="${trigger.getAttribute("aria-controls") || ""}"]`) ||
+        document.querySelector('[role="listbox"]');
+      for (let wait = 0; wait < 8 && !listbox; wait++) {
+        await S().sleep(120);
+        listbox = document.querySelector('[role="listbox"]');
+      }
+      const optionEls = listbox
+        ? [...listbox.querySelectorAll('[role="option"], li, [data-value]')]
+        : [...document.querySelectorAll('[role="option"]')].filter(S().isVisible);
+      const optionTexts = optionEls.map((o) => (o.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+      let preferred = "";
+      if (/niveau|[ée]tudes|dipl[oô]me|education|degree/i.test(label)) {
+        preferred = profile.education || "Bac+5";
+      } else if (/antiquit|anciennet|exp[eé]rience|années|seniority/i.test(label)) {
+        preferred = await answerFromCvOrAi(label, "select", trigger);
+      } else {
+        preferred = (await answerFromCvOrAi(label, "select", trigger)) || "";
+      }
+      const picked = pickSelectOptionText(optionTexts, label, profile, preferred);
+      const target =
+        optionEls.find((o) => (o.textContent || "").replace(/\s+/g, " ").trim() === picked) ||
+        optionEls.find((o) => !isPlaceholderOptionText((o.textContent || "").trim()));
+      if (target) {
+        await S().humanClick(target);
+        S().log(PLATFORM, `Liste: "${label.slice(0, 48)}" → ${picked}`, "info");
+      } else {
+        // Escape closed empty list
+        try {
+          trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        } catch (_e) {}
+      }
+      await S().sleep(180);
+    }
+  }
+
+  function hasUnfilledRequiredQuestions() {
+    for (const sel of S().$$("select")) {
+      if (selectLooksUnfilled(sel)) {
+        const req =
+          sel.required ||
+          sel.getAttribute("aria-required") === "true" ||
+          /\*/.test(fieldLabelFor(sel)) ||
+          !!sel.closest('[class*="error"], [aria-invalid="true"]') ||
+          /sélectionn/i.test(
+            sel.closest('[class*="question"], fieldset, .ia-Questions-item')?.textContent || ""
+          );
+        if (req || selectLooksUnfilled(sel)) return true;
+      }
+    }
+    for (const trigger of S().$$('button[role="combobox"], [role="combobox"]:not(select)')) {
+      if (!S().isVisible(trigger)) continue;
+      const t = (trigger.textContent || "").replace(/\s+/g, " ").trim();
+      if (isPlaceholderOptionText(t) || /sélectionn|select an option/i.test(t)) return true;
+    }
+    // Visible validation errors (incl. numeric screening)
+    const err = [...document.querySelectorAll('[class*="error"], [role="alert"], [aria-invalid="true"]')].some(
+      (el) =>
+        S().isVisible(el) &&
+        /sélectionn|select|obligatoire|required|continuer|nombre valide|nombre entier|aucune décimale|doit être un nombre|numeric/i.test(
+          el.textContent || ""
+        )
+    );
+    if (err) return true;
+    for (const el of S().$$("input[type='text'], input[type='number'], input:not([type])")) {
+      if (!S().isVisible(el)) continue;
+      if (questionHasNumericError(el)) return true;
+      const v = String(el.value || "").trim();
+      if (/\d+\s*ans?/i.test(v) && /exp[eé]rience|année|combien/i.test(fieldLabelFor(el))) return true;
+    }
+    return false;
   }
 
   async function fillQuestionsStep() {
     const profile = await S().getProfile();
 
-    // Radios: prefer Oui / Yes / first option
+    // Radios: CV-aware Oui/Non — never invent diplômes (e.g. infirmier)
     const radioNames = new Set();
+    const cvText = profile.cvText || "";
     for (const radio of S().$$('input[type="radio"]')) {
       if (!S().isVisible(radio) || !radio.name || radioNames.has(radio.name)) continue;
       radioNames.add(radio.name);
@@ -841,13 +1570,38 @@
         S().isVisible(r)
       );
       if (!group.length || group.some((r) => r.checked)) continue;
-      const preferred =
-        group.find((r) => /oui|yes|true|available|disponible/i.test(r.value || r.id || "")) ||
-        group.find((r) => {
-          const lab = document.querySelector(`label[for="${r.id}"]`);
-          return /oui|yes|disponible/i.test(lab?.textContent || "");
-        }) ||
-        group[0];
+      const qText =
+        fieldLabelFor(radio) ||
+        radio.closest('[class*="question"], [data-testid*="question"], fieldset, .ia-Questions-item')
+          ?.innerText ||
+        "";
+      const yn =
+        (S().answerYesNoFromCv && S().answerYesNoFromCv(qText, cvText, profile)) ||
+        (await answerFromCvOrAi(qText, "radio", radio));
+      const wantOui = /^(oui|yes|true|1)$/i.test(String(yn || "").trim());
+      const wantNon = /^(non|no|false|0)$/i.test(String(yn || "").trim());
+      const labelOf = (r) =>
+        `${r.value || ""} ${r.id || ""} ${document.querySelector(`label[for="${r.id}"]`)?.textContent || ""} ${r.closest("label")?.textContent || ""}`;
+      let preferred = null;
+      if (wantNon) {
+        preferred =
+          group.find((r) => /non|no|false|0/i.test(labelOf(r))) ||
+          group.find((r) => !/oui|yes|true/i.test(labelOf(r)));
+      } else if (wantOui) {
+        preferred = group.find((r) => /oui|yes|true|1/i.test(labelOf(r)));
+      }
+      // Soft questions (disponibilité) → Oui; credential unknown → Non
+      if (!preferred) {
+        const isCred = /dipl[oô]me|certificat|infirmier|permis|habilitation|titulaire|avez-vous/i.test(qText);
+        preferred = isCred
+          ? group.find((r) => /non|no/i.test(labelOf(r))) || group[group.length - 1]
+          : group.find((r) => /oui|yes|disponible/i.test(labelOf(r))) || group[0];
+      }
+      S().log(
+        PLATFORM,
+        `Radio: "${String(qText).slice(0, 50)}" → ${wantNon ? "Non" : wantOui ? "Oui" : preferred?.value || "?"}`,
+        "info"
+      );
       try {
         preferred.click();
       } catch (_e) {
@@ -876,53 +1630,62 @@
       }
     }
 
-    // Selects: AI when label is experience-like, else first non-empty
+    // Native <select> — also fill visually-hidden selects (Indeed custom UI often keeps them in DOM)
     for (const sel of S().$$("select")) {
-      if (!S().isVisible(sel) || sel.value) continue;
-      const label = (
-        (sel.id && document.querySelector(`label[for="${sel.id}"]`)?.textContent) ||
-        sel.getAttribute("aria-label") ||
-        ""
-      ).trim();
-      const options = [...sel.options].map((o) => o.text.trim()).filter(Boolean);
-      let picked = null;
-      if (/antiquit|anciennet|exp[eé]rience|années|seniority/i.test(label)) {
-        const ans = await answerFromCvOrAi(label, "select", sel);
-        picked = options.find((o) => o.toLowerCase() === String(ans).toLowerCase()) ||
-          options.find(
-            (o) =>
-              o.toLowerCase().includes(String(ans).toLowerCase()) ||
-              String(ans).toLowerCase().includes(o.toLowerCase())
-          );
+      if (!selectLooksUnfilled(sel)) continue;
+      // Skip truly detached / display:none without a sibling combobox UI
+      const style = window.getComputedStyle(sel);
+      const hiddenHard = style.display === "none" && !sel.closest('[class*="question"], form, [role="form"]');
+      if (hiddenHard) continue;
+      const label = fieldLabelFor(sel);
+      const options = [...sel.options].map((o) => (o.text || o.label || "").trim()).filter(Boolean);
+      let preferred = "";
+      if (/niveau|[ée]tudes|dipl[oô]me|education|degree|formation/i.test(label)) {
+        preferred = profile.education || "Bac+5";
+      } else if (/antiquit|anciennet|exp[eé]rience|années|seniority/i.test(label)) {
+        preferred = await answerFromCvOrAi(label, "select", sel);
+      } else {
+        preferred = (await answerFromCvOrAi(label || "question", "select", sel)) || "";
       }
-      if (!picked) {
-        picked = options.find((o) => o && !/select|choisir|—|--/i.test(o));
-      }
-      if (picked) {
-        const opt = [...sel.options].find((o) => o.text.trim() === picked);
-        if (opt) {
-          sel.value = opt.value;
-          sel.dispatchEvent(new Event("input", { bubbles: true }));
+      const picked = pickSelectOptionText(options, label, profile, preferred);
+      if (picked && applyNativeSelectValue(sel, picked)) {
+        S().log(PLATFORM, `Select: "${label.slice(0, 48)}" → ${picked}`, "info");
+      } else if (picked) {
+        // Retry via selectedIndex
+        const idx = options.findIndex((o) => o === picked);
+        if (idx >= 0) {
+          sel.selectedIndex = idx;
           sel.dispatchEvent(new Event("change", { bubbles: true }));
+          S().log(PLATFORM, `Select(idx): "${label.slice(0, 48)}" → ${picked}`, "info");
         }
       }
       await S().sleep(100);
     }
+
+    // Custom listbox / combobox (Indeed Smart Apply design system)
+    await fillComboboxTriggers(profile);
 
     // Text / number / date / textarea — use CV/AI for experience / antiquity
     for (const el of S().$$(
       "textarea, input[type='text'], input[type='number'], input[type='date'], input[type='tel'], input:not([type])"
     )) {
       if (!S().isVisible(el)) continue;
-      if (el.value && String(el.value).trim()) continue;
-      const label = (
-        (el.id && document.querySelector(`label[for="${el.id}"]`)?.textContent) ||
-        el.getAttribute("aria-label") ||
-        el.getAttribute("placeholder") ||
-        el.id ||
-        ""
-      ).toLowerCase();
+      const curVal = String(el.value || "").trim();
+      const labelRaw = fieldLabelFor(el) || el.getAttribute("placeholder") || el.id || "";
+      const label = labelRaw.toLowerCase();
       const hint = `${label} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase();
+      const numericQ =
+        el.type === "number" ||
+        S().wantsNumericAnswer?.(labelRaw, el) ||
+        questionHasNumericError(el) ||
+        /de combien|combien d['’]?ann|années?\s*d['’]?exp|years?\s*(of\s*)?exp/i.test(label);
+      // Re-fill when value is invalid prose like "1 an"
+      if (curVal && !(numericQ && (!/^\d+(\.\d+)?$/.test(curVal) || questionHasNumericError(el)))) {
+        continue;
+      }
+      if (numericQ && curVal) {
+        S().setNativeValue(el, "");
+      }
 
       if (S().isDateFieldHint?.(hint, el) || el.type === "date" || /date|naissance|birth|dob|jj\/mm|dd\/mm|xx\/xx|disponib|démarrage|début|debut/i.test(hint)) {
         const dateVal = S().formatDateAnswer?.(profile, el, hint) || "01/09/2026";
@@ -936,66 +1699,101 @@
       } else if (/rythme|alternance.*(école|ecole|entreprise)|jours?\s*(école|ecole)/i.test(label)) {
         await S().humanType(el, "2 jours école / 3 jours entreprise");
       } else if (
-        /antiquit|anciennet[ée]|exp[eé]rience|seniority|année|year|ans\b|poste|previous|précédent/i.test(label) ||
-        el.type === "number"
+        numericQ ||
+        /antiquit|anciennet[ée]|exp[eé]rience|seniority|année|year|ans\b|poste|previous|précédent/i.test(label)
       ) {
-        let answer = await answerFromCvOrAi(label || "années d'expérience", el.type === "number" ? "number" : "text", el);
-        if (el.type === "number") {
-          const num = String(answer).match(/\d+/);
-          answer = num ? num[0] : "3";
-        }
-        if (!answer || /^(oui|yes|we)\.?$/i.test(answer)) {
-          const n = String(profile.experience || "").match(/(\d+)/);
-          answer = el.type === "number" ? n?.[1] || "3" : n ? `${n[1]} ans` : "3 ans";
-        }
+        let answer = await answerFromCvOrAi(labelRaw || "années d'expérience", "number", el);
+        answer = S().coerceNumericAnswer ? S().coerceNumericAnswer(answer, "3") : (String(answer).match(/\d+/) || ["3"])[0];
         await S().humanType(el, answer);
+        S().log(PLATFORM, `Expérience (nombre): ${answer}`, "info");
       } else if (/salaire|salary|prétention|compensation/i.test(label)) {
-        await S().humanType(el, profile.salaryExpectation || "45000");
+        const sal = S().coerceNumericAnswer
+          ? S().coerceNumericAnswer(profile.salaryExpectation || "45000", "45000")
+          : String(profile.salaryExpectation || "45000").replace(/\D/g, "") || "45000";
+        await S().humanType(el, sal);
       } else if (/phone|téléphone|tel/i.test(label)) {
         await S().humanType(el, profile.phone || "0612345678");
       } else {
-        const ai = await answerFromCvOrAi(label || "question candidature", "text", el);
+        const ai = await answerFromCvOrAi(labelRaw || "question candidature", "text", el);
         await S().humanType(el, ai && !/^(we)\.?$/i.test(ai) ? ai : "Oui");
       }
       await S().sleep(120);
     }
+    await fixNumericQuestionErrors();
   }
 
-  async function waitAndSolveRecaptcha(maxMs = 90000) {
+  function recaptchaExpiredUi() {
+    if (typeof window.__AmijobsRecaptchaExpired === "function") {
+      try {
+        return !!window.__AmijobsRecaptchaExpired();
+      } catch (_e) {}
+    }
+    const t = document.body?.innerText || "";
+    return /test de validation a expir[ée]|validation a expir[ée]|expir[ée].*case|verification expired/i.test(t);
+  }
+
+  function hasFreshRecaptchaToken() {
+    if (recaptchaExpiredUi()) return false;
+    if (typeof window.__AmijobsHasFreshRecaptchaToken === "function") {
+      try {
+        return !!window.__AmijobsHasFreshRecaptchaToken();
+      } catch (_e) {}
+    }
+    const token = String(
+      window.__AmijobsRecaptchaToken ||
+        document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
+        ""
+    );
+    return token.length > 40;
+  }
+
+  async function waitAndSolveRecaptcha(maxMs = 240000) {
     const start = Date.now();
     const hasWidget = () =>
       !!document.querySelector(
         'iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey], textarea[name="g-recaptcha-response"]'
-      ) || /je ne suis pas un robot|i'?m not a robot/i.test(document.body?.innerText || "");
+      ) || /je ne suis pas un robot|i'?m not a robot|test de validation/i.test(document.body?.innerText || "");
 
     if (!hasWidget()) return true;
 
-    const readToken = () =>
-      String(
-        window.__AmijobsRecaptchaToken ||
-          document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
-          ""
-      );
-
-    if (readToken().length > 40) {
-      // Re-apply MAIN-world patch (Indeed may remount the widget)
+    // Stale / expired token from an earlier wizard step → discard and re-solve
+    if (recaptchaExpiredUi() || !hasFreshRecaptchaToken()) {
       try {
-        if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
-          window.__AmijobsInjectRecaptchaToken(readToken());
+        if (typeof window.__AmijobsClearRecaptcha === "function") {
+          window.__AmijobsClearRecaptcha(recaptchaExpiredUi() ? "expired_ui" : "stale");
         }
       } catch (_e) {}
+    } else {
+      // Fresh token already present — re-patch MAIN world and submit ASAP
+      try {
+        const tok = window.__AmijobsRecaptchaToken || "";
+        if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
+          window.__AmijobsInjectRecaptchaToken(tok);
+        }
+      } catch (_e) {}
+      if (!window.__AmijobsRecaptchaFreshLogged) {
+        window.__AmijobsRecaptchaFreshLogged = true;
+        S().log(PLATFORM, "reCAPTCHA token frais — dépôt candidature", "success");
+      }
       return true;
     }
 
-    S().log(PLATFORM, "reCAPTCHA détecté — résolution 2captcha…", "warn");
+    S().log(PLATFORM, "reCAPTCHA détecté — résolution 2captcha (frais)…", "warn");
     let loggedOk = false;
+    let tick = 0;
     while (Date.now() - start < maxMs) {
       if (shouldStop) return false;
-      const token = readToken();
-      if (token.length > 40) {
+      if (recaptchaExpiredUi()) {
         try {
-          if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
-            window.__AmijobsInjectRecaptchaToken(token);
+          if (typeof window.__AmijobsClearRecaptcha === "function") window.__AmijobsClearRecaptcha("expired_loop");
+        } catch (_e) {}
+        S().log(PLATFORM, "reCAPTCHA expiré — nouveau solve 2captcha…", "warn");
+      }
+      if (hasFreshRecaptchaToken()) {
+        try {
+          const tok = window.__AmijobsRecaptchaToken || "";
+          if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
+            window.__AmijobsInjectRecaptchaToken(tok);
           }
         } catch (_e) {}
         if (!loggedOk) {
@@ -1004,40 +1802,102 @@
         }
         return true;
       }
+      // Keep wizard busy + lock fresh during long 2captcha polls (often 2–5 min)
+      if (tick % 4 === 0) {
+        try {
+          await chrome.storage.local.set({
+            indeedWizardBusy: {
+              at: Date.now(),
+              path: smartApplyPath(),
+              title: window.__AmijobsCurrentJobTitle || "",
+            },
+          });
+          await chrome.runtime.sendMessage({
+            action: "acquireSmartApplyLock",
+            owner: "indeed",
+            handoff: !!window.__AmijobsWizardIsHandoff,
+          });
+        } catch (_e) {}
+      }
+      tick += 1;
       try {
+        // Never click the checkbox after/during inject — it resets Indeed's widget to "expiré"
         if (typeof window.__AmijobsSolveRecaptcha === "function") {
           const ok = await window.__AmijobsSolveRecaptcha(true);
           if (!ok) S().log(PLATFORM, "2captcha en cours / échec partiel…", "warn");
         } else {
           await chrome.runtime.sendMessage({ action: "solveRecaptchaNow" }).catch(() => {});
         }
-        if (typeof window.__AmijobsClickRecaptcha === "function") window.__AmijobsClickRecaptcha();
       } catch (_e) {}
-      await S().sleep(4000);
+      await S().sleep(2500);
     }
     S().log(PLATFORM, "reCAPTCHA non résolu à temps", "warn");
-    return readToken().length > 40;
+    return hasFreshRecaptchaToken();
   }
 
   async function runApplyWizard(jobInfo, settings) {
+    if (!isTopAutomationFrame()) {
+      return { success: false, reason: "iframe_skip" };
+    }
+    if (isLoginWallPage()) {
+      S().log(PLATFORM, "Indeed demande une reconnexion — offre abandonnée", "error");
+      await chrome.runtime
+        .sendMessage({ action: "indeedLoginWall", url: window.location.href })
+        .catch(() => {});
+      return { success: false, reason: "login_wall" };
+    }
     if (!isSmartApplyPage()) {
       S().log(PLATFORM, "Wizard ignoré (pas une page Smart Apply)", "warn");
       return { success: false, reason: "not_smartapply" };
     }
     S().log(PLATFORM, `Assistant Smart Apply — ${smartApplyPath()}`);
-    for (let step = 0; step < 60; step++) {
+    window.__AmijobsCvCdpTries = 0;
+    window.__AmijobsCurrentJobTitle = jobInfo?.title || "";
+    try {
+      const { sessionIndeed: sOwner = null, sessionGlassdoor: sGd = null } =
+        await chrome.storage.local.get(["sessionIndeed", "sessionGlassdoor"]);
+      // Dual mode: Indeed's own session stays active, so fromGlassdoor is often false —
+      // still treat Glassdoor awaitingIndeed as a handoff for lock heartbeats.
+      window.__AmijobsWizardIsHandoff = !!(sOwner?.fromGlassdoor || sGd?.awaitingIndeed);
+    } catch (_e) {
+      window.__AmijobsWizardIsHandoff = false;
+    }
+    try {
+      await chrome.storage.local.set({
+        indeedWizardBusy: { at: Date.now(), path: smartApplyPath(), title: jobInfo?.title || "" },
+      });
+    } catch (_e) {}
+    let resumeContinueClicks = 0;
+    let resumeUploadAttempts = 0;
+    let incompleteQuestionsTries = 0;
+    try {
+    for (let step = 0; step < 80; step++) {
       if (shouldStop) return { success: false, reason: "stopped" };
       if (detectApplySuccess()) return { success: true };
 
-      // reCAPTCHA / Turnstile on Smart Apply
+      // Keep busy flag + Smart Apply lock fresh so Glassdoor doesn't steal mid-wizard
+      if (step % 5 === 0) {
+        try {
+          await chrome.storage.local.set({
+            indeedWizardBusy: { at: Date.now(), path: smartApplyPath(), title: jobInfo?.title || "" },
+          });
+          await chrome.runtime.sendMessage({
+            action: "acquireSmartApplyLock",
+            owner: "indeed",
+            handoff: !!window.__AmijobsWizardIsHandoff,
+          });
+        } catch (_e) {}
+      }
+
+      // reCAPTCHA only on review — don't burn 2captcha on every wizard step
       try {
-        if (typeof window.__AmijobsClickRecaptcha === "function") window.__AmijobsClickRecaptcha();
-        if (typeof window.__AmijobsSolveRecaptcha === "function") window.__AmijobsSolveRecaptcha();
         if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
         if (typeof window.__AmijobsSolveTurnstile === "function") window.__AmijobsSolveTurnstile();
       } catch (_e) {}
 
       const path = smartApplyPath();
+      // Do NOT click / pre-solve reCAPTCHA here — early tokens expire before submit
+      // ("Le test de validation a expiré"). waitAndSolveRecaptcha handles it below.
       // Wait for review preview loader (live test: "Préparation de l'aperçu")
       const loader = S().$('[data-testid="loading-indicator"]');
       if (loader && S().isVisible(loader)) {
@@ -1049,36 +1909,188 @@
         await fillProfileLocationStep();
       }
       if (/resume-selection/i.test(path)) {
-        await clickResumeIfNeeded();
+        const cvMeta = await S().getCvFile();
+        if (cvMeta?.name) window.__AmijobsResumeFileName = cvMeta.name;
+        const ready = await clickResumeIfNeeded();
+        if (!ready || !resumeFileUiAccepted(cvMeta?.name || "")) {
+          if (!cvMeta?.base64) {
+            S().log(PLATFORM, "Skip — aucun CV fichier dans Options (Indeed CV indisponible)", "error");
+            return { success: false, reason: "no_cv_file" };
+          }
+          resumeUploadAttempts += 1;
+          if (resumeUploadAttempts > 10) {
+            S().log(PLATFORM, "Upload CV impossible après plusieurs essais — abandon offre", "error");
+            return { success: false, reason: "resume_upload_failed" };
+          }
+          // Don't spam Continuer — Indeed shows "Sélectionnez un fichier pour continuer"
+          S().log(PLATFORM, `Attente upload CV (essai ${resumeUploadAttempts}) — pas de Continuer`, "warn");
+          await uploadCvFallback();
+          await S().sleep(1500);
+          continue;
+        }
+        // Indeed FR continue after picking/uploading resume — only if UI shows filename
+        if (resumeUploadErrorVisible() || !resumeFileUiAccepted(cvMeta?.name || "")) {
+          S().log(PLATFORM, "CV pas encore accepté par Indeed — skip Continuer", "warn");
+          await S().sleep(1000);
+          continue;
+        }
+        const cont =
+          S().$('[data-testid="resume-selection-continue-button"]') ||
+          S().$('[data-testid="continue-button"]') ||
+          [...S().$$("button")].find((b) => /^continuer$/i.test((b.textContent || "").trim()));
+        if (cont && S().isVisible(cont) && !cont.disabled) {
+          if (resumeContinueClicks >= 6) {
+            S().log(PLATFORM, "Resume-selection bloqué après plusieurs Continuer — abandon offre", "error");
+            return { success: false, reason: "resume_stuck" };
+          }
+          resumeContinueClicks += 1;
+          const before = smartApplyPath();
+          S().log(PLATFORM, `Clic Continuer (CV) #${resumeContinueClicks}`);
+          await S().humanClick(cont);
+          await S().sleep(2200);
+          // If validation error / still on same step, force re-upload next loop
+          if (/resume-selection/i.test(smartApplyPath())) {
+            if (resumeUploadErrorVisible() || !resumeFileUiAccepted(cvMeta?.name || "")) {
+              S().log(PLATFORM, "Toujours sur CV après Continuer — re-upload CDP", "warn");
+              window.__AmijobsResumeUploadedAt = 0;
+              await uploadCvFallback();
+            } else if (smartApplyPath() === before) {
+              // Filename visible but step stuck — click Continuer again, do NOT re-download CV
+              S().log(PLATFORM, "CV accepté mais étape inchangée — nouvel essai Continuer (sans re-upload)", "warn");
+            }
+          } else {
+            resumeContinueClicks = 0;
+            resumeUploadAttempts = 0;
+            window.__AmijobsCvCdpTries = 0;
+          }
+          continue;
+        }
+      } else {
+        resumeContinueClicks = 0;
       }
       if (/relevant-experience/i.test(path)) {
         await fillRelevantExperienceStep();
       }
       if (/questions/i.test(path)) {
         await fillQuestionsStep();
+        if (hasUnfilledRequiredQuestions()) {
+          incompleteQuestionsTries += 1;
+          S().log(PLATFORM, "Questions incomplètes — correction (nombre/select)", "warn");
+          await fixNumericQuestionErrors();
+          await fillQuestionsStep();
+          await S().sleep(700);
+          if (hasUnfilledRequiredQuestions()) {
+            await fixNumericQuestionErrors();
+            await S().sleep(900);
+            if (incompleteQuestionsTries >= 8) {
+              S().log(
+                PLATFORM,
+                "Questions bloquées après plusieurs essais — offre ignorée",
+                "error"
+              );
+              return { success: false, reason: "questions_stuck" };
+            }
+            continue;
+          }
+        } else {
+          incompleteQuestionsTries = 0;
+        }
       } else {
         await S().fillVisibleFields(jobInfo, PLATFORM);
+        await fixNumericQuestionErrors();
       }
 
-      // Review step often shows reCAPTCHA before "Déposer ma candidature"
-      if (/review/i.test(path)) {
-        await waitAndSolveRecaptcha(90000);
-      }
-
-      let action = findVisibleContinueOrSubmit();
-      // Review: force-find Déposer even if testids differ
-      if (!action && /review/i.test(path)) {
-        for (const el of S().$$("button, [role='button']")) {
-          const t = (el.textContent || "").replace(/\s+/g, " ").trim();
-          if (/d[ée]poser\s*(ma|votre)?\s*candidature/i.test(t) && S().isVisible(el)) {
-            action = { el, kind: "submit" };
+      // Review / captcha step: solve FRESH then force-submit (button often stays aria-disabled)
+      const onReviewLike =
+        /review/i.test(path) ||
+        (!!document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, textarea[name="g-recaptcha-response"]') &&
+          !!findSubmitButton(true));
+      if (onReviewLike) {
+        for (let captchaTry = 0; captchaTry < 3; captchaTry++) {
+          const ok = await waitAndSolveRecaptcha(150000);
+          if (!ok) break;
+          const submitBtn = findSubmitButton(true);
+          if (!submitBtn || settings.autoSubmit === false) {
+            if (!submitBtn) {
+              S().log(
+                PLATFORM,
+                `Bouton Déposer introuvable (path=${smartApplyPath()}) — boutons: ${[...S().$$("button")]
+                  .filter((b) => S().isVisible(b))
+                  .map((b) => (b.textContent || "").trim().slice(0, 28))
+                  .slice(0, 6)
+                  .join(" | ")}`,
+                "warn"
+              );
+            }
+            break;
+          }
+          try {
+            const tok = window.__AmijobsRecaptchaToken || "";
+            if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
+              window.__AmijobsInjectRecaptchaToken(tok);
+            }
+          } catch (_e) {}
+          // Re-check expiry right before click (token can die while waiting)
+          if (recaptchaExpiredUi() || !hasFreshRecaptchaToken()) {
+            S().log(PLATFORM, `reCAPTCHA expiré avant submit — retry ${captchaTry + 1}/3`, "warn");
+            try {
+              if (typeof window.__AmijobsClearRecaptcha === "function") window.__AmijobsClearRecaptcha("pre_submit");
+            } catch (_e2) {}
+            continue;
+          }
+          S().log(PLATFORM, `Clic submit: ${(submitBtn.textContent || "").trim().slice(0, 40)}`);
+          forceEnableClickable(submitBtn);
+          await S().humanClick(submitBtn);
+          // Native click fallback if humanClick ignored disabled styling
+          try {
+            submitBtn.click();
+          } catch (_e) {}
+          await S().sleep(2000);
+          for (let i = 0; i < 12; i++) {
+            if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
+            if (recaptchaExpiredUi()) {
+              S().log(PLATFORM, "reCAPTCHA expiré après submit — nouveau token", "warn");
+              try {
+                if (typeof window.__AmijobsClearRecaptcha === "function") window.__AmijobsClearRecaptcha("post_submit");
+              } catch (_e2) {}
+              break;
+            }
+            await S().sleep(700);
+          }
+          if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
+          if (!recaptchaExpiredUi() && /review/i.test(smartApplyPath())) {
+            // Still on review but not expired — don't loop forever
             break;
           }
         }
       }
+
+      // Never advance resume-selection without a file/radio accepted
+      if (/resume-selection/i.test(smartApplyPath()) && !resumeLooksReady()) {
+        await clickResumeIfNeeded();
+        await S().sleep(900);
+        continue;
+      }
+
+      let action = findVisibleContinueOrSubmit();
+      if (!action && onReviewLike) {
+        const sb = findSubmitButton(true);
+        if (sb) action = { el: sb, kind: "submit" };
+      }
       if (!action) {
-        if (/review/i.test(path)) {
-          await waitAndSolveRecaptcha(20000);
+        if (onReviewLike) {
+          await waitAndSolveRecaptcha(150000);
+          const sb = findSubmitButton(true);
+          if (sb && hasFreshRecaptchaToken() && settings.autoSubmit !== false) {
+            forceEnableClickable(sb);
+            S().log(PLATFORM, `Clic submit (retry): ${(sb.textContent || "").trim().slice(0, 40)}`);
+            await S().humanClick(sb);
+            try {
+              sb.click();
+            } catch (_e) {}
+            await S().sleep(2000);
+            if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
+          }
           await S().sleep(1200);
           continue;
         }
@@ -1093,10 +2105,17 @@
       }
 
       if (action.kind === "submit") {
-        const captchaOk = await waitAndSolveRecaptcha(90000);
+        const captchaOk = await waitAndSolveRecaptcha(150000);
         if (!captchaOk) {
           S().log(PLATFORM, "Submit bloqué — captcha non résolu", "warn");
           await S().sleep(1500);
+          continue;
+        }
+        if (recaptchaExpiredUi() || !hasFreshRecaptchaToken()) {
+          S().log(PLATFORM, "Submit bloqué — captcha expiré, re-solve…", "warn");
+          try {
+            if (typeof window.__AmijobsClearRecaptcha === "function") window.__AmijobsClearRecaptcha("submit_gate");
+          } catch (_e) {}
           continue;
         }
         // Re-inject token right before click (MAIN world)
@@ -1108,31 +2127,35 @@
         } catch (_e) {}
         if (settings.autoSubmit !== false) {
           S().log(PLATFORM, `Clic submit: ${(action.el.textContent || "").trim().slice(0, 40)}`);
-          // Force-enable if Indeed left it aria-disabled after token inject
-          try {
-            action.el.disabled = false;
-            action.el.removeAttribute("disabled");
-            action.el.removeAttribute("aria-disabled");
-          } catch (_e) {}
+          forceEnableClickable(action.el);
           await S().humanClick(action.el);
+          try {
+            action.el.click();
+          } catch (_e) {}
           await S().sleep(2800);
           for (let i = 0; i < 16; i++) {
             if (detectApplySuccess()) return { success: true };
             if (/post-apply/i.test(smartApplyPath())) return { success: true };
-            // Captcha may reappear after failed submit — clear stale token and retry
+            // Captcha expired / cleared after failed submit — force fresh 2captcha
             if (
               document.querySelector('iframe[src*="recaptcha"]') &&
-              /review/i.test(smartApplyPath())
+              /review/i.test(smartApplyPath()) &&
+              (recaptchaExpiredUi() || !hasFreshRecaptchaToken())
             ) {
-              const still = document.querySelector('textarea[name="g-recaptcha-response"]')?.value || "";
-              if (!still || still.length < 40) {
-                window.__AmijobsRecaptchaToken = "";
-                await waitAndSolveRecaptcha(60000);
-              } else if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
-                window.__AmijobsInjectRecaptchaToken(still);
-              }
+              try {
+                if (typeof window.__AmijobsClearRecaptcha === "function") {
+                  window.__AmijobsClearRecaptcha("post_submit_loop");
+                }
+              } catch (_e) {}
+              await waitAndSolveRecaptcha(90000);
               const again = findVisibleContinueOrSubmit();
-              if (again?.kind === "submit") {
+              if (again?.kind === "submit" && hasFreshRecaptchaToken() && !recaptchaExpiredUi()) {
+                try {
+                  const tok = window.__AmijobsRecaptchaToken || "";
+                  if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
+                    window.__AmijobsInjectRecaptchaToken(tok);
+                  }
+                } catch (_e) {}
                 await S().humanClick(again.el);
               }
             }
@@ -1142,7 +2165,9 @@
           // Still on review after clicks → don't fake success
           if (/review/i.test(smartApplyPath())) {
             S().log(PLATFORM, "Submit review sans confirmation — nouvel essai captcha", "warn");
-            window.__AmijobsRecaptchaToken = "";
+            try {
+              if (typeof window.__AmijobsClearRecaptcha === "function") window.__AmijobsClearRecaptcha("no_confirm");
+            } catch (_e) {}
             continue;
           }
           return { success: true, reason: "submitted" };
@@ -1152,8 +2177,27 @@
 
       if (action.el.disabled || action.el.getAttribute("aria-disabled") === "true") {
         if (/questions/i.test(path)) await fillQuestionsStep();
-        if (/review/i.test(path)) await waitAndSolveRecaptcha(20000);
+        if (onReviewLike || action.kind === "submit") {
+          await waitAndSolveRecaptcha(150000);
+          if (hasFreshRecaptchaToken() && action.kind === "submit" && settings.autoSubmit !== false) {
+            forceEnableClickable(action.el);
+            S().log(PLATFORM, `Clic submit (unlock): ${(action.el.textContent || "").trim().slice(0, 40)}`);
+            await S().humanClick(action.el);
+            try {
+              action.el.click();
+            } catch (_e) {}
+            await S().sleep(2000);
+            if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
+          }
+        }
         await S().sleep(800);
+        continue;
+      }
+
+      // Never let generic Continuer fire on resume-selection without accepted CV
+      if (/resume-selection/i.test(smartApplyPath()) && !resumeFileUiAccepted(window.__AmijobsResumeFileName || "")) {
+        await uploadCvFallback();
+        await S().sleep(1000);
         continue;
       }
 
@@ -1163,6 +2207,23 @@
       );
     }
     return { success: false, reason: "wizard_timeout" };
+    } finally {
+      try {
+        await chrome.storage.local.set({ indeedWizardBusy: null });
+      } catch (_e) {}
+      // Always free Smart Apply mutex — Glassdoor handoffs own the lock as "glassdoor"
+      try {
+        const handoff = !!window.__AmijobsWizardIsHandoff;
+        await chrome.runtime.sendMessage({
+          action: "releaseSmartApplyLock",
+          owner: handoff ? "glassdoor" : "indeed",
+          fair: true,
+        });
+        if (handoff) {
+          await chrome.runtime.sendMessage({ action: "releaseSmartApplyLock", owner: "indeed" });
+        }
+      } catch (_e) {}
+    }
   }
 
   async function applyCurrentJob(settings, jobInfo) {
@@ -1250,31 +2311,173 @@
     return { success: false, reason: "no_smartapply_opened" };
   }
 
+  function indeedAlertModalVisible() {
+    for (const el of document.querySelectorAll(
+      '[role="dialog"], [aria-modal="true"], [class*="Modal"], [class*="modal"], [data-testid*="Modal"]'
+    )) {
+      try {
+        if (!S().isVisible(el)) continue;
+        if (
+          /Confiez-nous votre recherche|Enregistrer cette alerte|Créez une alerte pour recevoir|Découvrez en premier|create (a )?job alert/i.test(
+            el.innerText || ""
+          )
+        ) {
+          return true;
+        }
+      } catch (_e) {}
+    }
+    return false;
+  }
+
+  async function dismissIndeedPopups() {
+    // Job alert / newsletter modals block SERP + Postuler ("Confiez-nous votre recherche")
+    if (!indeedAlertModalVisible()) {
+      // Still try generic close buttons (cookie / newsletter)
+      for (const sel of [
+        'button[aria-label="Close"]',
+        'button[aria-label="Fermer"]',
+        '[data-testid="modal-close-button"]',
+        '.icl-Modal-close',
+      ]) {
+        const btn = S().$(sel);
+        if (btn && S().isVisible(btn)) {
+          await S().humanClick(btn);
+          await S().sleep(300);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    const findCloseIn = (root) => {
+      if (!root) return null;
+      const nodes = root.querySelectorAll?.(
+        'button, [role="button"], a, [class*="close" i], [class*="Close"], [data-testid*="close" i], [aria-label*="close" i], [aria-label*="fermer" i]'
+      );
+      for (const b of nodes || []) {
+        if (!S().isVisible(b)) continue;
+        const t = (b.textContent || "").trim();
+        const al = `${b.getAttribute("aria-label") || ""} ${b.getAttribute("data-testid") || ""} ${b.className || ""}`.toLowerCase();
+        if (
+          t === "×" ||
+          t === "✕" ||
+          t === "X" ||
+          /^x$/i.test(t) ||
+          /close|fermer|dismiss|icon-close|modal-close/i.test(al) ||
+          (t.length === 0 && /close|fermer/i.test(al))
+        ) {
+          return b;
+        }
+      }
+      // Indeed alert: first tiny icon button in dialog header is usually X
+      const dialogBtns = [...(root.querySelectorAll?.("button") || [])].filter((b) => S().isVisible(b));
+      const saveIdx = dialogBtns.findIndex((b) => /Enregistrer cette alerte|Save (this )?alert/i.test(b.textContent || ""));
+      if (saveIdx > 0) {
+        // Prefer a button that is NOT the save CTA — often the X is first
+        const nonSave = dialogBtns.find((b) => !/Enregistrer|Save|modifier|Modify/i.test(b.textContent || ""));
+        if (nonSave) return nonSave;
+      }
+      return dialogBtns.find((b) => ((b.textContent || "").trim().length || 0) <= 1) || null;
+    };
+
+    const dialogs = [
+      ...document.querySelectorAll('[role="dialog"], [aria-modal="true"], [class*="Modal"], [class*="modal"], [data-testid*="Modal"]'),
+    ];
+    for (const dialog of dialogs.length ? dialogs : [document.body]) {
+      const xBtn = findCloseIn(dialog);
+      if (xBtn) {
+        try {
+          xBtn.click();
+        } catch (_e) {
+          await S().humanClick(xBtn);
+        }
+        await S().sleep(600);
+        if (!indeedAlertModalVisible()) {
+          S().log(PLATFORM, "Alerte emploi Indeed fermée", "warn");
+          return true;
+        }
+      }
+    }
+
+    // Escape + click backdrop
+    for (let i = 0; i < 3; i++) {
+      try {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
+        document.dispatchEvent(new KeyboardEvent("keyup", { key: "Escape", keyCode: 27, bubbles: true }));
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
+      } catch (_e) {}
+      await S().sleep(350);
+      if (!indeedAlertModalVisible()) {
+        S().log(PLATFORM, "Alerte emploi Indeed fermée (Escape)", "warn");
+        return true;
+      }
+    }
+
+    // Last resort: remove alert modal + backdrop so Postuler is clickable
+    for (const el of [
+      ...document.querySelectorAll('[role="dialog"], [aria-modal="true"], [class*="Modal"], [class*="modal"]'),
+    ]) {
+      try {
+        if (/Confiez-nous|Enregistrer cette alerte|Créez une alerte/i.test(el.innerText || "")) {
+          el.remove();
+        }
+      } catch (_e) {
+        try {
+          el.style.setProperty("display", "none", "important");
+          el.style.setProperty("pointer-events", "none", "important");
+        } catch (_e2) {}
+      }
+    }
+    for (const el of document.querySelectorAll(
+      '[class*="overlay" i], [class*="Overlay"], [class*="backdrop" i], [class*="Backdrop"]'
+    )) {
+      try {
+        if (S().isVisible(el)) {
+          el.style.setProperty("pointer-events", "none", "important");
+          el.style.setProperty("display", "none", "important");
+        }
+      } catch (_e) {}
+    }
+    await S().sleep(300);
+    if (!indeedAlertModalVisible()) {
+      S().log(PLATFORM, "Alerte emploi Indeed forcée (remove)", "warn");
+      return true;
+    }
+    S().log(PLATFORM, "Alerte emploi Indeed toujours visible", "warn");
+    return false;
+  }
+
   async function handleSearchPage(session, settings) {
     const maxJobs = session.maxJobs || settings.maxJobsPerSession || 25;
-    const appliedJobs = (await chrome.runtime.sendMessage({ action: "getState" }))?.appliedJobs || {};
+
+    await dismissIndeedPopups();
 
     // Force Easy Apply / candidature simplifiée only
     if (await ensureEasyApplyOnlyFilter()) {
       return;
     }
 
-    // Always pause Indeed SERP while ANY Smart Apply wizard tab is open
-    // (previously only paused during Glassdoor handoff — Indeed-only mass apply kept
-    // opening new jobs and killed the wizard via tab merge / focus thrash).
+    // Only defer opening a NEW Indeed apply while a live Smart Apply wizard is open
+    // (shared with Glassdoor). Do NOT starve Indeed on "prefer Glassdoor" alone.
+    let deferNewApply = false;
     try {
+      const { indeedWizardBusy = null } = await chrome.storage.local.get(["indeedWizardBusy"]);
+      const busyAge = indeedWizardBusy?.at ? Date.now() - indeedWizardBusy.at : 999999;
       const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
       const hasSmart =
         tabs?.hasSmartApply ||
         /smartapply|indeedapply/i.test(location.href);
-      if (hasSmart && isSearchPage()) {
-        S().log(PLATFORM, "Pause SERP — Smart Apply en cours", "warn");
-        await S().sleep(4000);
-        return;
+      if (busyAge < 180000 && !hasSmart && isSearchPage()) {
+        await chrome.storage.local.set({ indeedWizardBusy: null });
+      } else if (hasSmart && isSearchPage()) {
+        deferNewApply = true;
+        try {
+          await chrome.runtime.sendMessage({ action: "nudgeIndeedSmartApply" });
+        } catch (_e) {}
       }
     } catch (_e) {}
 
-    // Yield Indeed SERP while Glassdoor owns the single Indeed tab for Smart Apply
+    // While Glassdoor owns the live wizard, Indeed browses but does not Postuler
     const { sessionGlassdoor = null, glassdoorSmartApply = null } = await chrome.storage.local.get([
       "sessionGlassdoor",
       "glassdoorSmartApply",
@@ -1282,31 +2485,66 @@
     const gdAwaiting = !!(sessionGlassdoor?.active && sessionGlassdoor?.awaitingIndeed);
     const gdSmartAge = glassdoorSmartApply ? Date.now() - (glassdoorSmartApply.at || 0) : 999999;
     const gdAwaitAge = gdAwaiting
-      ? Date.now() - (sessionGlassdoor.lastRunAt || sessionGlassdoor.startedAt || Date.now())
+      ? Date.now() - (sessionGlassdoor.lastRunAt || Date.parse(sessionGlassdoor.startedAt) || Date.now())
       : 999999;
-    // Stale Glassdoor handoff must not freeze Indeed forever
-    if (gdAwaiting && gdAwaitAge > 75000) {
-      S().log(PLATFORM, "Libération Pause SERP — handoff Glassdoor expiré", "warn");
+    if (gdAwaiting && gdAwaitAge > 240000) {
+      S().log(PLATFORM, "Libération handoff Glassdoor expiré — reprise file Indeed", "warn");
       await chrome.storage.local.set({
         sessionGlassdoor: { ...sessionGlassdoor, awaitingIndeed: false, indeedHandoffDone: false },
       });
-    } else if (gdAwaiting || gdSmartAge < 90000) {
+    } else if (gdAwaiting || gdSmartAge < 120000) {
       const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
       const hasSmart =
         tabs?.hasSmartApply ||
-        /smartapply|indeedapply/i.test(location.href);
+        tabs?.hasApplyTab ||
+        /smartapply|indeedapply|\/viewjob|\/rc\/clk/i.test(location.href);
       if (hasSmart || /smartapply|indeedapply/i.test(location.href)) {
-        S().log(PLATFORM, "Pause SERP — Smart Apply Glassdoor en cours sur cet onglet", "warn");
-        await S().sleep(4000);
-        return;
+        deferNewApply = true;
       }
-      // Stale flag without Smart Apply → clear and continue SERP
-      if (gdAwaiting && gdAwaitAge > 20000) {
-        S().log(PLATFORM, "Libération Pause SERP — awaitingIndeed sans Smart Apply", "warn");
-        await chrome.storage.local.set({
-          sessionGlassdoor: { ...sessionGlassdoor, awaitingIndeed: false },
-        });
+      // Do NOT clear Glassdoor awaitingIndeed from Indeed — that aborts live handoffs.
+      // Glassdoor owns stale cleanup (60s / 240s).
+    }
+
+    if (deferNewApply && isSearchPage()) {
+      // Keep Indeed visibly busy: drain handled queue items, prepare cards
+      let q = session.queue || [];
+      let qi = session.qIndex || 0;
+      let advanced = 0;
+      const live =
+        (await chrome.runtime.sendMessage({ action: "getState" }).catch(() => null)) || {};
+      const appliedMap = live.appliedJobs || {};
+      const skippedMap = live.skippedJobs || {};
+      while (qi < q.length && advanced < 8) {
+        const it = q[qi];
+        const id = it?.jobId;
+        if (id && (appliedMap[id] || skippedMap[id] || (await alreadyHandled(id)))) {
+          qi += 1;
+          advanced += 1;
+          continue;
+        }
+        break;
       }
+      if (advanced) await setSession({ qIndex: qi });
+      if (!q.length) {
+        const cards = await waitForJobCards(8000).catch(() => []);
+        if (cards?.length) {
+          q = cards
+            .filter((c) => isValidIndeedJobKey(c.jobId) && c.title && c.title.length >= 3)
+            .map((c) => ({ jobId: c.jobId, title: c.title, company: c.company }));
+          await setSession({ queue: q, qIndex: 0 });
+          S().log(PLATFORM, `SERP Indeed prêt (${q.length} offres) — Smart Apply partagé en cours`, "warn");
+        } else {
+          S().log(PLATFORM, "SERP Indeed actif — attente fin Smart Apply (Glassdoor/Indeed)", "warn");
+        }
+      } else {
+        S().log(
+          PLATFORM,
+          `SERP Indeed actif (${Math.max(0, q.length - qi)} en file) — attente tour Smart Apply`,
+          "warn"
+        );
+      }
+      await S().sleep(800);
+      return;
     }
 
     if ((session.applied || 0) >= maxJobs) {
@@ -1323,6 +2561,9 @@
     }
     let queue = session.queue || [];
     let qIndex = session.qIndex || 0;
+    // Always re-read handled jobs (skips must stick across SERP reloads)
+    let liveState = (await chrome.runtime.sendMessage({ action: "getState" }).catch(() => null)) || {};
+    let appliedJobs = liveState.appliedJobs || {};
 
     if (!queue.length) {
       if (detectNoResultsPage()) {
@@ -1331,8 +2572,21 @@
       }
       const cards = await waitForJobCards(45000);
       if (!cards.length) {
+        const emptyRetries = (session.emptyCardRetries || 0) + 1;
+        S().log(
+          PLATFORM,
+          `SERP vide (tentative ${emptyRetries}) — popups / anti-bot / sélecteurs`,
+          "warn"
+        );
+        await dismissIndeedPopups().catch(() => {});
+        // Retry same page twice before flipping (avoids silent page burn)
+        if (emptyRetries < 3) {
+          await setSession({ emptyCardRetries: emptyRetries });
+          await S().sleep(2500);
+          return;
+        }
         const noPages = (session.noApplyPages || 0) + 1;
-        await setSession({ noApplyPages: noPages });
+        await setSession({ noApplyPages: noPages, emptyCardRetries: 0 });
         if (noPages >= 3 && detectNoResultsPage()) {
           await endSession("Aucun résultat pour ce lieu/mot-clé");
           return;
@@ -1342,7 +2596,8 @@
           return;
         }
         const nextPage = (session.currentPage || 0) + 1;
-        await setSession({ currentPage: nextPage, queue: [], qIndex: 0 });
+        S().log(PLATFORM, `Page suivante Indeed (${nextPage + 1}) — SERP vide après retries`, "warn");
+        await setSession({ currentPage: nextPage, queue: [], qIndex: 0, pageApplied: 0 });
         window.location.href = buildSearchUrl(session.keywords, session.location, nextPage, session);
         return;
       }
@@ -1355,7 +2610,7 @@
           company: c.company,
         }));
       qIndex = 0;
-      await setSession({ queue, qIndex: 0, noApplyPages: 0 });
+      await setSession({ queue, qIndex: 0, noApplyPages: 0, emptyCardRetries: 0 });
       S().log(PLATFORM, `${queue.length} offres trouvées`);
     }
 
@@ -1391,6 +2646,8 @@
         await endSession("Objectif session atteint");
         return;
       }
+      // Cap applies per SERP page then continue on page 2+
+      if (await maybeFlipIndeedPage(current, settings, maxJobs)) return;
 
       const item = queue[qIndex];
       if (!isValidIndeedJobKey(item.jobId)) {
@@ -1398,7 +2655,7 @@
         await setSession({ qIndex });
         continue;
       }
-      if (await alreadyApplied(appliedJobs, item.jobId)) {
+      if (await alreadyHandled(item.jobId) || (await alreadyApplied(appliedJobs, item.jobId))) {
         qIndex++;
         await setSession({ qIndex });
         continue;
@@ -1437,14 +2694,6 @@
         continue;
       }
 
-      await setSession({
-        phase: "viewjob",
-        currentJk: item.jobId,
-        currentTitle: item.title,
-        currentCompany: item.company,
-        qIndex: qIndex + 1,
-      });
-
       // Prefer SPA: click the card on the SERP (right panel) then "Postuler sur Indeed"
       // Avoids brittle /viewjob?jk= navigations that 404 on bad/stale keys.
       const liveCard =
@@ -1461,21 +2710,70 @@
           link.setAttribute?.("target", "_self");
         } catch (_e) {}
         S().log(PLATFORM, `Ouverture offre SERP: ${item.title || item.jobId}`);
+        await setSession({
+          phase: "viewjob",
+          currentJk: item.jobId,
+          currentTitle: item.title,
+          currentCompany: item.company,
+          qIndex: qIndex + 1,
+        });
         await S().humanClick(link);
         await S().sleep(S().randomDelay(1600, 2600));
+        await markSeenJob(item.jobId);
         const fresh = await getSession();
         await handleViewJobPage(fresh || session, settings);
         return;
       }
 
-      const host = getIndeedHost(session);
-      window.location.href = `${host}/viewjob?jk=${encodeURIComponent(item.jobId)}`;
-      return;
+      // Card not in DOM (virtualized list) — advance queue and try next; recharge later
+      S().log(PLATFORM, `Carte absente du DOM: ${item.title || item.jobId} — suivante`, "warn");
+      qIndex++;
+      await setSession({ qIndex });
+      continue;
+    }
+
+    // Before flipping pages: if we still need applies on THIS page, reload cards
+    const perPage = settings.maxJobsPerPage || 0;
+    const pageApplied = (await getSession())?.pageApplied || 0;
+    const totalApplied = (await getSession())?.applied || 0;
+    const sessNow = await getSession();
+    const rechargeAttempts = sessNow?.rechargeAttempts || 0;
+    if (perPage > 0 && pageApplied < perPage && totalApplied < maxJobs && rechargeAttempts < 2) {
+      await dismissIndeedPopups().catch(() => {});
+      const more = await waitForJobCards(22000, { minCards: 10 });
+      const seen = (await getSession())?.seenJobIds || {};
+      const fresh = more
+        .filter((c) => isValidIndeedJobKey(c.jobId) && !seen[c.jobId] && c.easyApply !== false)
+        .filter((c) => c.easyApply)
+        .map((c) => ({ jobId: c.jobId, title: c.title, company: c.company }));
+      // If no easyApply flags at all, keep any unseen
+      const fallback = more
+        .filter((c) => isValidIndeedJobKey(c.jobId) && !seen[c.jobId])
+        .map((c) => ({ jobId: c.jobId, title: c.title, company: c.company }));
+      const use = fresh.length ? fresh : fallback;
+      if (use.length) {
+        S().log(PLATFORM, `Recharge SERP page ${(session.currentPage || 0) + 1}: ${use.length} nouvelles offres`);
+        await setSession({ queue: use, qIndex: 0, noApplyPages: 0, rechargeAttempts: rechargeAttempts + 1 });
+        return;
+      }
     }
 
     const nextPage = (session.currentPage || 0) + 1;
-    await setSession({ currentPage: nextPage, queue: [], qIndex: 0 });
-    window.location.href = buildSearchUrl(session.keywords, session.location, nextPage, session);
+    if (nextPage > 8) {
+      await endSession(totalApplied > 0 ? "Plus d'offres Easy Apply (pages épuisées)" : "Aucune offre Easy Apply");
+      return;
+    }
+    const nextUrl = buildSearchUrl(session.keywords, session.location, nextPage, session);
+    S().log(PLATFORM, `Page suivante Indeed (${nextPage + 1}) — file épuisée`, "warn");
+    await setSession({
+      currentPage: nextPage,
+      pageApplied: 0,
+      rechargeAttempts: 0,
+      queue: [],
+      qIndex: 0,
+      searchUrl: nextUrl,
+    });
+    window.location.href = nextUrl;
   }
 
   async function handleViewJobPage(session, settings) {
@@ -1491,9 +2789,7 @@
         reason: "Offre introuvable / clé invalide",
       });
       await setSession({ phase: "search" });
-      window.location.href =
-        session.searchUrl ||
-        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      window.location.href = searchReturnUrl(session);
       return;
     }
 
@@ -1528,27 +2824,94 @@
             : `Limite entreprise (${jobInfo.company})`,
       });
       await setSession({ phase: "search" });
-      window.location.href =
-        session.searchUrl ||
-        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      window.location.href = searchReturnUrl(session);
       return;
     }
 
-    const btn = await waitForApplyButton(18000);
+    // Shared mutex with Glassdoor Easy Apply — detect handoff BEFORE skip/return
+    // so a failed Postuler on a GD URL doesn't poison Indeed's own SERP queue.
+    let gdHandoff = false;
+    let gdMeta = null;
+    try {
+      const { sessionGlassdoor: sGd = null, glassdoorSmartApply = null } = await chrome.storage.local.get([
+        "sessionGlassdoor",
+        "glassdoorSmartApply",
+      ]);
+      const smartAge = glassdoorSmartApply?.at ? Date.now() - glassdoorSmartApply.at : 999999;
+      gdHandoff = !!(sGd?.active && (sGd.awaitingIndeed || smartAge < 180000));
+      gdMeta = glassdoorSmartApply || (gdHandoff ? sGd : null);
+    } catch (_e) {}
+    if (gdHandoff && gdMeta) {
+      if (gdMeta.jobId || gdMeta.currentJk) jobInfo.jobId = gdMeta.jobId || gdMeta.currentJk || jobInfo.jobId;
+      if (gdMeta.title || gdMeta.currentTitle)
+        jobInfo.title = gdMeta.title || gdMeta.currentTitle || jobInfo.title;
+      if (gdMeta.company || gdMeta.currentCompany)
+        jobInfo.company = gdMeta.company || gdMeta.currentCompany || jobInfo.company;
+    }
+
+    const btn = await waitForApplyButton(gdHandoff ? 22000 : 18000);
     if (!btn) {
-      S().log(PLATFORM, "Bouton Postuler sur Indeed introuvable", "warn");
-      await chrome.runtime.sendMessage({
-        action: "markSkipped",
-        platform: PLATFORM,
-        jobId: jobInfo.jobId,
-        title: jobInfo.title,
-        reason: "Pas de candidature Indeed",
-      });
+      if (gdHandoff) {
+        // Fail fast — don't hold GD's lock for 120s on a dead viewjob
+        S().log(
+          PLATFORM,
+          `Handoff Glassdoor: Postuler introuvable (${jobInfo.title || jobId}) — release`,
+          "warn"
+        );
+        try {
+          const { sessionGlassdoor: sGd = null } = await chrome.storage.local.get(["sessionGlassdoor"]);
+          if (sGd?.active) {
+            await chrome.storage.local.set({
+              sessionGlassdoor: { ...sGd, awaitingIndeed: false, indeedHandoffDone: false },
+              glassdoorSmartApply: null,
+            });
+          }
+          await chrome.runtime.sendMessage({ action: "releaseSmartApplyLock", owner: "glassdoor" });
+        } catch (_e) {}
+        return;
+      }
+      if (detectAlreadyAppliedUi()) {
+        S().log(PLATFORM, `Déjà postulé (UI): ${jobInfo.title || jobId}`, "warn");
+        await chrome.runtime.sendMessage({
+          action: "markSkipped",
+          platform: PLATFORM,
+          jobId: jobInfo.jobId,
+          title: jobInfo.title,
+          reason: "already_applied_ui",
+        });
+      } else {
+        S().log(PLATFORM, "Bouton Postuler sur Indeed introuvable", "warn");
+        await chrome.runtime.sendMessage({
+          action: "markSkipped",
+          platform: PLATFORM,
+          jobId: jobInfo.jobId,
+          title: jobInfo.title,
+          reason: "Pas de candidature Indeed",
+        });
+      }
       await setSession({ phase: "search" });
-      window.location.href =
-        session.searchUrl ||
-        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      window.location.href = searchReturnUrl(session);
       return;
+    }
+    const lock = await chrome.runtime
+      .sendMessage({ action: "acquireSmartApplyLock", owner: "indeed", handoff: gdHandoff })
+      .catch(() => null);
+    if (!lock?.ok) {
+      S().log(
+        PLATFORM,
+        `Smart Apply occupé (${lock?.owner || "glassdoor"}) — pause offre, retry plus tard`,
+        "warn"
+      );
+      await setSession({ phase: "search" });
+      await S().sleep(1500);
+      // Soft return — avoid full SERP hard navigation when possible
+      if (!isSearchPage()) {
+        window.location.href = searchReturnUrl(session);
+      }
+      return;
+    }
+    if (gdHandoff || lock?.handoff) {
+      window.__AmijobsWizardIsHandoff = true;
     }
 
     S().log(PLATFORM, `Clic: ${(btn.innerText || btn.textContent || "Postuler").trim().slice(0, 48)}`);
@@ -1556,7 +2919,7 @@
     const result = await applyCurrentJob(settings, jobInfo);
 
     if (result.reason === "smartapply_tab") {
-      // Another tab owns the wizard; wait for completion instead of abandoning early
+      // Another tab owns the wizard; keep lock while waiting for completion
       S().log(PLATFORM, "Smart Apply ouvert dans un onglet — attente");
       const appliedBefore = (await getSession())?.applied || 0;
       for (let i = 0; i < 55; i++) {
@@ -1567,10 +2930,14 @@
         if ((fresh.applied || 0) > appliedBefore) break;
         if (fresh.phase === "search") break;
       }
+      try {
+        await chrome.runtime.sendMessage({
+          action: "releaseSmartApplyLock",
+          owner: gdHandoff || window.__AmijobsWizardIsHandoff ? "glassdoor" : "indeed",
+        });
+      } catch (_e) {}
       await setSession({ phase: "search" });
-      window.location.href =
-        session.searchUrl ||
-        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      window.location.href = searchReturnUrl(session);
       return;
     }
 
@@ -1583,19 +2950,27 @@
         company: jobInfo.company,
         url: result.url || jobInfo.url,
       });
+      try {
+        await chrome.runtime.sendMessage({ action: "releaseSmartApplyLock", owner: "indeed", fair: true });
+      } catch (_e) {}
       S().log(PLATFORM, `Postulé (site entreprise): ${jobInfo.title}`, "success");
       await setSession({ phase: "search" });
-      window.location.href =
-        session.searchUrl ||
-        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      window.location.href = searchReturnUrl(session);
       return;
     }
 
     if (
       result.reason === "company_site_apply" ||
       result.reason === "external_ats" ||
-      result.reason === "no_smartapply_opened"
+      result.reason === "no_smartapply_opened" ||
+      result.reason === "no_indeed_apply"
     ) {
+      try {
+        await chrome.runtime.sendMessage({
+          action: "releaseSmartApplyLock",
+          owner: gdHandoff || window.__AmijobsWizardIsHandoff ? "glassdoor" : "indeed",
+        });
+      } catch (_e) {}
       await chrome.runtime.sendMessage({
         action: "markSkipped",
         platform: PLATFORM,
@@ -1604,39 +2979,76 @@
         reason: result.reason === "company_site_apply" ? "Site entreprise (échec/indisponible)" : "Pas de Smart Apply Indeed",
       });
       await setSession({ phase: "search" });
-      window.location.href =
-        session.searchUrl ||
-        buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+      window.location.href = searchReturnUrl(session);
       return;
     }
 
     if (result.success) {
+      const creditGd = !!(gdHandoff || window.__AmijobsWizardIsHandoff);
+      let creditJobId = jobInfo.jobId;
+      let creditTitle = jobInfo.title;
+      let creditCompany = jobInfo.company;
+      if (creditGd) {
+        try {
+          const { glassdoorSmartApply = null, sessionGlassdoor: sGd = null } =
+            await chrome.storage.local.get(["glassdoorSmartApply", "sessionGlassdoor"]);
+          creditJobId = glassdoorSmartApply?.jobId || sGd?.currentJk || creditJobId;
+          creditTitle = glassdoorSmartApply?.title || sGd?.currentTitle || creditTitle;
+          creditCompany = glassdoorSmartApply?.company || sGd?.currentCompany || creditCompany;
+        } catch (_e) {}
+      }
       await chrome.runtime.sendMessage({
         action: "markApplied",
-        platform: PLATFORM,
-        jobId: jobInfo.jobId,
-        title: jobInfo.title,
-        company: jobInfo.company,
+        platform: creditGd ? "glassdoor" : PLATFORM,
+        jobId: creditJobId,
+        title: creditTitle,
+        company: creditCompany,
         url: jobInfo.url,
       });
-      S().log(PLATFORM, `Postulé: ${jobInfo.title}`, "success");
+      // markApplied already bumps session.applied — only track per-page count here
+      const sNow = await getSession();
+      const pageApplied = creditGd ? sNow?.pageApplied || 0 : (sNow?.pageApplied || 0) + 1;
+      await setSession({ pageApplied, phase: "search", awaitingSmartApply: false });
+      try {
+        await chrome.runtime.sendMessage({
+          action: "releaseSmartApplyLock",
+          owner: creditGd ? "glassdoor" : "indeed",
+          fair: true,
+        });
+      } catch (_e) {}
+      S().log(
+        PLATFORM,
+        creditGd
+          ? `Postulé (via Glassdoor): ${creditTitle || creditJobId}`
+          : `Postulé: ${jobInfo.title} (page ${(sNow?.currentPage || 0) + 1}, ${pageApplied}/${settings.maxJobsPerPage || "∞"} page)`,
+        "success"
+      );
     } else {
-      await chrome.runtime.sendMessage({
-        action: "markError",
-        platform: PLATFORM,
-        jobId: jobInfo.jobId,
-        title: jobInfo.title,
-        error: result.reason || "error",
-      });
+      if (!(gdHandoff || window.__AmijobsWizardIsHandoff)) {
+        await chrome.runtime.sendMessage({
+          action: "markError",
+          platform: PLATFORM,
+          jobId: jobInfo.jobId,
+          title: jobInfo.title,
+          error: result.reason || "error",
+        });
+      }
+      await setSession({ phase: "search", awaitingSmartApply: false });
+      try {
+        await chrome.runtime.sendMessage({
+          action: "releaseSmartApplyLock",
+          owner: gdHandoff || window.__AmijobsWizardIsHandoff ? "glassdoor" : "indeed",
+        });
+      } catch (_e) {}
     }
 
     await S().sleep(
       S().randomDelay(settings.delayBetweenJobs?.min || 800, settings.delayBetweenJobs?.max || 1800)
     );
-    await setSession({ phase: "search" });
-    window.location.href =
-      session.searchUrl ||
-      buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+    const after = await getSession();
+    const maxJobs = after?.maxJobs || settings.maxJobsPerSession || 25;
+    if (result.success && (await maybeFlipIndeedPage(after, settings, maxJobs))) return;
+    window.location.href = searchReturnUrl(after || session);
   }
 
   async function handleApplyPage(session, settings) {
@@ -1668,19 +3080,45 @@
     const result = await runApplyWizard(jobInfo, settings);
 
     if (result.success) {
-      await chrome.runtime.sendMessage({
-        action: "markApplied",
-        platform: fromGlassdoor ? "glassdoor" : PLATFORM,
-        jobId: jobInfo.jobId || session.currentJk,
-        title: jobInfo.title,
-        company: jobInfo.company,
-        url: jobInfo.url,
-      });
-      S().log(
-        PLATFORM,
-        `Postulé${fromGlassdoor ? " (via Glassdoor)" : ""}: ${jobInfo.title || jobInfo.jobId}`,
-        "success"
-      );
+      {
+        const sBefore = await getSession();
+        await chrome.runtime.sendMessage({
+          action: "markApplied",
+          platform: fromGlassdoor ? "glassdoor" : PLATFORM,
+          jobId: jobInfo.jobId || session.currentJk,
+          title: jobInfo.title,
+          company: jobInfo.company,
+          url: jobInfo.url,
+          page: fromGlassdoor
+            ? (await chrome.storage.local.get(["sessionGlassdoor"])).sessionGlassdoor?.currentPage || 0
+            : sBefore?.currentPage || 0,
+        });
+      }
+      try {
+        await chrome.storage.local.set({ indeedWizardBusy: null });
+      } catch (_e) {}
+      if (!fromGlassdoor) {
+        const sNow = await getSession();
+        const pageApplied = (sNow?.pageApplied || 0) + 1;
+        await setSession({ pageApplied, phase: "search", awaitingSmartApply: false });
+        try {
+          await chrome.runtime.sendMessage({ action: "releaseSmartApplyLock", owner: "indeed", fair: true });
+        } catch (_e) {}
+        S().log(
+          PLATFORM,
+          `Postulé: ${jobInfo.title || jobInfo.jobId} (page ${(sNow?.currentPage || 0) + 1}, ${pageApplied}/${settings.maxJobsPerPage || "∞"} page)`,
+          "success"
+        );
+      } else {
+        try {
+          await chrome.runtime.sendMessage({ action: "releaseSmartApplyLock", owner: "glassdoor", fair: true });
+        } catch (_e) {}
+        S().log(
+          PLATFORM,
+          `Postulé${fromGlassdoor ? " (via Glassdoor)" : ""}: ${jobInfo.title || jobInfo.jobId}`,
+          "success"
+        );
+      }
     } else if (!fromGlassdoor) {
       await chrome.runtime.sendMessage({
         action: "markError",
@@ -1689,15 +3127,17 @@
         title: jobInfo.title,
         error: result.reason || "error",
       });
+      try {
+        await chrome.runtime.sendMessage({ action: "releaseSmartApplyLock", owner: "indeed" });
+      } catch (_e) {}
     } else {
-      // Glassdoor owns the waiter — log only; do not clear awaitingIndeed / mark glassdoor error yet
+      // Soft retry once, then release Glassdoor waiter so mass-apply can skip & continue
       S().log(
         PLATFORM,
         `Smart Apply (Glassdoor) en cours / retry: ${result.reason || "error"}`,
         "warn"
       );
       try {
-        // One soft retry while Glassdoor is still waiting
         await S().sleep(1500);
         const retry = await runApplyWizard(jobInfo, settings);
         if (retry.success) {
@@ -1711,6 +3151,8 @@
           });
           S().log(PLATFORM, `Postulé (via Glassdoor): ${jobInfo.title || jobInfo.jobId}`, "success");
           result.success = true;
+        } else {
+          result.reason = retry.reason || result.reason || "wizard_timeout";
         }
       } catch (_e) {
         /* ignore */
@@ -1718,17 +3160,14 @@
     }
 
     if (fromGlassdoor) {
-      // Only release the Glassdoor waiter + close tab on success.
-      // On failure, keep awaitingIndeed so Glassdoor does not false-timeout while Smart Apply retries.
+      const { sessionGlassdoor: sNow = null } = await chrome.storage.local.get(["sessionGlassdoor"]);
       if (result.success) {
-        const { sessionGlassdoor: sNow = null } = await chrome.storage.local.get(["sessionGlassdoor"]);
         if (sNow?.active) {
           await chrome.storage.local.set({
             sessionGlassdoor: {
               ...sNow,
               awaitingIndeed: false,
               indeedHandoffDone: true,
-              applied: (sNow.applied || 0) + 1,
             },
             glassdoorSmartApply: null,
           });
@@ -1740,28 +3179,62 @@
           searchUrl: "",
           fromGlassdoor: true,
         });
+      } else {
+        // Release waiter + skip job so Glassdoor can flip to next Easy Apply card
+        S().log(
+          PLATFORM,
+          `Abandon Smart Apply Glassdoor: ${result.reason || "error"} — reprise SERP Glassdoor`,
+          "warn"
+        );
+        if (sNow?.active) {
+          await chrome.storage.local.set({
+            sessionGlassdoor: {
+              ...sNow,
+              awaitingIndeed: false,
+              indeedHandoffDone: false,
+            },
+            glassdoorSmartApply: null,
+            indeedWizardBusy: null,
+          });
+        } else {
+          await chrome.storage.local.set({ glassdoorSmartApply: null, indeedWizardBusy: null });
+        }
+        await chrome.runtime.sendMessage({
+          action: "markSkipped",
+          platform: "glassdoor",
+          jobId: jobInfo.jobId || session.currentJk,
+          title: jobInfo.title,
+          reason: result.reason || "smartapply_failed",
+        }).catch(() => {});
+        await chrome.runtime.sendMessage({
+          action: "closeTabAndResumeIndeed",
+          searchUrl: "",
+          fromGlassdoor: true,
+        }).catch(() => {});
       }
       return;
     }
 
+    const after = await getSession();
+    const maxJobs = after?.maxJobs || settings.maxJobsPerSession || 25;
+    const flipUrl =
+      result.success ? await maybeFlipIndeedPage(after, settings, maxJobs, { navigate: false }) : null;
     await setSession({ phase: "search" });
+    const resumeUrl = flipUrl || searchReturnUrl((await getSession()) || after || session);
     // Prefer closing smartapply tab and returning to search on fr.indeed
     if (/smartapply\.indeed\.com/i.test(window.location.href)) {
       await chrome.runtime.sendMessage({
         action: "closeTabAndResumeIndeed",
-        searchUrl:
-          session.searchUrl ||
-          buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session),
+        searchUrl: resumeUrl,
       });
       return;
     }
-    window.location.href =
-      session.searchUrl ||
-      buildSearchUrl(session.keywords, session.location, session.currentPage || 0, session);
+    window.location.href = resumeUrl;
   }
 
   async function runAutoApplySession() {
     if (isRunning) return;
+    if (!isTopAutomationFrame()) return;
     // v1.4.0: Skip service worker iframes — they're not real apply pages
     const winPath = window.location.pathname || "";
     if (/^\/_\/service_worker/i.test(winPath) || /^\/_\/scripts\//i.test(winPath) || /^\/sw_iframe/i.test(winPath)) {
@@ -1775,8 +3248,21 @@
       let session = await getSession();
       // Glassdoor handoff can activate Indeed apply without a full session
       if (!session?.active && isSmartApplyPage()) {
+        if (isLoginWallPage() || detectLoginWall()) {
+          await chrome.runtime
+            .sendMessage({ action: "indeedLoginWall", url: window.location.href })
+            .catch(() => {});
+          return;
+        }
         const { sessionGlassdoor } = await chrome.storage.local.get(["sessionGlassdoor"]);
         if (sessionGlassdoor?.active) {
+          const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+          if (amijobsMeta?.indeedLoginRequired) {
+            await chrome.runtime
+              .sendMessage({ action: "indeedLoginWall", url: window.location.href })
+              .catch(() => {});
+            return;
+          }
           await chrome.storage.local.set({
             sessionIndeed: {
               active: true,
@@ -1821,7 +3307,15 @@
           await tryPassCloudflareChallenge();
         }
         if (detectLoginWall() && !isSmartApplyPage()) {
-          await endSession("Connexion Indeed requise");
+          // Background closes auth tab, clears Glassdoor handoff, blocks re-loop
+          await chrome.runtime
+            .sendMessage({
+              action: "indeedLoginWall",
+              url: window.location.href,
+              fromGlassdoor: !!session.fromGlassdoor,
+            })
+            .catch(() => {});
+          S().log(PLATFORM, "Connexion Indeed requise — session Indeed mise en pause", "warn");
           return;
         }
       }
@@ -1836,14 +3330,43 @@
 
       S().log(PLATFORM, `Page: ${new URL(url).pathname} (phase: ${session.phase || "search"})`);
 
-      if (isSmartApplyPage(url) || session.phase === "apply") {
+      // Route by URL first — stale phase=viewjob/apply must not steal /jobs SERP
+      if (isSmartApplyPage(url)) {
         await handleApplyPage(session, settings);
-      } else if (isViewJobPage(url) || session.phase === "viewjob") {
+      } else if (isViewJobPage(url)) {
         await handleViewJobPage(session, settings);
       } else if (isSearchPage(url)) {
-        await handleSearchPage(session, settings);
+        if (session.phase === "viewjob" || session.phase === "apply") {
+          // SPA stayed on SERP with right panel — finish that job, else reset to search
+          const hasPanel =
+            !!findIndeedEasyApplyButton() ||
+            !!S().$('[data-testid="jobsearch-JobInfoHeader-title"], .jobsearch-JobInfoHeader-title, h1.jobsearch-JobInfoHeader-title');
+          if (session.phase === "viewjob" && hasPanel && session.currentJk) {
+            await handleViewJobPage(session, settings);
+          } else {
+            await setSession({ phase: "search" });
+            await handleSearchPage({ ...session, phase: "search" }, settings);
+          }
+        } else {
+          await handleSearchPage(session, settings);
+        }
+      } else if (session.phase === "apply" && /indeedapply|smartapply/i.test(url)) {
+        await handleApplyPage(session, settings);
       } else {
+        // Help/support scraped by Glassdoor, login walls, etc. — never yank apply tab to SERP
+        // during a Glassdoor handoff (that aborts the Easy Apply flow).
+        let gdAwait = false;
+        try {
+          const { sessionGlassdoor: sGd = null } = await chrome.storage.local.get(["sessionGlassdoor"]);
+          gdAwait = !!(sGd?.active && sGd.awaitingIndeed);
+        } catch (_e) {}
+        const isHelp =
+          /help\.|support\.|\/hc\/|guidelines|articles\//i.test(url) ||
+          /accounts\.google|recaptcha|just a moment/i.test(document.title || "");
         S().log(PLATFORM, `Page non gérée: ${url}`, "warn");
+        if (gdAwait || isHelp || session.fromGlassdoor) {
+          return;
+        }
         if (session.searchUrl) window.location.href = session.searchUrl;
       }
     } catch (err) {
@@ -1901,10 +3424,41 @@
     }
   });
 
+  async function checkAndResumeSession() {
+    if (!isTopAutomationFrame()) return;
+    const start = Date.now();
+    while (Date.now() - start < 120000) {
+      if (isRunning) return;
+      const session = await getSession();
+      if (!session?.active) return;
+      // Don't steal focus from an open Smart Apply wizard
+      try {
+        const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
+        if (tabs?.hasSmartApply && isSearchPage()) {
+          await S().sleep(3000);
+          continue;
+        }
+      } catch (_e) {}
+      if (Date.now() - (session.lastRunAt || 0) < 2500) {
+        await S().sleep(1500);
+        continue;
+      }
+      await S().sleep(1200);
+      if (!isRunning) await runAutoApplySession();
+      return;
+    }
+  }
+
   S().log(PLATFORM, `Indeed module v${VERSION} chargé`);
   setTimeout(() => {
     getSession().then((session) => {
       if (session?.active || isSmartApplyPage()) runAutoApplySession();
     });
   }, 1800);
+  // Early returns (empty SERP retry, Pause SERP) used to stall forever without a resume loop
+  setInterval(() => {
+    getSession().then((session) => {
+      if (session?.active && !isRunning) checkAndResumeSession();
+    });
+  }, 8000);
 })();
