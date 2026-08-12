@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.4.47";
+const EXT_VERSION = "1.4.48";
 let lastGlassdoorSerpRestoreAt = 0;
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
@@ -319,6 +319,8 @@ let lastIndeedLoginWallAt = 0;
 /** Armed while Glassdoor clicks Easy Apply without a scrapable Indeed href. */
 let indeedHandoffCapture = null;
 let tabEnforceLock = false;
+/** platform -> chrome window id (dual mode uses separate windows). */
+const platformWindowIds = Object.create(null);
 const lastPlatformReopenAt = Object.create(null);
 const platformReopenCount = Object.create(null);
 
@@ -553,9 +555,51 @@ function tabMatchesPlatform(tab, platform) {
   return detectPlatformFromUrl(tab?.url || "") === platform;
 }
 
-async function listPlatformTabs(platform) {
-  const tabs = await chrome.tabs.query({});
+async function listPlatformTabs(platform, windowId = null) {
+  const tabs = await chrome.tabs.query(windowId != null ? { windowId } : {});
   return tabs.filter((t) => t.id && tabMatchesPlatform(t, platform));
+}
+
+async function isParallelSmartApplyEnabled() {
+  try {
+    const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+    return !!amijobsMeta?.parallelSmartApply;
+  } catch (_e) {
+    return false;
+  }
+}
+
+async function getPlatformWindowId(platform) {
+  if (platformWindowIds[platform]) {
+    try {
+      await chrome.windows.get(platformWindowIds[platform]);
+      return platformWindowIds[platform];
+    } catch (_e) {
+      delete platformWindowIds[platform];
+    }
+  }
+  try {
+    const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+    const id = amijobsMeta?.platformWindowIds?.[platform];
+    if (id != null) {
+      try {
+        await chrome.windows.get(id);
+        platformWindowIds[platform] = id;
+        return id;
+      } catch (_e) {}
+    }
+  } catch (_e) {}
+  return null;
+}
+
+async function persistPlatformWindowIds() {
+  try {
+    const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+    if (!amijobsMeta) return;
+    await chrome.storage.local.set({
+      amijobsMeta: { ...amijobsMeta, platformWindowIds: { ...platformWindowIds } },
+    });
+  } catch (_e) {}
 }
 
 function pickTabToKeep(tabs, preferredUrl = "") {
@@ -580,8 +624,13 @@ function pickTabToKeep(tabs, preferredUrl = "") {
 }
 
 /** HARD RULE: at most one browser tab per job board. Never create a second.
- * Indeed exception: SERP and Smart Apply may coexist — never navigate Apply→SERP or close the other. */
-async function ensureSinglePlatformTab(platform, url, { active = false, forceNavigate = true } = {}) {
+ * Indeed exception: SERP and Smart Apply may coexist — never navigate Apply→SERP or close the other.
+ * Parallel dual mode: allow 2 Smart Apply tabs (Indeed mass-apply + Glassdoor handoff). */
+async function ensureSinglePlatformTab(platform, url, { active = false, forceNavigate = true, windowId = null } = {}) {
+  const parallel = await isParallelSmartApplyEnabled();
+  const targetWindowId =
+    windowId != null ? windowId : (await getPlatformWindowId(platform)) || null;
+
   // Indeed: keep board + apply as separate slots
   if (platform === "indeed") {
     const tabs = await listPlatformTabs("indeed");
@@ -590,22 +639,56 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
     const wantApply = /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk|\/apply\b/i.test(
       String(url || "")
     );
-    const isApplyTab = (t) =>
-      /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(t.url || "");
+    const isApplyTab = (t) => {
+      if (isIndeedLoginWallUrl(t.url || "")) return false;
+      try {
+        const u = new URL(t.url || "", "https://indeed.com");
+        return /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(
+          `${u.hostname}${u.pathname}`
+        );
+      } catch (_e) {
+        return /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(
+          String(t.url || "").split(/[?#]/)[0]
+        );
+      }
+    };
     const applyTabs = tabs.filter((t) => isApplyTab(t));
-    const boardTabs = tabs.filter((t) => !isApplyTab(t));
+    const boardTabs = tabs.filter((t) => !isApplyTab(t) && !isIndeedLoginWallUrl(t.url || ""));
+    const maxApply = parallel ? 2 : 1;
     const pool = wantApply ? applyTabs : boardTabs;
     const otherPool = wantApply ? boardTabs : applyTabs;
 
     // Cap duplicates inside the target pool only — never touch the other pool
-    const keep = pickTabToKeep(pool, url) || pool[0] || null;
-    for (const t of pool) {
-      if (keep && t.id === keep.id) continue;
-      try {
-        await chrome.tabs.remove(t.id);
-      } catch (_e) {}
+    let keep = pickTabToKeep(pool, url) || pool[0] || null;
+    // Parallel: when opening a new apply URL, prefer an apply tab in the caller's window,
+    // or create a new one instead of hijacking the other board's wizard.
+    if (wantApply && parallel && targetWindowId != null) {
+      const inWin = applyTabs.filter((t) => t.windowId === targetWindowId);
+      if (inWin.length) keep = pickTabToKeep(inWin, url) || inWin[0];
+      else keep = null; // force create in this window below
     }
-    // Cap other pool to 1 as well (without navigating it)
+    const maxPool = wantApply ? maxApply : 1;
+    if (pool.length > maxPool) {
+      const sorted = [...pool].sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+      const keepSet = new Set(
+        (wantApply && parallel ? sorted.slice(0, maxApply) : [keep].filter(Boolean)).map((t) => t.id)
+      );
+      if (keep?.id) keepSet.add(keep.id);
+      for (const t of pool) {
+        if (keepSet.has(t.id)) continue;
+        try {
+          await chrome.tabs.remove(t.id);
+        } catch (_e) {}
+      }
+    } else if (keep && !parallel) {
+      for (const t of pool) {
+        if (t.id === keep.id) continue;
+        try {
+          await chrome.tabs.remove(t.id);
+        } catch (_e) {}
+      }
+    }
+    // Cap other pool (board) to 1 as well (without navigating it)
     if (otherPool.length > 1) {
       const keepOther = pickTabToKeep(otherPool, wantApply ? "/jobs" : "smartapply") || otherPool[0];
       for (const t of otherPool) {
@@ -632,7 +715,11 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
       // Need apply tab but only had board → create apply tab
       if (wantApply && !isApplyTab(keep) && url) {
         try {
-          const created = await chrome.tabs.create({ url, active: !!active });
+          const created = await chrome.tabs.create({
+            url,
+            active: !!active,
+            ...(targetWindowId != null ? { windowId: targetWindowId } : {}),
+          });
           return created?.id || keep.id;
         } catch (_e) {
           return keep.id;
@@ -643,14 +730,18 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
 
     if (!url) return null;
     try {
-      const created = await chrome.tabs.create({ url, active: !!active });
+      const created = await chrome.tabs.create({
+        url,
+        active: !!active,
+        ...(targetWindowId != null ? { windowId: targetWindowId } : {}),
+      });
       return created?.id || null;
     } catch (_e) {
       return null;
     }
   }
 
-  const tabs = await listPlatformTabs(platform);
+  const tabs = await listPlatformTabs(platform, targetWindowId);
   const keep = pickTabToKeep(tabs, url);
   const extras = tabs.filter((t) => keep && t.id !== keep.id);
 
@@ -679,7 +770,11 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
 
   if (!url) return null;
   try {
-    const created = await chrome.tabs.create({ url, active: !!active });
+    const created = await chrome.tabs.create({
+      url,
+      active: !!active,
+      ...(targetWindowId != null ? { windowId: targetWindowId } : {}),
+    });
     return created?.id || null;
   } catch (_e) {
     return null;
@@ -694,17 +789,18 @@ async function enforceOneTabPerPlatform(reason = "") {
       const tabs = await listPlatformTabs(platform);
       if (tabs.length <= 1) continue;
 
-      // Indeed exception: allow 1 SERP + 1 Apply (+ keep login wall while user signs in)
+      // Indeed exception: allow 1 SERP + Apply (+ keep login wall while user signs in)
+      // Parallel dual mode: keep up to 2 Smart Apply tabs (Indeed + Glassdoor handoff)
       if (platform === "indeed") {
+        const parallel = await isParallelSmartApplyEnabled();
+        const maxApply = parallel ? 2 : 1;
         const isLoginTab = (t) => isIndeedLoginWallUrl(t.url || "");
         const isApplyTab = (t) => {
           if (isLoginTab(t)) return false;
           try {
             const u = new URL(t.url || "", "https://indeed.com");
             const hostPath = `${u.hostname}${u.pathname}`;
-            return /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(
-              hostPath
-            );
+            return /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(hostPath);
           } catch (_e) {
             const s = String(t.url || "").split(/[?#]/)[0];
             return /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(s);
@@ -713,10 +809,10 @@ async function enforceOneTabPerPlatform(reason = "") {
         const loginTabs = tabs.filter((t) => isLoginTab(t));
         const applyTabs = tabs.filter((t) => isApplyTab(t));
         const boardTabs = tabs.filter((t) => !isApplyTab(t) && !isLoginTab(t));
-        const keepApply = pickTabToKeep(applyTabs, "smartapply");
         const keepBoard = pickTabToKeep(boardTabs, "/jobs");
         const keepLogin = pickTabToKeep(loginTabs, "/auth") || loginTabs[0] || null;
-        // During an active wizard, do not close apply tabs (SPA URL changes look like dupes)
+        const sortedApply = [...applyTabs].sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+        const keepApplyIds = new Set(sortedApply.slice(0, maxApply).map((t) => t.id));
         const { indeedWizardBusy = null, amijobsMeta = null } = await chrome.storage.local.get([
           "indeedWizardBusy",
           "amijobsMeta",
@@ -725,8 +821,7 @@ async function enforceOneTabPerPlatform(reason = "") {
         const loginPause = !!amijobsMeta?.indeedLoginRequired;
         if (!wizardHot) {
           for (const t of applyTabs) {
-            // During login pause keep SERP + auth only (drop bouncing apply tabs)
-            if (loginPause || (keepApply && t.id !== keepApply.id)) {
+            if (loginPause || !keepApplyIds.has(t.id)) {
               try {
                 await chrome.tabs.remove(t.id);
               } catch (_e) {}
@@ -740,7 +835,6 @@ async function enforceOneTabPerPlatform(reason = "") {
             } catch (_e) {}
           }
         }
-        // Keep a single auth tab during login pause; close extras
         for (const t of loginTabs) {
           if (keepLogin && t.id !== keepLogin.id) {
             try {
@@ -748,7 +842,7 @@ async function enforceOneTabPerPlatform(reason = "") {
             } catch (_e) {}
           }
         }
-        if (reason && !wizardHot && (applyTabs.length > 1 || boardTabs.length > 1)) {
+        if (reason && !wizardHot && (applyTabs.length > maxApply || boardTabs.length > 1)) {
           await appendLog(`Onglets indeed fusionnés (SERP+Apply) — ${reason}`, "warn", platform);
         }
         continue;
@@ -808,21 +902,50 @@ async function enforceOneTabPerPlatform(reason = "") {
 }
 
 async function openPlatformTabs(urls, platforms) {
-  let first = true;
-  // Honor caller order (Glassdoor before Indeed for parallel startup)
   const ordered = Array.isArray(platforms) && platforms.length
-    ? platforms.filter((p) => SUPPORTED_PLATFORMS.includes(p))
-    : SUPPORTED_PLATFORMS;
+    ? platforms.filter((p) => SUPPORTED_PLATFORMS.includes(p) && urls[p])
+    : SUPPORTED_PLATFORMS.filter((p) => urls[p]);
+
+  // 2+ boards → one Chrome window each so both stay visible and can apply together
+  const useWindows = ordered.length >= 2;
+  let first = true;
+  let left = 40;
   for (const p of ordered) {
     if (!urls[p]) continue;
-    await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
+    if (useWindows) {
+      try {
+        const win = await chrome.windows.create({
+          url: urls[p],
+          type: "normal",
+          focused: first,
+          width: 1180,
+          height: 900,
+          left,
+          top: 40,
+        });
+        if (win?.id != null) {
+          platformWindowIds[p] = win.id;
+        }
+        left += 60;
+      } catch (_e) {
+        await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
+      }
+    } else {
+      await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
+    }
     first = false;
   }
+  if (useWindows) await persistPlatformWindowIds();
   await enforceOneTabPerPlatform("démarrage session");
 }
 
 async function navigatePlatformTab(platform, url) {
-  return ensureSinglePlatformTab(platform, url, { active: false, forceNavigate: true });
+  const windowId = await getPlatformWindowId(platform);
+  return ensureSinglePlatformTab(platform, url, {
+    active: false,
+    forceNavigate: true,
+    windowId,
+  });
 }
 
 let externalApplyTabId = null;
@@ -1865,6 +1988,20 @@ async function preferredBoardStillActive(preferOwner) {
 
 async function acquireSmartApplyLock(owner, ttlMs = SMART_APPLY_LOCK_TTL_MS, handoff = false) {
   if (!owner) return { ok: false, reason: "no_owner" };
+
+  // Dual Indeed+Glassdoor: both may run a Smart Apply wizard at once (separate windows/tabs).
+  // The old exclusive mutex made Glassdoor idle with "Smart Apply occupé" the whole Indeed wizard.
+  if (await isParallelSmartApplyEnabled()) {
+    const now = Date.now();
+    const { amijobsSmartApplyOwners = {} } = await chrome.storage.local.get(["amijobsSmartApplyOwners"]);
+    const owners = { ...(amijobsSmartApplyOwners || {}), [owner]: now };
+    await chrome.storage.local.set({
+      amijobsSmartApplyOwners: owners,
+      amijobsSmartApplyLock: { owner, at: now, parallel: true },
+    });
+    return { ok: true, owner, parallel: true };
+  }
+
   const data = await chrome.storage.local.get([
     "amijobsSmartApplyLock",
     "amijobsSmartApplyPrefer",
@@ -1919,6 +2056,19 @@ async function acquireSmartApplyLock(owner, ttlMs = SMART_APPLY_LOCK_TTL_MS, han
 
 async function releaseSmartApplyLock(owner, { fair = false } = {}) {
   if (!owner) return { ok: true };
+  if (await isParallelSmartApplyEnabled()) {
+    const { amijobsSmartApplyOwners = {} } = await chrome.storage.local.get(["amijobsSmartApplyOwners"]);
+    const owners = { ...(amijobsSmartApplyOwners || {}) };
+    delete owners[owner];
+    await chrome.storage.local.set({
+      amijobsSmartApplyOwners: owners,
+      amijobsSmartApplyLock: Object.keys(owners).length
+        ? { owner: Object.keys(owners)[0], at: Date.now(), parallel: true }
+        : null,
+      amijobsSmartApplyPrefer: null,
+    });
+    return { ok: true, parallel: true };
+  }
   const { amijobsSmartApplyLock = null } = await chrome.storage.local.get(["amijobsSmartApplyLock"]);
   if (!amijobsSmartApplyLock?.owner || amijobsSmartApplyLock.owner === owner) {
     const other =
@@ -2884,6 +3034,7 @@ async function startMultiSession(msg) {
   const location = locations[0] || "";
   const locationsOrEmpty = locations.length ? locations : [""];
 
+  const parallelDual = platforms.includes("indeed") && platforms.includes("glassdoor");
   const amijobsMeta = {
     active: true,
     platforms,
@@ -2894,6 +3045,8 @@ async function startMultiSession(msg) {
     maxJobs,
     startedAt: new Date().toISOString(),
     indeedLoginRequired: false,
+    parallelSmartApply: parallelDual,
+    platformWindowIds: {},
   };
 
   const updates = { amijobsMeta, enabled: true };
@@ -2944,25 +3097,26 @@ async function startMultiSession(msg) {
     });
   }
 
-  // Shared Smart Apply mutex — both SERPs run together; wizard turns alternate after each apply.
-  // Do NOT prefer Glassdoor at start (that starved Indeed and looked like "only Glassdoor").
+  // Shared Smart Apply state — dual mode runs wizards in parallel (separate windows)
   updates.amijobsSmartApplyLock = null;
   updates.amijobsSmartApplyPrefer = null;
+  updates.amijobsSmartApplyOwners = {};
 
   await chrome.storage.local.set(updates);
   // Reset reopen storm counters for this run
   for (const p of platforms) {
     platformReopenCount[p] = 0;
     lastPlatformReopenAt[p] = 0;
+    delete platformWindowIds[p];
   }
   await appendLog(
     `Session AmiJobs démarrée (${platforms.join(" + ")}): "${keywords}" @ "${locationsOrEmpty.join(", ")}"` +
       (contracts.length ? ` [${contracts.join(", ")}]` : ""),
     "success"
   );
-  if (platforms.includes("indeed") && platforms.includes("glassdoor")) {
+  if (parallelDual) {
     await appendLog(
-      "Mode parallèle Indeed+Glassdoor — les 2 SERP actifs, Smart Apply en alternance",
+      "Mode parallèle Indeed+Glassdoor — 1 fenêtre par board, Smart Apply simultanés",
       "info"
     );
   }
@@ -3169,9 +3323,18 @@ function handleMessage(msg, sendResponse, sender = null) {
         }
       }
       try {
+        // Glassdoor Easy Apply → open Smart Apply in the Glassdoor window (not Indeed's)
+        let windowId = msg.windowId != null ? msg.windowId : null;
+        if (windowId == null && msg.windowOwner) {
+          windowId = await getPlatformWindowId(msg.windowOwner);
+        }
+        if (windowId == null && msg.platform === "indeed" && msg.fromGlassdoor) {
+          windowId = await getPlatformWindowId("glassdoor");
+        }
         const tabId = await ensureSinglePlatformTab(msg.platform, msg.url, {
           active: !!msg.active,
           forceNavigate: msg.forceNavigate !== false,
+          windowId,
         });
         sendResponse({ ok: true, tabId });
       } catch (e) {
@@ -3326,20 +3489,26 @@ function handleMessage(msg, sendResponse, sender = null) {
   if (msg.action === "listIndeedTabs") {
     listPlatformTabs("indeed")
       .then((tabs) => {
-        const hasSmartApply = tabs.some((t) =>
-          /smartapply|indeedapply|applybyapplyablejobid/i.test(t.url || "")
-        );
-        // Glassdoor Easy Apply often lands on viewjob / rc/clk before smartapply
-        // Do NOT count SERP /jobs?vjk= — Indeed always has a panel open while browsing
-        const hasApplyTab = tabs.some((t) =>
+        const applyTabs = tabs.filter((t) =>
           /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk|\/apply\b/i.test(
             t.url || ""
           )
         );
+        const hasSmartApply = tabs.some((t) =>
+          /smartapply|indeedapply|applybyapplyablejobid/i.test(t.url || "")
+        );
+        const hasApplyTab = applyTabs.length > 0;
         const hasSerp = tabs.some(
           (t) => /\/jobs\b/i.test(t.url || "") && !/smartapply|indeedapply|\/viewjob|\/rc\/clk/i.test(t.url || "")
         );
-        sendResponse({ ok: true, count: tabs.length, hasSmartApply, hasApplyTab, hasSerp });
+        sendResponse({
+          ok: true,
+          count: tabs.length,
+          applyCount: applyTabs.length,
+          hasSmartApply,
+          hasApplyTab,
+          hasSerp,
+        });
       })
       .catch((e) => sendResponse({ ok: false, reason: e.message }));
     return true;
@@ -3349,14 +3518,14 @@ function handleMessage(msg, sendResponse, sender = null) {
     (async () => {
       try {
         const tabs = await listPlatformTabs("indeed");
-        const apply = tabs.find((t) =>
+        const applies = tabs.filter((t) =>
           /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(t.url || "")
         );
-        if (apply?.id) {
-          await chrome.tabs.update(apply.id, { active: true }).catch(() => {});
+        for (const apply of applies.slice(0, 2)) {
+          if (!apply?.id) continue;
           await chrome.tabs.sendMessage(apply.id, { action: "startAutoApply" }).catch(() => {});
         }
-        sendResponse({ ok: true, nudged: !!apply?.id });
+        sendResponse({ ok: true, nudged: applies.length > 0, count: applies.length });
       } catch (e) {
         sendResponse({ ok: false, reason: e.message });
       }

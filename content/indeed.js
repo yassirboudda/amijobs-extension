@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.47";
+  const VERSION = "1.4.48";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -2535,17 +2535,28 @@
     }
 
     // Only defer opening a NEW Indeed apply while a live Smart Apply wizard is open
-    // (shared with Glassdoor). Do NOT starve Indeed on "prefer Glassdoor" alone.
+    // (shared with Glassdoor). Parallel dual mode: keep applying unless 2 wizards already run.
     let deferNewApply = false;
     try {
-      const { indeedWizardBusy = null } = await chrome.storage.local.get(["indeedWizardBusy"]);
+      const { amijobsMeta = null, indeedWizardBusy = null } = await chrome.storage.local.get([
+        "amijobsMeta",
+        "indeedWizardBusy",
+      ]);
+      const parallel = !!amijobsMeta?.parallelSmartApply;
       const busyAge = indeedWizardBusy?.at ? Date.now() - indeedWizardBusy.at : 999999;
       const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
+      const applyCount = Number(tabs?.applyCount || (tabs?.hasSmartApply || tabs?.hasApplyTab ? 1 : 0));
       const hasSmart =
         tabs?.hasSmartApply ||
         /smartapply|indeedapply/i.test(location.href);
       if (busyAge < 180000 && !hasSmart && isSearchPage()) {
         await chrome.storage.local.set({ indeedWizardBusy: null });
+      } else if (parallel) {
+        // Allow Indeed SERP to keep opening jobs while Glassdoor also has a wizard
+        deferNewApply = applyCount >= 2 && isSearchPage();
+        if (deferNewApply) {
+          S().log(PLATFORM, "2 Smart Apply déjà ouverts — Indeed SERP attend un slot", "warn");
+        }
       } else if (hasSmart && isSearchPage()) {
         deferNewApply = true;
         try {
@@ -2555,10 +2566,10 @@
     } catch (_e) {}
 
     // While Glassdoor owns the live wizard, Indeed browses but does not Postuler
-    const { sessionGlassdoor = null, glassdoorSmartApply = null } = await chrome.storage.local.get([
-      "sessionGlassdoor",
-      "glassdoorSmartApply",
-    ]);
+    // (unless parallel dual mode — both boards apply at once)
+    const { sessionGlassdoor = null, glassdoorSmartApply = null, amijobsMeta: metaPar = null } =
+      await chrome.storage.local.get(["sessionGlassdoor", "glassdoorSmartApply", "amijobsMeta"]);
+    const parallelDual = !!metaPar?.parallelSmartApply;
     const gdAwaiting = !!(sessionGlassdoor?.active && sessionGlassdoor?.awaitingIndeed);
     const gdSmartAge = glassdoorSmartApply ? Date.now() - (glassdoorSmartApply.at || 0) : 999999;
     const gdAwaitAge = gdAwaiting
@@ -2569,7 +2580,7 @@
       await chrome.storage.local.set({
         sessionGlassdoor: { ...sessionGlassdoor, awaitingIndeed: false, indeedHandoffDone: false },
       });
-    } else if (gdAwaiting || gdSmartAge < 120000) {
+    } else if (!parallelDual && (gdAwaiting || gdSmartAge < 120000)) {
       const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
       const hasSmart =
         tabs?.hasSmartApply ||

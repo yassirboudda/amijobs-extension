@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.4.47";
+  const VERSION = "1.4.48";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -675,6 +675,8 @@
           url: abs,
           active: true,
           forceNavigate: true,
+          fromGlassdoor: true,
+          windowOwner: "glassdoor",
         });
         S().log(
           PLATFORM,
@@ -784,7 +786,7 @@
     return { success: false, reason: "wizard_timeout" };
   }
 
-  /** Fail-fast on shared Smart Apply mutex — keep Glassdoor SERP moving while Indeed applies. */
+  /** In parallel dual mode the lock always succeeds — both boards apply at once. */
   async function waitForSmartApplyLock(maxMs = 6000) {
     const start = Date.now();
     let logged = false;
