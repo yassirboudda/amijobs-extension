@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.4.45";
+  const VERSION = "1.4.46";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -898,13 +898,13 @@
     }
     try {
       const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
-      if (amijobsMeta?.indeedLoginRequired) {
+      if (amijobsMeta?.indeedLoginRequired || sGate?.awaitingIndeedLogin) {
         S().log(
           PLATFORM,
-          "Indeed non connecté — Easy Apply (Indeed) ignoré, suite Glassdoor seule",
+          "En attente connexion Indeed — Easy Apply en pause (pas d'abandon d'offres)",
           "warn"
         );
-        return { success: false, reason: "indeed_login_required" };
+        return { success: false, reason: "indeed_login_wait" };
       }
     } catch (_e) {}
     if (detectGlassdoorDailyLimit()) {
@@ -1374,6 +1374,21 @@
       return;
     }
 
+    try {
+      const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+      if (amijobsMeta?.indeedLoginRequired || session.awaitingIndeedLogin) {
+        S().log(
+          PLATFORM,
+          "Pause Glassdoor — connectez-vous sur l'onglet Indeed (reprise auto)",
+          "warn"
+        );
+        isRunning = false;
+        await clearGlassdoorRunLock();
+        await S().sleep(10000);
+        return;
+      }
+    } catch (_e) {}
+
     // Only wait when THIS Glassdoor session handed off to Smart Apply
     if (session.awaitingIndeed) {
       const age = Date.now() - (session.lastRunAt || Date.parse(session.startedAt) || Date.now());
@@ -1560,6 +1575,10 @@
           S().log(PLATFORM, `Smart Apply occupé — offre gardée pour plus tard: ${jobInfo.title}`, "warn");
           await clearJobListingFromUrl(session);
           // Fall through to SERP card loop (do not abort run after soft clear)
+        } else if (result.reason === "indeed_login_wait") {
+          S().log(PLATFORM, "Pause Glassdoor — connectez-vous sur Indeed puis reprise auto", "warn");
+          await S().sleep(10000);
+          return;
         } else if (result.reason) {
           // Including no_easy_apply — must markSkipped or the same jl= reopens forever
           await chrome.runtime.sendMessage({
@@ -1779,6 +1798,10 @@
           S().log(PLATFORM, "Smart Apply occupé (Indeed) — autre offre Glassdoor", "warn");
           await S().sleep(2500);
           continue;
+        } else if (result.reason === "indeed_login_wait") {
+          S().log(PLATFORM, "Pause — connexion Indeed requise (offres conservées)", "warn");
+          await S().sleep(12000);
+          return;
         } else if (result.reason === "gd_daily_limit") {
           await chrome.runtime.sendMessage({
             action: "markSkipped",

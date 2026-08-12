@@ -3,7 +3,7 @@
 // https://amijobs.com
 // ============================================================================
 
-const EXT_VERSION = "1.4.45";
+const EXT_VERSION = "1.4.46";
 let lastGlassdoorSerpRestoreAt = 0;
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
@@ -355,14 +355,12 @@ function isIndeedSmartApplyUrl(url = "") {
 }
 
 /**
- * Glassdoor→Indeed landed on login. Clear handoff, close auth tab, block further
- * Indeed handoffs for this run so we don't endSession→kickGlassdoor→auth forever.
+ * Indeed asked for login mid-session.
+ * Pause dual-mode, KEEP the auth tab so the user can sign in, then auto-resume.
+ * Never close the auth tab / end sessions in a loop — that caused the Connexion thrash.
  */
 async function handleIndeedLoginWall(tabId, url = "") {
   const now = Date.now();
-  if (now - lastIndeedLoginWallAt < 8000) return { ok: true, deduped: true };
-  lastIndeedLoginWallAt = now;
-
   const data = await chrome.storage.local.get([
     "sessionIndeed",
     "sessionGlassdoor",
@@ -372,9 +370,29 @@ async function handleIndeedLoginWall(tabId, url = "") {
   const sessionIndeed = data.sessionIndeed || null;
   const sessionGlassdoor = data.sessionGlassdoor || null;
   const meta = data.amijobsMeta || {};
+  const alreadyPaused = !!meta.indeedLoginRequired;
+
+  // Dedup noisy repeats, but always refresh pause flags
+  if (now - lastIndeedLoginWallAt < 5000 && alreadyPaused) {
+    if (tabId != null) {
+      try {
+        await chrome.tabs.update(tabId, { active: true });
+      } catch (_e) {}
+    }
+    return { ok: true, deduped: true, paused: true };
+  }
+  lastIndeedLoginWallAt = now;
+
+  watchingIndeedFromGlassdoor = null;
+  indeedHandoffCapture = null;
 
   await chrome.storage.local.set({
-    amijobsMeta: { ...meta, indeedLoginRequired: true, indeedLoginAt: new Date().toISOString() },
+    amijobsMeta: {
+      ...meta,
+      indeedLoginRequired: true,
+      indeedLoginAt: meta.indeedLoginAt || new Date().toISOString(),
+      indeedLoginTabId: tabId != null ? tabId : meta.indeedLoginTabId || null,
+    },
     indeedWizardBusy: null,
     glassdoorSmartApply: null,
   });
@@ -382,53 +400,133 @@ async function handleIndeedLoginWall(tabId, url = "") {
   try {
     await releaseSmartApplyLock("indeed");
   } catch (_e) {}
+  try {
+    await releaseSmartApplyLock("glassdoor");
+  } catch (_e) {}
 
-  // Always clear Glassdoor handoff wait — auth will never complete the wizard
+  // Clear in-flight Glassdoor→Indeed handoff (auth cannot finish the wizard)
   if (sessionGlassdoor?.active) {
     await chrome.storage.local.set({
       sessionGlassdoor: {
         ...sessionGlassdoor,
         awaitingIndeed: false,
         indeedHandoffDone: false,
+        awaitingIndeedLogin: true,
         lastRunAt: Date.now(),
         runLockAt: 0,
       },
     });
   }
 
-  const wasHandoff = !!(sessionIndeed?.fromGlassdoor || sessionGlassdoor?.awaitingIndeed);
+  // Drop ephemeral Glassdoor-owned Indeed session; keep native Indeed paused
   if (sessionIndeed?.active && sessionIndeed.fromGlassdoor) {
     await chrome.storage.local.set({
-      sessionIndeed: { ...sessionIndeed, active: false, phase: "done", endedAt: new Date().toISOString() },
-      lastSessionIndeed: { ...sessionIndeed, active: false, endedAt: new Date().toISOString() },
+      sessionIndeed: {
+        ...sessionIndeed,
+        active: false,
+        phase: "done",
+        endedAt: new Date().toISOString(),
+      },
+      lastSessionIndeed: {
+        ...sessionIndeed,
+        active: false,
+        endedAt: new Date().toISOString(),
+      },
+    });
+  } else if (sessionIndeed?.active && !sessionIndeed.fromGlassdoor) {
+    await chrome.storage.local.set({
+      sessionIndeed: {
+        ...sessionIndeed,
+        pausedForLogin: true,
+        phase: sessionIndeed.phase === "apply" ? "search" : sessionIndeed.phase,
+        lastRunAt: Date.now(),
+      },
     });
   }
 
-  await appendLog(
-    wasHandoff
-      ? "Connexion Indeed requise — handoff Glassdoor abandonné (pas de boucle)"
-      : "Connexion Indeed requise — handoffs Indeed bloqués pour cette session",
-    "warn",
-    "indeed"
-  );
+  if (!alreadyPaused) {
+    await appendLog(
+      "Connexion Indeed requise — connectez-vous dans l'onglet Indeed; reprise auto après connexion",
+      "warn",
+      "indeed"
+    );
+  }
 
+  // Keep auth tab open and focused so the user can actually log in
   if (tabId != null) {
     try {
-      await chrome.tabs.remove(tabId);
+      await chrome.tabs.update(tabId, { active: true });
     } catch (_e) {}
   }
 
-  // Native Indeed mass-apply cannot continue without login
-  if (sessionIndeed?.active && !sessionIndeed.fromGlassdoor) {
-    await endPlatformSession("indeed", "Connexion Indeed requise");
-  } else if (sessionGlassdoor?.active) {
-    // Resume Glassdoor SERP without re-opening Indeed auth tabs
-    setTimeout(() => {
-      kickPlatformSessions(["glassdoor"]).catch(() => {});
-    }, 1200);
+  return { ok: true, blocked: true, paused: true };
+}
+
+/** Clear login pause and resume Indeed + Glassdoor after the user signs in. */
+async function clearIndeedLoginGate(reason = "login_ok") {
+  const data = await chrome.storage.local.get([
+    "sessionIndeed",
+    "sessionGlassdoor",
+    "amijobsMeta",
+  ]);
+  const meta = data.amijobsMeta || {};
+  if (!meta.indeedLoginRequired && !data.sessionIndeed?.pausedForLogin && !data.sessionGlassdoor?.awaitingIndeedLogin) {
+    return { ok: true, cleared: false };
   }
 
-  return { ok: true, blocked: true };
+  const nextMeta = { ...meta };
+  delete nextMeta.indeedLoginRequired;
+  delete nextMeta.indeedLoginAt;
+  delete nextMeta.indeedLoginTabId;
+
+  const updates = { amijobsMeta: nextMeta };
+  if (data.sessionIndeed?.active) {
+    updates.sessionIndeed = {
+      ...data.sessionIndeed,
+      pausedForLogin: false,
+      lastRunAt: 0,
+      runLockAt: 0,
+    };
+  }
+  if (data.sessionGlassdoor?.active) {
+    updates.sessionGlassdoor = {
+      ...data.sessionGlassdoor,
+      awaitingIndeedLogin: false,
+      awaitingIndeed: false,
+      indeedHandoffDone: false,
+      lastRunAt: 0,
+      runLockAt: 0,
+    };
+  }
+  await chrome.storage.local.set(updates);
+  await appendLog(`Indeed reconnecté (${reason}) — reprise Indeed + Glassdoor`, "success", "indeed");
+
+  setTimeout(() => {
+    const platforms = [];
+    if (updates.sessionIndeed?.active || data.sessionIndeed?.active) platforms.push("indeed");
+    if (updates.sessionGlassdoor?.active || data.sessionGlassdoor?.active) platforms.push("glassdoor");
+    if (platforms.length) kickPlatformSessions(platforms).catch(() => {});
+  }, 800);
+
+  return { ok: true, cleared: true };
+}
+
+function urlLooksIndeedLoggedIn(url = "") {
+  if (!url || isIndeedLoginWallUrl(url)) return false;
+  try {
+    const u = new URL(String(url), "https://indeed.com");
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname || "";
+    if (host === "smartapply.indeed.com" || host.endsWith(".smartapply.indeed.com")) return true;
+    if (!/(^|\.)indeed\.(com|fr)$/i.test(host) && host !== "indeed.com" && host !== "indeed.fr") {
+      return false;
+    }
+    // Jobs SERP / viewjob / apply after auth redirect
+    return /\/jobs\b|\/viewjob|\/(?:beta\/)?indeedapply|\/apply\b|\/pagead\/clk|\/rc\/clk/i.test(path);
+  } catch (_e) {
+    const s = String(url).split(/[?#]/)[0];
+    return /smartapply\.indeed\.com|indeed\.(com|fr)\/(?:jobs|viewjob|indeedapply|apply)/i.test(s);
+  }
 }
 
 function detectPlatformFromUrl(url = "") {
@@ -596,22 +694,39 @@ async function enforceOneTabPerPlatform(reason = "") {
       const tabs = await listPlatformTabs(platform);
       if (tabs.length <= 1) continue;
 
-      // Indeed exception: allow 1 SERP + 1 Apply (smartapply / indeedapply / viewjob handoff)
+      // Indeed exception: allow 1 SERP + 1 Apply (+ keep login wall while user signs in)
       if (platform === "indeed") {
-        const isApplyTab = (t) =>
-          /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(
-            t.url || ""
-          );
+        const isLoginTab = (t) => isIndeedLoginWallUrl(t.url || "");
+        const isApplyTab = (t) => {
+          if (isLoginTab(t)) return false;
+          try {
+            const u = new URL(t.url || "", "https://indeed.com");
+            const hostPath = `${u.hostname}${u.pathname}`;
+            return /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(
+              hostPath
+            );
+          } catch (_e) {
+            const s = String(t.url || "").split(/[?#]/)[0];
+            return /smartapply|indeedapply|applybyapplyablejobid|\/viewjob|\/pagead\/clk|\/rc\/clk/i.test(s);
+          }
+        };
+        const loginTabs = tabs.filter((t) => isLoginTab(t));
         const applyTabs = tabs.filter((t) => isApplyTab(t));
-        const boardTabs = tabs.filter((t) => !isApplyTab(t));
+        const boardTabs = tabs.filter((t) => !isApplyTab(t) && !isLoginTab(t));
         const keepApply = pickTabToKeep(applyTabs, "smartapply");
         const keepBoard = pickTabToKeep(boardTabs, "/jobs");
+        const keepLogin = pickTabToKeep(loginTabs, "/auth") || loginTabs[0] || null;
         // During an active wizard, do not close apply tabs (SPA URL changes look like dupes)
-        const { indeedWizardBusy = null } = await chrome.storage.local.get(["indeedWizardBusy"]);
+        const { indeedWizardBusy = null, amijobsMeta = null } = await chrome.storage.local.get([
+          "indeedWizardBusy",
+          "amijobsMeta",
+        ]);
         const wizardHot = indeedWizardBusy?.at && Date.now() - indeedWizardBusy.at < 180000;
+        const loginPause = !!amijobsMeta?.indeedLoginRequired;
         if (!wizardHot) {
           for (const t of applyTabs) {
-            if (keepApply && t.id !== keepApply.id) {
+            // During login pause keep SERP + auth only (drop bouncing apply tabs)
+            if (loginPause || (keepApply && t.id !== keepApply.id)) {
               try {
                 await chrome.tabs.remove(t.id);
               } catch (_e) {}
@@ -620,6 +735,14 @@ async function enforceOneTabPerPlatform(reason = "") {
         }
         for (const t of boardTabs) {
           if (keepBoard && t.id !== keepBoard.id) {
+            try {
+              await chrome.tabs.remove(t.id);
+            } catch (_e) {}
+          }
+        }
+        // Keep a single auth tab during login pause; close extras
+        for (const t of loginTabs) {
+          if (keepLogin && t.id !== keepLogin.id) {
             try {
               await chrome.tabs.remove(t.id);
             } catch (_e) {}
@@ -1396,6 +1519,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     await handleIndeedLoginWall(tabId, url);
     return;
   }
+
+  // User finished signing in — leave auth for jobs/smartapply
+  try {
+    const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+    if (amijobsMeta?.indeedLoginRequired && urlLooksIndeedLoggedIn(url)) {
+      await clearIndeedLoginGate("navigated_after_auth");
+    }
+  } catch (_e) {}
 
   const isSmartApplyUrl = isIndeedSmartApplyUrl(url);
   const isHandoffLandingUrl = (() => {
@@ -2520,6 +2651,27 @@ setInterval(() => {
   ensureActiveSessionTabs().catch(() => {});
 }, 12000);
 
+// Auto-resume after the user finishes Indeed login (SPA may skip a clean onUpdated)
+setInterval(() => {
+  (async () => {
+    const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+    if (!amijobsMeta?.indeedLoginRequired) return;
+    const tabs = await listPlatformTabs("indeed");
+    const resumed = tabs.find((t) => urlLooksIndeedLoggedIn(t.url || ""));
+    if (resumed) {
+      await clearIndeedLoginGate("poll_after_auth");
+      return;
+    }
+    // Keep auth tab focused occasionally so the user notices
+    const auth = tabs.find((t) => isIndeedLoginWallUrl(t.url || ""));
+    if (auth?.id && amijobsMeta.indeedLoginTabId == null) {
+      await chrome.storage.local.set({
+        amijobsMeta: { ...amijobsMeta, indeedLoginTabId: auth.id },
+      });
+    }
+  })().catch(() => {});
+}, 8000);
+
 // Hard cap: never more than 1 tab per job board
 function isIndeedHandoffApplyUrl(url = "") {
   if (isIndeedLoginWallUrl(url)) return false;
@@ -3008,9 +3160,10 @@ function handleMessage(msg, sendResponse, sender = null) {
         sendResponse({ ok: false, reason: "indeed_login_wall" });
         return;
       }
-      if (msg.platform === "indeed") {
+      if (msg.platform === "indeed" && url && !isIndeedLoginWallUrl(url)) {
         const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
         if (amijobsMeta?.indeedLoginRequired) {
+          // Do not open more apply tabs until the user finishes signing in
           sendResponse({ ok: false, reason: "indeed_login_required" });
           return;
         }
@@ -3596,7 +3749,15 @@ function handleMessage(msg, sendResponse, sender = null) {
   }
 
   if (msg.action === "indeedLoginWall") {
-    handleIndeedLoginWall(msg.tabId ?? null, msg.url || "")
+    const tabId = msg.tabId ?? sender?.tab?.id ?? null;
+    handleIndeedLoginWall(tabId, msg.url || sender?.tab?.url || "")
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+
+  if (msg.action === "indeedLoginResolved") {
+    clearIndeedLoginGate(msg.reason || "content_resolved")
       .then((r) => sendResponse(r))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;

@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.45";
+  const VERSION = "1.4.46";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -3284,6 +3284,26 @@
       }
       if (!session?.active) return;
 
+      // Paused for Indeed login — wait, or auto-resume once auth is gone
+      try {
+        const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+        if (amijobsMeta?.indeedLoginRequired || session.pausedForLogin) {
+          if (isLoginWallPage() || detectLoginWall()) {
+            S().log(PLATFORM, "En attente de connexion Indeed…", "warn");
+            return;
+          }
+          if (isSearchPage() || isSmartApplyPage() || isViewJobPage()) {
+            await chrome.runtime
+              .sendMessage({ action: "indeedLoginResolved", reason: "indeed_page_ok" })
+              .catch(() => {});
+            session = await getSession();
+            if (!session?.active) return;
+          } else {
+            return;
+          }
+        }
+      } catch (_e) {}
+
       if (detectCloudflareChallenge() || detectBlockedPage()) {
         const ok = await tryPassCloudflareChallenge();
         if (!ok && detectBlockedPage() && !detectCloudflareChallenge()) {
@@ -3307,15 +3327,20 @@
           await tryPassCloudflareChallenge();
         }
         if (detectLoginWall() && !isSmartApplyPage()) {
-          // Background closes auth tab, clears Glassdoor handoff, blocks re-loop
+          // Pause + keep auth tab — do not end session / close tab (user must sign in)
           await chrome.runtime
             .sendMessage({
               action: "indeedLoginWall",
+              tabId: null,
               url: window.location.href,
               fromGlassdoor: !!session.fromGlassdoor,
             })
             .catch(() => {});
-          S().log(PLATFORM, "Connexion Indeed requise — session Indeed mise en pause", "warn");
+          S().log(
+            PLATFORM,
+            "Connexion Indeed requise — connectez-vous dans cet onglet; reprise auto ensuite",
+            "warn"
+          );
           return;
         }
       }
