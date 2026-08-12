@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.46";
+  const VERSION = "1.4.47";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -1174,6 +1174,21 @@
     );
   }
 
+  function isDisplayed(el) {
+    if (!el) return false;
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      // Sticky footers can be partially off-screen — allow tiny height
+      return rect.width > 2 && rect.height > 2;
+    } catch (_e) {
+      return false;
+    }
+  }
+
   function findSubmitButton(includeDisabled = true) {
     const submitRe = [
       /d[ée]poser\s*(ma|votre)?\s*candidature/i,
@@ -1186,27 +1201,69 @@
       /^d[ée]poser$/i,
       /postuler maintenant/i,
       /^apply now$/i,
+      /candidater/i,
     ];
     const testIds = [
       '[data-testid="submit-application"]',
       '[data-testid="submit-button"]',
       '[data-testid="indeed-apply-submit"]',
+      '[data-testid="ia-submitApplication-footerButton"]',
+      '[data-testid*="submitApplication"]',
       'button[data-testid*="submit"]',
       'button[type="submit"]',
+      'button.ia-continueButton',
+      'button.ia-Button--primary',
     ];
+    // IMPORTANT: do NOT use S().isVisible here — it treats disabled as invisible,
+    // and Indeed keeps "Déposer" disabled until the captcha UI flips.
     for (const sel of testIds) {
       for (const el of S().$$(sel)) {
-        if (!S().isVisible(el)) continue;
+        if (!isDisplayed(el)) continue;
         if (!includeDisabled && (el.disabled || el.getAttribute("aria-disabled") === "true")) continue;
         return el;
       }
     }
     for (const btn of S().$$("button, a[role='button'], input[type='submit'], [role='button']")) {
-      if (!S().isVisible(btn)) continue;
+      if (!isDisplayed(btn)) continue;
       if (!includeDisabled && (btn.disabled || btn.getAttribute("aria-disabled") === "true")) continue;
-      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
-      if (!text || /signaler|fermer|close|exit|options de cv/i.test(text)) continue;
+      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""} ${btn.value || ""}`
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!text || /signaler|fermer|close|exit|options de cv|passer au contenu|enregistrer et fermer|quitter|retour|back|preview|aperçu/i.test(text)) {
+        continue;
+      }
       if (submitRe.some((p) => p.test(text))) return btn;
+    }
+    return null;
+  }
+
+  async function waitForSubmitButton(maxMs = 20000) {
+    const start = Date.now();
+    let lastLog = 0;
+    while (Date.now() - start < maxMs) {
+      const btn = findSubmitButton(true);
+      if (btn) return btn;
+      // Re-inject token — Indeed often mounts Déposer only after callback fires
+      try {
+        const tok = window.__AmijobsRecaptchaToken || "";
+        if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
+          window.__AmijobsInjectRecaptchaToken(tok);
+        }
+        if (typeof window.__AmijobsClickRecaptcha === "function") window.__AmijobsClickRecaptcha();
+        else if (typeof window.__AmijobsSolveRecaptcha === "function") {
+          /* keep solving path warm */
+        }
+      } catch (_e) {}
+      if (Date.now() - lastLog > 5000) {
+        lastLog = Date.now();
+        const sample = [...S().$$("button")]
+          .filter((b) => isDisplayed(b))
+          .map((b) => `${(b.textContent || "").trim().slice(0, 24)}${b.disabled ? "[dis]" : ""}`)
+          .slice(0, 8)
+          .join(" | ");
+        S().log(PLATFORM, `Attente bouton Déposer… (${sample || "aucun"})`, "warn");
+      }
+      await S().sleep(700);
     }
     return null;
   }
@@ -2006,24 +2063,37 @@
         (!!document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, textarea[name="g-recaptcha-response"]') &&
           !!findSubmitButton(true));
       if (onReviewLike) {
+        window.__AmijobsReviewMisses = window.__AmijobsReviewMisses || 0;
         for (let captchaTry = 0; captchaTry < 3; captchaTry++) {
           const ok = await waitAndSolveRecaptcha(150000);
           if (!ok) break;
-          const submitBtn = findSubmitButton(true);
+          // After token inject, Indeed may take a few seconds to mount/enable Déposer
+          let submitBtn = findSubmitButton(true) || (await waitForSubmitButton(18000));
           if (!submitBtn || settings.autoSubmit === false) {
             if (!submitBtn) {
+              window.__AmijobsReviewMisses += 1;
               S().log(
                 PLATFORM,
-                `Bouton Déposer introuvable (path=${smartApplyPath()}) — boutons: ${[...S().$$("button")]
-                  .filter((b) => S().isVisible(b))
-                  .map((b) => (b.textContent || "").trim().slice(0, 28))
-                  .slice(0, 6)
+                `Bouton Déposer introuvable (path=${smartApplyPath()}, miss=${window.__AmijobsReviewMisses}) — boutons: ${[
+                  ...S().$$("button"),
+                ]
+                  .filter((b) => isDisplayed(b))
+                  .map((b) => {
+                    const t = (b.textContent || "").trim().slice(0, 28);
+                    return `${t}${b.disabled || b.getAttribute("aria-disabled") === "true" ? "[dis]" : ""}`;
+                  })
+                  .slice(0, 8)
                   .join(" | ")}`,
                 "warn"
               );
+              if (window.__AmijobsReviewMisses >= 8) {
+                S().log(PLATFORM, "Review sans Déposer après plusieurs essais — abandon offre", "error");
+                return { success: false, reason: "submit_button_missing" };
+              }
             }
             break;
           }
+          window.__AmijobsReviewMisses = 0;
           try {
             const tok = window.__AmijobsRecaptchaToken || "";
             if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
@@ -2040,6 +2110,9 @@
           }
           S().log(PLATFORM, `Clic submit: ${(submitBtn.textContent || "").trim().slice(0, 40)}`);
           forceEnableClickable(submitBtn);
+          try {
+            submitBtn.scrollIntoView({ block: "center", inline: "nearest" });
+          } catch (_e) {}
           await S().humanClick(submitBtn);
           // Native click fallback if humanClick ignored disabled styling
           try {
@@ -2080,7 +2153,7 @@
       if (!action) {
         if (onReviewLike) {
           await waitAndSolveRecaptcha(150000);
-          const sb = findSubmitButton(true);
+          const sb = findSubmitButton(true) || (await waitForSubmitButton(12000));
           if (sb && hasFreshRecaptchaToken() && settings.autoSubmit !== false) {
             forceEnableClickable(sb);
             S().log(PLATFORM, `Clic submit (retry): ${(sb.textContent || "").trim().slice(0, 40)}`);
@@ -2090,6 +2163,10 @@
             } catch (_e) {}
             await S().sleep(2000);
             if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
+          }
+          window.__AmijobsReviewMisses = (window.__AmijobsReviewMisses || 0) + 1;
+          if (window.__AmijobsReviewMisses >= 8) {
+            return { success: false, reason: "submit_button_missing" };
           }
           await S().sleep(1200);
           continue;
