@@ -1,4 +1,4 @@
-// AmiJobs — Cloudflare Turnstile: click + 2captcha (challenge pages need action/cData/chlPageData)
+// AmiJobs — Cloudflare Turnstile: calm click + 2captcha (NO mutation spam / Ray ID thrash)
 (function () {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -127,17 +127,25 @@
 
   function looksLikeChallenge() {
     const host = location.hostname || "";
+    const title = (document.title || "").toLowerCase();
     const text = (document.body?.innerText || "").toLowerCase();
     return (
       /challenges\.cloudflare\.com|turnstile/i.test(host) ||
       !!document.querySelector(".cf-turnstile, #challenge-stage, iframe[src*='challenges.cloudflare']") ||
-      /vérifiez que vous êtes humain|verify you are human|checking your browser|just a moment|un instant|confirmez que vous|confirm that you are human/.test(
-        text
+      /just a moment|additional verification required|vérifiez que vous êtes humain|verify you are human|checking your browser|un instant|confirmez que vous|confirm that you are human|ray id/.test(
+        title + " " + text
       )
     );
   }
 
+  // HARD RATE LIMIT — Cloudflare refreshes Ray ID when we click too fast / react to every DOM mutation
+  let lastAttemptAt = 0;
+  const ATTEMPT_MIN_GAP_MS = 4000;
+
   function attempt() {
+    const now = Date.now();
+    if (now - lastAttemptAt < ATTEMPT_MIN_GAP_MS) return false;
+    lastAttemptAt = now;
     let clicked = false;
     if (looksLikeChallenge()) {
       const el = findCheckbox();
@@ -149,7 +157,7 @@
     return clicked;
   }
 
-  async function loop(times = 16, gapMs = 700) {
+  async function loop(times = 4, gapMs = 4000) {
     for (let i = 0; i < times; i++) {
       try {
         attempt();
@@ -177,7 +185,6 @@
   }
 
   function readInterceptedParams() {
-    // Prefer params posted from MAIN-world hook
     if (window.__AmijobsCfParamsIsolated) return window.__AmijobsCfParamsIsolated;
     return null;
   }
@@ -235,14 +242,16 @@
           })(),
         };
       }
-      await sleep(500);
+      await sleep(800);
     }
     return null;
   }
 
   async function solveTurnstileVia2Captcha(force = false) {
     if (solving) return false;
-    if (!force && Date.now() - lastSolveAt < 20000) return false;
+    // Never spam 2captcha / reinject — that also thrash-reloads CF widgets
+    if (!force && Date.now() - lastSolveAt < 45000) return false;
+    if (force && Date.now() - lastSolveAt < 25000) return false;
     if (!looksLikeChallenge() && !collectSiteKeyDom().length && !readInterceptedParams()) {
       return false;
     }
@@ -307,7 +316,6 @@
       }
 
       deliverTokenToPage(res.token);
-      // Ask background to also inject via MAIN world executeScript
       try {
         await chrome.runtime.sendMessage({
           action: "injectTurnstileToken",
@@ -329,35 +337,25 @@
       return false;
     }
   };
-  window.__AmijobsTurnstileLoop = () => loop();
+  window.__AmijobsTurnstileLoop = () => loop(3, 5000);
   window.__AmijobsSolveTurnstile = solveTurnstileVia2Captcha;
+  window.__AmijobsLooksLikeCfChallenge = looksLikeChallenge;
 
-  if (!window.__AmijobsTurnstileBooted) {
-    window.__AmijobsTurnstileBooted = true;
-    const boot = () => {
-      loop(12, 600);
-      // Prefer 2captcha for managed challenges (clicks alone often fail)
-      setTimeout(() => solveTurnstileVia2Captcha(true).catch(() => {}), 1500);
-      setTimeout(() => solveTurnstileVia2Captcha(true).catch(() => {}), 8000);
-      setTimeout(() => solveTurnstileVia2Captcha(true).catch(() => {}), 20000);
-    };
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", boot);
-    } else {
-      boot();
-    }
-    try {
-      const mo = new MutationObserver(() => {
-        try {
-          attempt();
-        } catch (_e) {}
-      });
-      mo.observe(document.documentElement, { childList: true, subtree: true });
-      setTimeout(() => mo.disconnect(), 90000);
-    } catch (_e) {}
+  // Already loaded → do NOTHING aggressive (re-inject used to restart click storms)
+  if (window.__AmijobsTurnstileBooted) {
+    return;
+  }
+  window.__AmijobsTurnstileBooted = true;
+
+  const boot = () => {
+    // Few calm clicks only — MutationObserver was the Ray ID "bruteforce" loop
+    loop(3, 5000);
+    setTimeout(() => solveTurnstileVia2Captcha(true).catch(() => {}), 2000);
+    setTimeout(() => solveTurnstileVia2Captcha(false).catch(() => {}), 50000);
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
   } else {
-    attempt();
-    loop(8, 500);
-    solveTurnstileVia2Captcha(true).catch(() => {});
+    boot();
   }
 })();

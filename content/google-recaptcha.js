@@ -324,11 +324,32 @@
     return true;
   }
 
+  function isWidgetReady() {
+    if (isRecaptchaExpiredUi()) return false;
+    const token = readToken();
+    if (token.length < 40) return false;
+    if (!lastInjectedAt) return false;
+    if (Date.now() - lastInjectedAt > TOKEN_MAX_AGE_MS) return false;
+    const unchecked = document.querySelector(
+      '#recaptcha-anchor[aria-checked="false"], .recaptcha-checkbox[aria-checked="false"], span[role="checkbox"][aria-checked="false"]'
+    );
+    if (unchecked) {
+      try {
+        const r = unchecked.getBoundingClientRect();
+        if (r.width > 4 && r.height > 4) return false;
+      } catch (_e) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   window.__AmijobsInjectRecaptchaToken = injectToken;
   window.__AmijobsClickRecaptcha = clickRecaptcha;
   window.__AmijobsClearRecaptcha = clearToken;
   window.__AmijobsRecaptchaExpired = isRecaptchaExpiredUi;
   window.__AmijobsHasFreshRecaptchaToken = hasFreshToken;
+  window.__AmijobsRecaptchaWidgetReady = isWidgetReady;
 
   const onRecaptchaHost = /google\.com\/recaptcha|recaptcha\.net/i.test(location.href);
   const onApplyHost = /smartapply\.indeed|indeed\.(com|fr)|glassdoor\./i.test(location.href);
