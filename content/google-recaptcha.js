@@ -10,8 +10,13 @@
   let lastInjected = "";
   let lastInjectedAt = 0;
 
-  // Known Indeed Smart Apply checkbox key (from live HAR /enterprise/anchor?k=…)
-  const INDEED_SMARTAPPLY_SITEKEY = "6Lcr30spAAAAANOd2aQVyfNwAwHyAW6WsatMvrqU";
+  // HAR 2026-08-15 Smart Apply review:
+  // - visible checkbox: 6Ldn8Qwp… size=normal type=image (THIS is what blocks Déposer)
+  // - invisible: 6Lcr30sp… size=invisible (must NOT win sitekey ranking)
+  const INDEED_SMARTAPPLY_VISIBLE_SITEKEY = "6Ldn8QwpAAAAAAYahgoiLgJ0lHSu9PRHngswlkls";
+  const INDEED_SMARTAPPLY_INVISIBLE_SITEKEY = "6Lcr30spAAAAANOd2aQVyfNwAwHyAW6WsatMvrqU";
+  // legacy alias
+  const INDEED_SMARTAPPLY_SITEKEY = INDEED_SMARTAPPLY_VISIBLE_SITEKEY;
   const TOKEN_MAX_AGE_MS = 90000; // reCAPTCHA v2 tokens die ~2min; stay under 90s
 
   function clickEl(el) {
@@ -151,14 +156,18 @@
       if (!m) continue;
       const k = decodeURIComponent(m[1]);
       let score = 40;
-      if (/[?&]type=image\b|\/bframe/i.test(src)) score = 1;
-      else if (/\/enterprise\/.+anchor|\/api2\/anchor|\/anchor/i.test(src)) score = 100;
+      // Visible review checkbox (HAR: size=normal) must beat invisible
+      if (/[?&]size=normal\b/i.test(src)) score = 130;
+      else if (/[?&]type=image\b|\/bframe/i.test(src)) score = 5;
+      else if (/[?&]size=invisible\b/i.test(src)) score = 20;
+      else if (/\/enterprise\/.+anchor|\/api2\/anchor|\/anchor/i.test(src)) score = 90;
       else if (/\/enterprise\//i.test(src)) score = 60;
       push(k, score);
     }
 
-    if (/smartapply\.indeed|indeed\.(com|fr)/i.test(href + " " + (document.referrer || ""))) {
-      push(INDEED_SMARTAPPLY_SITEKEY, 110);
+    if (/smartapply\.indeed|indeed\.(com|[a-z]{2})/i.test(href + " " + (document.referrer || ""))) {
+      push(INDEED_SMARTAPPLY_VISIBLE_SITEKEY, 125);
+      push(INDEED_SMARTAPPLY_INVISIBLE_SITEKEY, 15);
     }
 
     keys.sort((a, b) => b.score - a.score);
@@ -408,15 +417,37 @@
       const apiDomain = detectApiDomain(document);
       let lastErr = "";
 
-      // Classic v2 ONLY for Indeed — enterprise burns time then fails with same sitekey
-      const attempts = /smartapply\.indeed|indeed\.(com|fr)/i.test(pageUrl)
-        ? [{ type: "recaptcha_v2", isEnterprise: false }]
+      // HAR: review widget is /recaptcha/enterprise/anchor size=normal → try Enterprise first
+      const onIndeed = /smartapply\.indeed|indeed\.(com|[a-z]{2})/i.test(pageUrl);
+      const attempts = onIndeed
+        ? [
+            { type: "recaptcha_enterprise", isEnterprise: true },
+            { type: "recaptcha_v2", isEnterprise: false },
+          ]
         : [
             { type: "recaptcha_v2", isEnterprise: false },
             { type: "recaptcha_enterprise", isEnterprise: true },
           ];
 
-      for (const key of keys.slice(0, 2)) {
+      // Prefer visible Indeed checkbox key; skip pure-invisible-only first attempts
+      const orderedKeys = keys.slice();
+      if (onIndeed) {
+        orderedKeys.sort((a, b) => {
+          const av = a === INDEED_SMARTAPPLY_VISIBLE_SITEKEY ? 2 : a === INDEED_SMARTAPPLY_INVISIBLE_SITEKEY ? 0 : 1;
+          const bv = b === INDEED_SMARTAPPLY_VISIBLE_SITEKEY ? 2 : b === INDEED_SMARTAPPLY_INVISIBLE_SITEKEY ? 0 : 1;
+          return bv - av;
+        });
+      }
+
+      for (const key of orderedKeys.slice(0, 3)) {
+        // Don't burn 2captcha on invisible-only key when visible key is available
+        if (
+          onIndeed &&
+          key === INDEED_SMARTAPPLY_INVISIBLE_SITEKEY &&
+          orderedKeys.includes(INDEED_SMARTAPPLY_VISIBLE_SITEKEY)
+        ) {
+          continue;
+        }
         for (const attempt of attempts) {
           try {
             chrome.runtime

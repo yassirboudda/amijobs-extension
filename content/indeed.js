@@ -4,11 +4,95 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.60";
+  const VERSION = "1.4.61";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
   let lastIndeedRunAt = 0;
+
+  /**
+   * HAR-proven signals (2026-08-15 session):
+   * - apply.indeed.com /api/v1/env → applyUrl applybyapplyablejobid
+   * - apis.indeed.com/graphql SubmitApplication → success
+   */
+  function installIndeedNetworkHooks() {
+    if (window.__AmijobsIndeedNetHooks) return;
+    window.__AmijobsIndeedNetHooks = true;
+    const captureEnv = (text) => {
+      try {
+        const raw = String(text || "");
+        const un = raw.replace(/\\u002F/g, "/");
+        const m =
+          un.match(/https:\/\/smartapply\.indeed\.com\/beta\/indeedapply\/applybyapplyablejobid\?[^"\\]+/i) ||
+          un.match(/"applyUrl"\s*:\s*"(https:[^"]+smartapply[^"]+)"/i);
+        if (!m) return;
+        const url = (m[1] || m[0]).replace(/\\u002F/g, "/").replace(/\\\//g, "/");
+        if (!/smartapply\.indeed\.com/i.test(url)) return;
+        window.__AmijobsLastApplyUrl = url;
+        chrome.storage.local.set({ amijobsIndeedApplyUrl: { url, at: Date.now() } }).catch(() => {});
+        // Do NOT auto-open here — env fires on panel load before Postuler (HAR).
+        // applyCurrentJob opens after the click.
+      } catch (_e) {}
+    };
+    const captureSubmit = (text, url) => {
+      try {
+        const blob = `${url || ""} ${text || ""}`;
+        if (!/SubmitApplication/i.test(blob)) return;
+        // Successful mutation responses include data.submitApplication / applicationId
+        if (/SubmitApplication|submitApplication/i.test(String(text || ""))) {
+          window.__AmijobsSubmitApplicationOk = Date.now();
+        }
+      } catch (_e) {}
+    };
+    try {
+      const ofetch = window.fetch.bind(window);
+      window.fetch = async function (...args) {
+        const res = await ofetch(...args);
+        try {
+          const reqUrl = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
+          if (/apply\.indeed\.com\/api\/v1\/env/i.test(reqUrl)) {
+            res
+              .clone()
+              .text()
+              .then(captureEnv)
+              .catch(() => {});
+          }
+          if (/apis\.indeed\.com\/graphql/i.test(reqUrl)) {
+            res
+              .clone()
+              .text()
+              .then((t) => captureSubmit(t, reqUrl))
+              .catch(() => {});
+          }
+        } catch (_e) {}
+        return res;
+      };
+    } catch (_e) {}
+    try {
+      const XO = XMLHttpRequest.prototype.open;
+      const XS = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+        this.__amijobsUrl = String(url || "");
+        return XO.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function (...args) {
+        this.addEventListener("load", function () {
+          try {
+            const u = this.__amijobsUrl || "";
+            if (/apply\.indeed\.com\/api\/v1\/env/i.test(u)) captureEnv(this.responseText);
+            if (/apis\.indeed\.com\/graphql/i.test(u)) captureSubmit(this.responseText, u);
+            // Also catch operation name in request body
+            const body = args[0];
+            if (typeof body === "string" && /SubmitApplication/i.test(body) && this.status >= 200 && this.status < 300) {
+              window.__AmijobsSubmitApplicationOk = Date.now();
+            }
+          } catch (_e) {}
+        });
+        return XS.apply(this, args);
+      };
+    } catch (_e) {}
+  }
+  installIndeedNetworkHooks();
 
   /** Nested indeed iframes must not run a second wizard (race on Continuer / CV). */
   function isTopAutomationFrame() {
@@ -189,6 +273,7 @@
     if (wantsFreelance) p.set("sc", "0kf:attr(DSQF7);");
     p.delete("start");
     if (page > 0) p.set("start", String(page * 10));
+    if (!p.has("radius")) p.set("radius", "25");
     return `${host}/jobs?${p.toString()}`;
   }
 
@@ -778,6 +863,10 @@
   }
 
   function detectApplySuccess() {
+    // HAR: GraphQL SubmitApplication completes the apply
+    if (window.__AmijobsSubmitApplicationOk && Date.now() - window.__AmijobsSubmitApplicationOk < 120000) {
+      return true;
+    }
     const path = window.location.pathname || "";
     const href = window.location.href || "";
     const title = (document.title || "").toLowerCase();
@@ -2304,6 +2393,7 @@
     S().log(PLATFORM, `Assistant Smart Apply — ${smartApplyPath()}`);
     window.__AmijobsCvCdpTries = 0;
     window.__AmijobsCurrentJobTitle = jobInfo?.title || "";
+    window.__AmijobsSubmitApplicationOk = 0;
     try {
       const { sessionIndeed: sOwner = null, sessionGlassdoor: sGd = null } =
         await chrome.storage.local.get(["sessionIndeed", "sessionGlassdoor"]);
@@ -2786,11 +2876,16 @@
       }, 14000);
     });
 
-    // HAR: Postuler → apply.indeed.com buttonClick → smartapply applybyapplyablejobid
+    // HAR: Postuler → apply.indeed.com buttonClick → env.applyUrl → smartapply
     const preHref =
       btn.getAttribute?.("href") ||
       btn.closest?.("a")?.href ||
       extractSmartApplyUrlFromDom();
+    // Clear stale apply URL before click so env hook can populate a fresh one
+    try {
+      window.__AmijobsLastApplyUrl = null;
+      await chrome.storage.local.remove(["amijobsIndeedApplyUrl"]);
+    } catch (_e) {}
     await S().humanClick(btn);
     await S().sleep(S().randomDelay(1200, 2200));
 
@@ -2831,13 +2926,32 @@
     }
 
     // Poll for same-tab Smart Apply OR popup tab (HAR opens smartapply after ~1–2s)
-    for (let i = 0; i < 16; i++) {
+    // Also wait for /api/v1/env applyUrl capture (HAR-proven).
+    for (let i = 0; i < 20; i++) {
       if (isSmartApplyPage()) return runApplyWizard(info, settings);
       if (detectApplySuccess()) return { success: true };
       if (popupState.opened) return { success: true, reason: "smartapply_tab" };
       const tabs = await chrome.runtime.sendMessage({ action: "listIndeedTabs" }).catch(() => null);
       if (tabs?.hasSmartApply || tabs?.hasApplyTab) {
         return { success: true, reason: "smartapply_tab" };
+      }
+      let envUrl = window.__AmijobsLastApplyUrl || null;
+      try {
+        const { amijobsIndeedApplyUrl = null } = await chrome.storage.local.get(["amijobsIndeedApplyUrl"]);
+        if (amijobsIndeedApplyUrl?.url && Date.now() - (amijobsIndeedApplyUrl.at || 0) < 60000) {
+          envUrl = amijobsIndeedApplyUrl.url;
+        }
+      } catch (_e) {}
+      if (envUrl && /smartapply|applybyapplyablejobid|preloadresumeapply/i.test(envUrl)) {
+        S().log(PLATFORM, `Smart Apply via env.applyUrl: ${envUrl.slice(0, 88)}…`, "warn");
+        try {
+          await chrome.runtime.sendMessage({ action: "openIndeedSmartApply", url: envUrl });
+          return { success: true, reason: "smartapply_tab" };
+        } catch (_e) {
+          window.location.href = envUrl;
+          await S().sleep(2000);
+          if (isSmartApplyPage()) return runApplyWizard(info, settings);
+        }
       }
       await S().sleep(500);
     }
@@ -2847,7 +2961,7 @@
     }
 
     // Fallback: navigate directly to applybyapplyablejobid (from env/DOM — HAR applyUrl)
-    const href = preHref || extractSmartApplyUrlFromDom();
+    const href = window.__AmijobsLastApplyUrl || preHref || extractSmartApplyUrlFromDom();
     if (href && /smartapply|applybyapplyablejobid|preloadresumeapply|indeedapply/i.test(href)) {
       S().log(PLATFORM, `Ouverture Smart Apply directe: ${href.slice(0, 90)}…`, "warn");
       try {

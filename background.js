@@ -5,7 +5,7 @@
 
 importScripts("content/geo-boards.js");
 
-const EXT_VERSION = "1.4.60";
+const EXT_VERSION = "1.4.61";
 let lastGlassdoorSerpRestoreAt = 0;
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
@@ -301,6 +301,7 @@ function buildIndeedSearchUrl(keywords, location, page = 0, contracts = []) {
     p.set("sc", "0kf:attr(DSQF7);");
   }
   if (page > 0) p.set("start", String(page * 10));
+  if (!p.has("radius")) p.set("radius", "25");
   const origin = boardsForQuery(location).indeedOrigin;
   return `${origin}/jobs?${p.toString()}`;
 }
