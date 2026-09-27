@@ -1,6 +1,8 @@
-// AmiJobs — Google reCAPTCHA: 2captcha token inject (v1.4.17)
-// Indeed Smart Apply: RecaptchaV2TaskProxyless only. Tokens expire ~120s — never
+// AmiJobs — Google reCAPTCHA: solvers elsewhere; Indeed = manual native token only (v1.5.6)
+// Indeed Smart Apply: Enterprise v2 visible checkbox. Tokens expire ~120s — never
 // pre-solve early in the wizard, and re-solve when UI shows "expiré".
+// Inject must call ONLY the visible widget callback — firing the invisible client's
+// promise-callback with the visible token breaks Indeed's React captcha state.
 (function () {
   if (window.__AmijobsRecaptchaLoaded) return;
   window.__AmijobsRecaptchaLoaded = true;
@@ -126,7 +128,9 @@
   function hasFreshToken(maxAgeMs = TOKEN_MAX_AGE_MS) {
     if (isRecaptchaExpiredUi()) return false;
     const t = readToken();
-    if (t.length < 40) return false;
+    if (!t || t.length < 200) return false;
+    if (/^HF[A-Za-z0-9_-]+$/.test(t) && t.length < 1000) return false;
+    if (!/^(03A|0cA|03a)/i.test(t) && t.length < 1000) return false;
     if (!lastInjectedAt) return false; // unknown age → treat as stale
     return Date.now() - lastInjectedAt < maxAgeMs;
   }
@@ -176,6 +180,10 @@
 
   function detectApiDomain(doc = document) {
     const href = doc.location?.href || location.href || "";
+    // Indeed Smart Apply always loads enterprise from recaptcha.net (HAR)
+    if (/smartapply\.indeed|indeed\.(com|[a-z]{2})/i.test(href + " " + (document.referrer || ""))) {
+      return "www.recaptcha.net";
+    }
     if (/recaptcha\.net/i.test(href)) return "www.recaptcha.net";
     for (const iframe of doc.querySelectorAll('iframe[src*="recaptcha"]')) {
       const src = iframe.getAttribute("src") || "";
@@ -184,21 +192,77 @@
     return "www.google.com";
   }
 
+  function normalizePageUrl(raw) {
+    const href = String(raw || "").trim();
+    if (!href) return "";
+    try {
+      const u = new URL(href);
+      // Solvers dislike :443 in origin; Indeed co= often includes it
+      if (u.port === "443" || u.port === "80") u.port = "";
+      if (/smartapply\.indeed\.com/i.test(u.hostname)) {
+        return `${u.origin}${u.pathname}${u.search}`;
+      }
+      return u.href;
+    } catch (_e) {
+      return href.replace(/:443(?=\/|$)/, "").replace(/:80(?=\/|$)/, "");
+    }
+  }
+
   function hostPageUrl() {
+    let href = "";
     try {
       if (window.top && window.top !== window) {
         try {
-          return window.top.location.href;
+          href = window.top.location.href;
         } catch (_e) {}
       }
     } catch (_e) {}
-    const params = new URLSearchParams(location.search || "");
-    const fromCo = decodeCoParam(params.get("co"));
-    if (fromCo) return fromCo;
-    if (document.referrer && /indeed|glassdoor|smartapply/i.test(document.referrer)) {
-      return document.referrer;
+    if (!href) {
+      const params = new URLSearchParams(location.search || "");
+      const fromCo = decodeCoParam(params.get("co"));
+      if (fromCo) href = fromCo;
+      else if (document.referrer && /indeed|glassdoor|smartapply/i.test(document.referrer)) {
+        href = document.referrer;
+      } else {
+        href = location.href;
+      }
     }
-    return location.href;
+    // SPA often stays on applybyapplyablejobid while review-module is shown —
+    // CapSolver must bind the token to the review URL Indeed validates against.
+    try {
+      const u = new URL(href);
+      if (/smartapply\.indeed\.com/i.test(u.hostname)) {
+        const body = document.body?.innerText || "";
+        const onReviewUi =
+          /review/i.test(u.pathname) ||
+          /relisez votre candidature|passez en revue|déposer ma candidature|je ne suis pas un robot/i.test(body);
+        if (onReviewUi && !/review/i.test(u.pathname)) {
+          href = `${u.origin}/beta/indeedapply/form/review-module`;
+        }
+      }
+    } catch (_e) {}
+    return normalizePageUrl(href) || href;
+  }
+
+  function extractEnterpriseS(doc = document) {
+    for (const el of doc.querySelectorAll("[data-s], [data-grecaptcha-s]")) {
+      const s = el.getAttribute("data-s") || el.getAttribute("data-grecaptcha-s") || "";
+      if (s && s.length > 16) return s;
+    }
+    for (const iframe of doc.querySelectorAll('iframe[src*="recaptcha"]')) {
+      const src = iframe.getAttribute("src") || "";
+      // Only from visible/normal widget — invisible s is a different session
+      if (/[?&]size=invisible\b/i.test(src)) continue;
+      const m = src.match(/[?&]s=([^&]+)/);
+      if (m) {
+        try {
+          return decodeURIComponent(m[1]);
+        } catch (_e) {
+          return m[1];
+        }
+      }
+    }
+    return "";
   }
 
   function runInPage(fnSource, arg) {
@@ -213,8 +277,18 @@
     }
   }
 
-  const PAGE_INJECT_FN = function (token) {
+  // Args: { token, visibleKey, invisibleKey }
+  const PAGE_INJECT_FN = function (opts) {
     try {
+      const token = typeof opts === "string" ? opts : opts?.token;
+      const visibleKey =
+        (typeof opts === "object" && opts?.visibleKey) ||
+        "6Ldn8QwpAAAAAAYahgoiLgJ0lHSu9PRHngswlkls";
+      const invisibleKey =
+        (typeof opts === "object" && opts?.invisibleKey) ||
+        "6Lcr30spAAAAANOd2aQVyfNwAwHyAW6WsatMvrqU";
+      if (!token) return;
+
       window.__AmijobsRecaptchaToken = token;
       const ensure = () => {
         let area =
@@ -259,23 +333,78 @@
       };
       patchApi(window.grecaptcha);
 
-      const walk = (obj, depth) => {
+      // Indeed SubmitApplication reads captcha.reCaptchaToken from React state,
+      // filled by the VISIBLE widget's success callback — not the invisible one.
+      // Calling invisible promise-callback with a visible-key token breaks submit.
+      const shouldInvoke = (key) => {
+        const k = String(key || "");
+        if (/expired|error|timeout|reset|cancel|close/i.test(k)) return false;
+        // Visible checkbox uses "callback"; do NOT fire promise-callback here
+        // (that is the invisible client's path).
+        return /^(callback|success-callback|successCallback)$/i.test(k);
+      };
+      const tryCall = (fn) => {
+        if (typeof fn !== "function") return;
+        try {
+          fn(token);
+        } catch (_e) {}
+      };
+      const findSitekeys = (obj, depth, out) => {
+        if (!obj || depth > 8) return;
+        try {
+          if (typeof obj === "string" && /^6L[A-Za-z0-9_-]{20,}/.test(obj)) out.push(obj);
+          else if (typeof obj === "object") {
+            for (const k of Object.keys(obj)) {
+              const v = obj[k];
+              if (typeof v === "string" && /sitekey|siteKey|^k$/i.test(k) && /^6L/.test(v)) out.push(v);
+              else if (v && typeof v === "object") findSitekeys(v, depth + 1, out);
+            }
+          }
+        } catch (_e) {}
+      };
+      const clientKind = (client) => {
+        const keys = [];
+        findSitekeys(client, 0, keys);
+        if (keys.some((k) => k === visibleKey || k.indexOf("6Ldn8Qwp") === 0)) return "visible";
+        if (keys.some((k) => k === invisibleKey || k.indexOf("6Lcr30sp") === 0)) return "invisible";
+        // clients[0] is usually visible on Smart Apply; 100000 = invisible
+        return "unknown";
+      };
+      const walkSuccess = (obj, depth) => {
         if (!obj || depth > 10) return;
         try {
           for (const k of Object.keys(obj)) {
             const v = obj[k];
-            if (typeof v === "function" && /callback|promise|resolve|success/i.test(String(k))) {
-              try {
-                v(token);
-              } catch (_e) {}
-            } else if (v && typeof v === "object") walk(v, depth + 1);
+            if (typeof v === "function" && shouldInvoke(k)) tryCall(v);
+            else if (v && typeof v === "object") walkSuccess(v, depth + 1);
           }
         } catch (_e) {}
       };
       try {
         if (window.___grecaptcha_cfg?.clients) {
-          for (const id of Object.keys(window.___grecaptcha_cfg.clients)) {
-            walk(window.___grecaptcha_cfg.clients[id], 0);
+          const ids = Object.keys(window.___grecaptcha_cfg.clients);
+          const ranked = ids
+            .map((id) => {
+              const client = window.___grecaptcha_cfg.clients[id];
+              const kind = clientKind(client);
+              let score = 0;
+              if (kind === "visible") score = 100;
+              else if (kind === "invisible") score = -50;
+              else if (String(id) === "0") score = 40;
+              else if (Number(id) >= 100000) score = -40;
+              return { id, client, kind, score };
+            })
+            .sort((a, b) => b.score - a.score);
+
+          for (const row of ranked) {
+            if (row.kind === "invisible" || row.score < 0) continue;
+            try {
+              const gg = row.client?.G?.G;
+              if (gg) tryCall(gg.callback);
+            } catch (_e) {}
+            walkSuccess(row.client, 0);
+            // One visible client is enough for Indeed's React state
+            if (row.kind === "visible" || row.score >= 40) break;
           }
         }
       } catch (_e) {}
@@ -295,7 +424,8 @@
   };
 
   function injectToken(token) {
-    if (!token || String(token).length < 40) return false;
+    if (!token || String(token).length < 200) return false;
+    if (/^HF[A-Za-z0-9_-]+$/.test(String(token)) && String(token).length < 1000) return false;
     lastInjected = token;
     lastInjectedAt = Date.now();
     window.__AmijobsRecaptchaToken = token;
@@ -319,7 +449,11 @@
       }
     } catch (_e) {}
 
-    runInPage(PAGE_INJECT_FN.toString(), token);
+    runInPage(PAGE_INJECT_FN.toString(), {
+      token,
+      visibleKey: INDEED_SMARTAPPLY_VISIBLE_SITEKEY,
+      invisibleKey: INDEED_SMARTAPPLY_INVISIBLE_SITEKEY,
+    });
 
     try {
       if (window.parent && window.parent !== window) {
@@ -386,6 +520,25 @@
 
     if (hasFreshToken() && !force) return true;
 
+    // Indeed: try AmiJobs exit API (server CapSolver with user-IP when tunnel supports TCP).
+    // If cloud solve fails, content/indeed.js waits for native browser token (manual).
+    const onIndeed =
+      /smartapply\.indeed|indeed\.(com|[a-z]{2})/i.test(location.href) ||
+      /smartapply\.indeed|indeed\.(com|[a-z]{2})/i.test(document.referrer || "");
+    if (onIndeed) {
+      if (hasFreshToken()) return true;
+      const native = String(
+        document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
+          document.querySelector("#g-recaptcha-response")?.value ||
+          ""
+      );
+      if (native.length >= 200 && !(/^HF[A-Za-z0-9_-]+$/.test(native) && native.length < 1000)) {
+        injectToken(native);
+        return true;
+      }
+      // Fall through to solver path (background → exit.amijobs.com)
+    }
+
     if (solving) return hasFreshToken();
     // Cooldown only when we already have a fresh token; failures retry quickly
     if (!force && Date.now() - lastSolveAt < 5000 && !hasFreshToken()) {
@@ -402,9 +555,6 @@
       const m = (iframe?.getAttribute("src") || "").match(/[?&]k=(6L[^&]+)/);
       if (m) keys.push(decodeURIComponent(m[1]));
     }
-    if (!keys.length && /smartapply\.indeed|indeed\.(com|fr)/i.test(location.href)) {
-      keys.push(INDEED_SMARTAPPLY_SITEKEY);
-    }
     if (!keys.length) return false;
 
     solving = true;
@@ -415,45 +565,22 @@
     try {
       const pageUrl = hostPageUrl();
       const apiDomain = detectApiDomain(document);
+      const enterpriseS = extractEnterpriseS(document);
+      const userAgent = navigator.userAgent || "";
       let lastErr = "";
 
-      // HAR: review widget is /recaptcha/enterprise/anchor size=normal → try Enterprise first
-      const onIndeed = /smartapply\.indeed|indeed\.(com|[a-z]{2})/i.test(pageUrl);
-      const attempts = onIndeed
-        ? [
-            { type: "recaptcha_enterprise", isEnterprise: true },
-            { type: "recaptcha_v2", isEnterprise: false },
-          ]
-        : [
-            { type: "recaptcha_v2", isEnterprise: false },
-            { type: "recaptcha_enterprise", isEnterprise: true },
-          ];
+      const attempts = [
+        { type: "recaptcha_v2", isEnterprise: false },
+        { type: "recaptcha_enterprise", isEnterprise: true },
+      ];
 
-      // Prefer visible Indeed checkbox key; skip pure-invisible-only first attempts
-      const orderedKeys = keys.slice();
-      if (onIndeed) {
-        orderedKeys.sort((a, b) => {
-          const av = a === INDEED_SMARTAPPLY_VISIBLE_SITEKEY ? 2 : a === INDEED_SMARTAPPLY_INVISIBLE_SITEKEY ? 0 : 1;
-          const bv = b === INDEED_SMARTAPPLY_VISIBLE_SITEKEY ? 2 : b === INDEED_SMARTAPPLY_INVISIBLE_SITEKEY ? 0 : 1;
-          return bv - av;
-        });
-      }
-
-      for (const key of orderedKeys.slice(0, 3)) {
-        // Don't burn 2captcha on invisible-only key when visible key is available
-        if (
-          onIndeed &&
-          key === INDEED_SMARTAPPLY_INVISIBLE_SITEKEY &&
-          orderedKeys.includes(INDEED_SMARTAPPLY_VISIBLE_SITEKEY)
-        ) {
-          continue;
-        }
+      for (const key of keys.slice(0, 3)) {
         for (const attempt of attempts) {
           try {
             chrome.runtime
               .sendMessage({
                 action: "appendLog",
-                message: `2captcha reCAPTCHA ${attempt.type} key=${key.slice(0, 12)}…`,
+                message: `reCAPTCHA ${attempt.type} via solvers key=${key.slice(0, 12)}…`,
                 level: "warn",
               })
               .catch(() => {});
@@ -466,11 +593,18 @@
               websiteKey: key,
               isEnterprise: attempt.isEnterprise,
               apiDomain,
+              userAgent,
+              enterprisePayload: enterpriseS ? { s: enterpriseS } : undefined,
+              recaptchaDataSValue: enterpriseS || "",
               injectInTab: true,
             });
             if (res?.ok && res.token) {
               injectToken(res.token);
-              // Do NOT click the checkbox after inject — that resets/expires the token
+              setTimeout(() => {
+                try {
+                  injectToken(res.token);
+                } catch (_e) {}
+              }, 400);
               return true;
             }
             lastErr = res?.reason || "no_token";
@@ -481,7 +615,7 @@
       }
       try {
         chrome.runtime
-          .sendMessage({ action: "appendLog", message: `2captcha échec: ${lastErr}`, level: "warn" })
+          .sendMessage({ action: "appendLog", message: `reCAPTCHA solvers échec: ${lastErr}`, level: "warn" })
           .catch(() => {});
       } catch (_e) {}
     } finally {

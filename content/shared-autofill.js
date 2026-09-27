@@ -3,7 +3,14 @@
   if (window.AmiJobsShared) return;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const randomDelay = (min, max) => Math.floor(Math.random() * (max - min)) + min;
+  const randomDelay = (min, max) => {
+    const a = Math.max(0, Number(min) || 0);
+    const b = Math.max(a, Number(max) || a);
+    // Always jitter at least ±1–40ms so identical min/max still look human
+    const base = a === b ? a : Math.floor(Math.random() * (b - a + 1)) + a;
+    const jitter = Math.floor(Math.random() * 41) - 10;
+    return Math.max(0, base + jitter);
+  };
 
   function $(selector, root = document) {
     return root.querySelector(selector);
@@ -114,8 +121,10 @@
   }
 
   function wantsNumericAnswer(label, el) {
-    const l = `${label || ""} ${el?.placeholder || ""} ${el?.getAttribute?.("aria-label") || ""}`.toLowerCase();
+    const l = `${label || ""} ${el?.placeholder || ""} ${el?.getAttribute?.("aria-label") || ""} ${el?.id || ""} ${el?.name || ""}`.toLowerCase();
     if (el?.type === "number") return true;
+    // Indeed Smart Apply screening: <input id="number-input-:xx:">
+    if (/^number-input/i.test(el?.id || "")) return true;
     if (/^(numeric|decimal|number)$/i.test(el?.inputMode || el?.getAttribute?.("inputmode") || "")) return true;
     if (el?.getAttribute?.("aria-invalid") === "true") {
       const err = el.closest('[class*="question"], fieldset, [class*="FormField"], label')?.innerText || "";
@@ -123,7 +132,10 @@
         return true;
       }
     }
-    return /nombre|combien|numeric|entier|décimal|decimal|années?\s*d['’]?exp|years?\s*(of\s*)?exp|de combien d['’]?ann/i.test(
+    // Nearby visible error (Indeed puts it as sibling text)
+    const near = `${el?.parentElement?.innerText || ""} ${el?.previousElementSibling?.innerText || ""}`;
+    if (/nombre valide|aucune décimale|doit être un nombre/i.test(near)) return true;
+    return /nombre|combien|numeric|entier|décimal|decimal|années?\s*d['’]?exp|years?\s*(of\s*)?exp|de combien d['’]?ann|exp[eé]rience/i.test(
       l
     );
   }
@@ -142,6 +154,30 @@
     const q = String(question || "").toLowerCase();
     const cv = `${cvText || profile.cvText || ""} ${profile.education || ""} ${profile.title || ""} ${profile.stack || ""}`.toLowerCase();
     if (!q) return null;
+
+    // "Do you live in France?" is not a credential question — answer from CV/location first
+    const locBlob = `${cv} ${profile.location || ""} ${profile.country || ""}`.toLowerCase();
+    const geoPref =
+      (typeof self !== "undefined" && self.AmiJobsQuestionPref) ||
+      (typeof window !== "undefined" && window.AmiJobsQuestionPref);
+    const country = geoPref?.extractCountry?.(q) || (/france|french|francais/.test(q) ? "france" : "");
+    if (
+      country &&
+      /live|living|reside|resid|habit|based|located|leaving|stay|vivre|work|travail|travailler|autoris|right to work|visa|eligible|allowed to/.test(
+        q
+      )
+    ) {
+      const countryHints = {
+        france: /france|paris|île-de-france|ile-de-france|lyon|marseille|lille|toulouse|nantes|bordeaux|\bidf\b/,
+        germany: /allemagne|germany|berlin|munich|deutschland/,
+        belgium: /belgique|belgium|bruxelles|brussels/,
+        switzerland: /suisse|switzerland|geneve|geneva|zurich/,
+        uk: /united kingdom|royaume-uni|london|england/,
+        eu: /europe|ue\b|eu\b|européen/,
+      };
+      if ((countryHints[country] || new RegExp(country, "i")).test(locBlob)) return "Oui";
+    }
+
     const isYn =
       /avez-vous|êtes-vous|etes-vous|poss[eè]dez|disposez|titulaire|dipl[oô]m[eé]|certificat|habilitation|permis|licence pro|qualification|accréditation|registered|licensed|do you (have|hold)|are you/i.test(
         q
@@ -279,6 +315,68 @@
     const el = field.element;
     const label = field.label;
     const profile = await getProfile();
+    const Q = window.AmiJobsQuestionPref;
+    const prefHit = Q?.findMatchingPreference?.(window.__AmijobsQuestionPreferences || [], label);
+    if (prefHit?.answer && field.type !== "checkbox") {
+      const prefAns = prefHit.answer;
+      if (field.type === "radio") {
+        const radios = field.elements || [];
+        const target =
+          radios.find((r, i) =>
+            String(field.options?.[i] || r.value || "").toLowerCase().includes(String(prefAns).toLowerCase())
+          ) ||
+          (/^(oui|yes)$/i.test(prefAns)
+            ? radios.find((r, i) => /oui|yes/i.test(field.options?.[i] || ""))
+            : /^(non|no)$/i.test(prefAns)
+              ? radios.find((r, i) => /non|no/i.test(field.options?.[i] || ""))
+              : null);
+        if (target) {
+          rememberAutoAnswer(label, prefAns);
+          window.__AmijobsFilling = true;
+          try {
+            await humanClick(target);
+          } finally {
+            setTimeout(() => {
+              window.__AmijobsFilling = false;
+            }, 400);
+          }
+          return;
+        }
+      } else if (field.type === "select") {
+        const options = [...el.options].map((o) => o.text.trim()).filter(Boolean);
+        const idx = options.findIndex(
+          (o) =>
+            o.toLowerCase() === String(prefAns).toLowerCase() ||
+            o.toLowerCase().includes(String(prefAns).toLowerCase()) ||
+            String(prefAns).toLowerCase().includes(o.toLowerCase())
+        );
+        if (idx >= 0) {
+          rememberAutoAnswer(label, options[idx]);
+          window.__AmijobsFilling = true;
+          try {
+            el.selectedIndex = idx;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          } finally {
+            setTimeout(() => {
+              window.__AmijobsFilling = false;
+            }, 400);
+          }
+          return;
+        }
+      } else {
+        rememberAutoAnswer(label, prefAns);
+        window.__AmijobsFilling = true;
+        try {
+          await humanType(el, prefAns);
+        } finally {
+          setTimeout(() => {
+            window.__AmijobsFilling = false;
+          }, 400);
+        }
+        return;
+      }
+    }
     const direct = await profileAnswer(label, profile);
     const hint = `${label || ""} ${el?.placeholder || ""} ${el?.getAttribute?.("aria-label") || ""}`;
 
@@ -370,7 +468,17 @@
           ? radios.find((r, i) => /non|no/i.test(field.options[i] || "")) || radios[radios.length - 1]
           : radios.find((r, i) => /oui|yes/i.test(field.options[i] || "")) || radios[0];
       }
-      if (target) await humanClick(target);
+      if (target) {
+        rememberAutoAnswer(label, wantNon ? "Non" : "Oui");
+        window.__AmijobsFilling = true;
+        try {
+          await humanClick(target);
+        } finally {
+          setTimeout(() => {
+            window.__AmijobsFilling = false;
+          }, 400);
+        }
+      }
       return;
     }
 
@@ -437,7 +545,15 @@
     if (wantsNumericAnswer(label, el) && cur && !/^\d+(\.\d+)?$/.test(cur)) {
       setNativeValue(el, "");
     }
-    await humanType(el, answer);
+    window.__AmijobsFilling = true;
+    try {
+      await humanType(el, answer);
+      rememberAutoAnswer(label, answer);
+    } finally {
+      setTimeout(() => {
+        window.__AmijobsFilling = false;
+      }, 400);
+    }
   }
 
   async function shouldSkipCompany(company) {
@@ -592,9 +708,99 @@
     return null;
   }
 
+  function rememberAutoAnswer(question, answer) {
+    const Q = window.AmiJobsQuestionPref;
+    const key = Q?.normalizeQuestion?.(question) || String(question || "").toLowerCase();
+    if (!key || Q?.isYnOptionText?.(question)) return;
+    if (!window.__AmijobsAutoAnswers) window.__AmijobsAutoAnswers = new Map();
+    window.__AmijobsAutoAnswers.set(key, { question, answer, at: Date.now() });
+  }
+
+  function findAutoAnswer(question) {
+    const map = window.__AmijobsAutoAnswers;
+    if (!map) return null;
+    const Q = window.AmiJobsQuestionPref;
+    const key = Q?.normalizeQuestion?.(question) || String(question || "").toLowerCase();
+    if (map.has(key)) return map.get(key);
+    for (const v of map.values()) {
+      if (Q?.questionsAreSimilar?.(v.question, question)) return v;
+    }
+    return null;
+  }
+
+  function valueFromField(el) {
+    if (!el) return "";
+    if (el.type === "radio") {
+      const checked =
+        (el.name && document.querySelector(`input[type="radio"][name="${CSS.escape(el.name)}"]:checked`)) ||
+        (el.checked ? el : null);
+      if (!checked) return "";
+      const lab =
+        (checked.id && document.querySelector(`label[for="${CSS.escape(checked.id)}"]`)?.textContent) ||
+        checked.closest("label")?.textContent ||
+        checked.value ||
+        "";
+      return String(lab).replace(/\s+/g, " ").trim();
+    }
+    if (el.type === "checkbox") return el.checked ? "Oui" : "Non";
+    if (el.tagName === "SELECT") return (el.options[el.selectedIndex]?.text || el.value || "").trim();
+    return String(el.value || el.textContent || "").trim();
+  }
+
+  async function refreshQuestionPreferences() {
+    try {
+      const { questionPreferences = [] } = await chrome.storage.local.get(["questionPreferences"]);
+      window.__AmijobsQuestionPreferences = Array.isArray(questionPreferences) ? questionPreferences : [];
+    } catch (_e) {
+      window.__AmijobsQuestionPreferences = window.__AmijobsQuestionPreferences || [];
+    }
+  }
+
+  function installQuestionPreferenceWatcher() {
+    if (window.__AmijobsPrefWatch) return;
+    window.__AmijobsPrefWatch = true;
+    refreshQuestionPreferences();
+    try {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== "local" || !changes.questionPreferences) return;
+        window.__AmijobsQuestionPreferences = changes.questionPreferences.newValue || [];
+      });
+    } catch (_e) {}
+    const onManual = (ev) => {
+      if (window.__AmijobsFilling) return;
+      const el = ev.target;
+      if (!el || !/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return;
+      if (el.type === "file" || el.type === "hidden") return;
+      const Q = window.AmiJobsQuestionPref;
+      const question = Q?.extractQuestionText?.(el) || getFieldLabel(el);
+      if (!question || Q?.isYnOptionText?.(question)) return;
+      const auto = findAutoAnswer(question);
+      if (!auto) return;
+      const cur = Q?.normalizeAnswer?.(valueFromField(el)) || valueFromField(el);
+      const prev = Q?.normalizeAnswer?.(auto.answer) || String(auto.answer || "");
+      if (!cur || cur === prev) return;
+      chrome.runtime
+        .sendMessage({
+          action: "recordQuestionPreference",
+          question,
+          answer: cur,
+          previousAnswer: prev,
+        })
+        .catch(() => {});
+    };
+    document.addEventListener("change", onManual, true);
+    document.addEventListener("click", (ev) => {
+      const el = ev.target?.closest?.("input[type='radio'], input[type='checkbox'], label");
+      if (!el) return;
+      setTimeout(() => onManual({ target: el.control || el.querySelector?.("input") || el }), 50);
+    }, true);
+  }
+
+  installQuestionPreferenceWatcher();
+
   window.AmiJobsShared = {
     sleep,
-    randomDelay: (min, max) => Math.floor(Math.random() * (max - min)) + min,
+    randomDelay,
     $,
     $$,
     humanClick,
@@ -617,6 +823,8 @@
     wantsNumericAnswer,
     coerceNumericAnswer,
     answerYesNoFromCv,
+    rememberAutoAnswer,
+    refreshQuestionPreferences,
     log(platform, msg, level = "info") {
       const ts = new Date().toISOString().slice(11, 23);
       console.log(`[AmiJobs ${platform} ${ts}] ${msg}`);

@@ -85,6 +85,10 @@ const AMIJOBS_I18N = {
     maxNoApplyPages: "Pages sans candidature avant arrêt",
     maxPerCompany: "Max candidatures / entreprise",
     maxPerCompanyHint: "0 = illimité. Limite le nombre de candidatures envoyées à la même entreprise.",
+    questionPrefTitle: "Question preferences",
+    questionPrefHint: "Seulement les réponses que vous corrigez à la main. Les questions trop proches (ex. vivre en France / autorisé à travailler en France) partagent la même préférence.",
+    questionPrefEmpty: "Aucune correction manuelle pour l’instant. Changez une réponse d’AmiJobs sur un formulaire pour l’enregistrer ici.",
+    questionPrefDelete: "Supprimer",
   },
   en: {
     extName: "AmiJobs",
@@ -171,6 +175,10 @@ const AMIJOBS_I18N = {
     maxNoApplyPages: "Empty pages before stop",
     maxPerCompany: "Max applications / company",
     maxPerCompanyHint: "0 = unlimited. Caps how many applications are sent to the same company.",
+    questionPrefTitle: "Question preferences",
+    questionPrefHint: "Only answers you correct by hand are saved. Near-duplicate questions (e.g. living in France / allowed to work in France) share the same preference.",
+    questionPrefEmpty: "No manual corrections yet. Change an AmiJobs answer on a form to save it here.",
+    questionPrefDelete: "Delete",
   },
   es: {
     extName: "AmiJobs",
@@ -257,6 +265,10 @@ const AMIJOBS_I18N = {
     maxNoApplyPages: "Páginas sin candidatura antes de parar",
     maxPerCompany: "Máx. candidaturas / empresa",
     maxPerCompanyHint: "0 = ilimitado. Limita cuántas candidaturas se envían a la misma empresa.",
+    questionPrefTitle: "Preferencias de preguntas",
+    questionPrefHint: "Solo se guardan las respuestas que corriges a mano. Las preguntas casi iguales comparten la misma preferencia.",
+    questionPrefEmpty: "Aún no hay correcciones manuales. Cambia una respuesta de AmiJobs en un formulario para guardarla aquí.",
+    questionPrefDelete: "Eliminar",
   },
 };
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AmiJobs",
-  "version": "1.4.61",
+  "version": "1.5.8",
   "description": "Auto-apply to jobs across multiple job-application websites with AI-assisted form filling.",
   "icons": {
     "16": "icons/icon16.png",
@@ -15,7 +15,8 @@
     "windows",
     "downloads",
     "scripting",
-    "debugger"
+    "debugger",
+    "webNavigation"
   ],
   "host_permissions": [
     "https://www.hellowork.com/*",
@@ -65,16 +66,16 @@
     "https://www.glassdoor.pl/*",
     "https://*.glassdoor.pl/*",
     "https://challenges.cloudflare.com/*",
-    "https://*.cloudflare.com/*",
     "https://www.google.com/recaptcha/*",
     "https://www.gstatic.com/recaptcha/*",
     "https://recaptcha.net/*",
     "https://www.recaptcha.net/*",
     "https://api.mistral.ai/*",
     "https://api.2captcha.com/*",
-    "https://autocomplete.indeed.com/*",
-    "https://*/*",
-    "http://*/*"
+    "https://api.capsolver.com/*",
+    "https://exit.amijobs.com/*",
+    "https://api.amijobs.com/*",
+    "https://autocomplete.indeed.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -82,8 +83,6 @@
   "content_scripts": [
     {
       "matches": [
-        "https://challenges.cloudflare.com/*",
-        "https://*.cloudflare.com/*",
         "https://www.indeed.com/*",
         "https://fr.indeed.com/*",
         "https://*.indeed.com/*",
@@ -134,30 +133,60 @@
       ],
       "run_at": "document_start",
       "all_frames": true,
-      "match_about_blank": true
+      "match_about_blank": true,
+      "world": "MAIN"
     },
     {
       "matches": [
-        "https://challenges.cloudflare.com/*",
-        "https://*.cloudflare.com/*"
+        "https://www.indeed.com/*",
+        "https://fr.indeed.com/*",
+        "https://*.indeed.com/*",
+        "https://smartapply.indeed.com/*",
+        "https://www.glassdoor.com/*",
+        "https://*.glassdoor.com/*",
+        "https://www.glassdoor.fr/*",
+        "https://*.glassdoor.fr/*",
+        "https://www.glassdoor.be/*",
+        "https://*.glassdoor.be/*",
+        "https://www.glassdoor.de/*",
+        "https://*.glassdoor.de/*",
+        "https://www.glassdoor.nl/*",
+        "https://*.glassdoor.nl/*",
+        "https://www.glassdoor.at/*",
+        "https://*.glassdoor.at/*",
+        "https://www.glassdoor.ch/*",
+        "https://*.glassdoor.ch/*",
+        "https://www.glassdoor.ie/*",
+        "https://*.glassdoor.ie/*",
+        "https://www.glassdoor.ca/*",
+        "https://*.glassdoor.ca/*",
+        "https://www.glassdoor.co.uk/*",
+        "https://*.glassdoor.co.uk/*",
+        "https://www.glassdoor.com.au/*",
+        "https://*.glassdoor.com.au/*",
+        "https://www.glassdoor.co.nz/*",
+        "https://*.glassdoor.co.nz/*",
+        "https://www.glassdoor.co.in/*",
+        "https://*.glassdoor.co.in/*",
+        "https://www.glassdoor.com.br/*",
+        "https://*.glassdoor.com.br/*",
+        "https://www.glassdoor.com.mx/*",
+        "https://*.glassdoor.com.mx/*",
+        "https://www.glassdoor.sg/*",
+        "https://*.glassdoor.sg/*",
+        "https://www.glassdoor.com.hk/*",
+        "https://*.glassdoor.com.hk/*",
+        "https://www.glassdoor.es/*",
+        "https://*.glassdoor.es/*",
+        "https://www.glassdoor.it/*",
+        "https://*.glassdoor.it/*",
+        "https://www.glassdoor.pl/*",
+        "https://*.glassdoor.pl/*"
       ],
       "js": [
-        "content/cloudflare-turnstile.js"
+        "content/cf-bridge.js"
       ],
       "run_at": "document_start",
-      "all_frames": true,
-      "match_about_blank": true
-    },
-    {
-      "matches": [
-        "https://www.google.com/recaptcha/*",
-        "https://recaptcha.net/*",
-        "https://www.recaptcha.net/*"
-      ],
-      "js": [
-        "content/google-recaptcha.js"
-      ],
-      "run_at": "document_idle",
       "all_frames": true,
       "match_about_blank": true
     },
@@ -190,6 +219,7 @@
       ],
       "js": [
         "content/geo-boards.js",
+        "content/question-pref.js",
         "content/shared-autofill.js",
         "content/company-site.js",
         "content/indeed.js",
@@ -205,6 +235,7 @@
       ],
       "js": [
         "content/geo-boards.js",
+        "content/question-pref.js",
         "content/shared-autofill.js",
         "content/company-site.js",
         "content/indeed.js",
@@ -259,6 +290,7 @@
       ],
       "js": [
         "content/geo-boards.js",
+        "content/question-pref.js",
         "content/shared-autofill.js",
         "content/company-site.js",
         "content/glassdoor.js",
@@ -280,5 +312,9 @@
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
-  }
+  },
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ]
 }

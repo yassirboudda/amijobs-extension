@@ -4,14 +4,25 @@
 // ============================================================================
 
 importScripts("content/geo-boards.js");
+importScripts("content/question-pref.js");
 
-const EXT_VERSION = "1.4.61";
+const EXT_VERSION = "1.5.7";
 let lastGlassdoorSerpRestoreAt = 0;
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
 const DEFAULT_MISTRAL_API_KEY = "uwqtlWhrRDIdE0QAHYkIhMFkLTbkDYIb";
 const TWOCAPTCHA_CREATE = "https://api.2captcha.com/createTask";
 const TWOCAPTCHA_RESULT = "https://api.2captcha.com/getTaskResult";
+const CAPSOLVER_CREATE = "https://api.capsolver.com/createTask";
+const CAPSOLVER_RESULT = "https://api.capsolver.com/getTaskResult";
+
+/** AmiJobs exit API (Cloudflare-proxied). Solver keys live on the server. */
+const AMIJOBS_EXIT_BASE = "https://exit.amijobs.com";
+const AMIJOBS_EXIT_GATE = "NrQC9FiH9eZ3o8XDlonW8jtfvMk1fl46";
+
+let __exitSession = null; // { sessionId, proxy, ws, deviceId }
+let __exitWs = null;
+let __exitPingTimer = null;
 
 const DEFAULT_PROFILE = {
   fullName: "",
@@ -995,8 +1006,29 @@ chrome.tabs.onCreated.addListener((tab) => {
   }
 });
 
+function isMassApplyJobBoardUrl(url) {
+  try {
+    const u = new URL(String(url || ""), "https://example.com");
+    const h = (u.hostname || "").toLowerCase();
+    if (/(^|\.)indeed\.com$/.test(h) || h === "smartapply.indeed.com") return true;
+    if (/(^|\.)glassdoor\./.test(h)) return true;
+    return false;
+  } catch (_e) {
+    return false;
+  }
+}
+
 async function injectExternalApplyScripts(tabId) {
   try {
+    // Company career sites need optional host access (not granted by default)
+    if (chrome.permissions?.request) {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab?.url && !isMassApplyJobBoardUrl(tab.url) && !/linkedin\.com|hellowork\.com/i.test(tab.url)) {
+          await chrome.permissions.request({ origins: ["https://*/*", "http://*/*"] });
+        }
+      } catch (_e) {}
+    }
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       files: ["content/shared-autofill.js", "content/google-recaptcha.js", "content/external-apply.js"],
@@ -1492,7 +1524,148 @@ async function uploadCvViaDebugger(tabId) {
   }
 }
 
-/** Trusted mouse click via CDP (needed for Cloudflare Turnstile checkbox). */
+/** Probe whether chrome.debugger can attach (fails if DevTools/MCP already debugging). */
+async function probeDebuggerAvailable(tabId) {
+  if (!tabId || !chrome.debugger) return false;
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    try {
+      await chrome.debugger.detach(target);
+    } catch (_e) {}
+    return true;
+  } catch (e) {
+    const msg = String(e?.message || e || "");
+    if (/already attached|Another debugger/i.test(msg)) return false;
+    // Some Chromium builds report differently when busy
+    if (/Cannot access|Debugger is already|detached/i.test(msg)) return false;
+    return false;
+  }
+}
+
+async function getTabUserAgent(tabId) {
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => navigator.userAgent || "",
+    });
+    return String(r?.[0]?.result || "").trim();
+  } catch (_e) {
+    return "";
+  }
+}
+
+/**
+ * Inject Turnstile token. Prefer matching browser UA (no CDP).
+ * Only override UA when required AND debugger is free. On debugger_busy, still inject
+ * the existing token (never start a second solve — cData/pagedata are one-shot).
+ */
+async function injectCloudflareTurnstileToken(tabId, token, solverUa = "", { requireUaMatch = false } = {}) {
+  if (!tabId || !token) return { ok: false, reason: "missing" };
+  const wantUa = String(solverUa || "").trim();
+  let currentUa = "";
+  try {
+    currentUa = await getTabUserAgent(tabId);
+  } catch (_e) {}
+  const needUaOverride = !!(wantUa && currentUa && wantUa !== currentUa);
+  const target = { tabId };
+  let attached = false;
+  let uaApplied = false;
+
+  if (needUaOverride && chrome.debugger) {
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      attached = true;
+      await chrome.debugger.sendCommand(target, "Network.enable", {});
+      await chrome.debugger.sendCommand(target, "Network.setUserAgentOverride", {
+        userAgent: wantUa,
+      });
+      uaApplied = true;
+      await appendLog("CF inject: UA override ON (held through callback)", "warn");
+    } catch (e) {
+      await appendLog(
+        `CF inject: debugger busy (${String(e?.message || e).slice(0, 80)}) — injecting without UA override`,
+        "warn"
+      );
+      if (requireUaMatch) return { ok: false, reason: "debugger_busy", needUa: true };
+      // Fall through: inject token anyway (better than burning params on a 2nd solve)
+    }
+  } else if (wantUa && wantUa === currentUa) {
+    await appendLog("CF inject: solver UA matches browser", "warn");
+  }
+
+  try {
+    const applied = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: "MAIN",
+      func: (tok) => {
+        try {
+          window.__AmijobsLastCfToken = tok;
+          window.postMessage({ source: "amijobs-cf-token", token: tok }, "*");
+          for (const input of document.querySelectorAll(
+            '[name="cf-turnstile-response"], input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], [name="g-recaptcha-response"]'
+          )) {
+            input.value = tok;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          if (typeof window.__AmijobsCfApplyToken === "function") {
+            return !!window.__AmijobsCfApplyToken(tok);
+          }
+          if (typeof window.__AmijobsCfCallback === "function") window.__AmijobsCfCallback(tok);
+          if (typeof window.tsCallback === "function") window.tsCallback(tok);
+          if (typeof window.cfCallback === "function") window.cfCallback(tok);
+          return true;
+        } catch (_e) {
+          return false;
+        }
+      },
+      args: [token],
+    });
+    const anyApplied = (applied || []).some((r) => r?.result);
+    if (attached && uaApplied) {
+      await new Promise((r) => setTimeout(r, 3500));
+    }
+    return { ok: true, uaApplied, applied: anyApplied };
+  } catch (e) {
+    return { ok: false, reason: String(e?.message || e) };
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_e) {}
+    }
+  }
+}
+
+function cfParamsFingerprint(p) {
+  if (!p?.sitekey) return "";
+  return `${p.sitekey}|${p.action || ""}|${p.ray || ""}|${String(p.data || "").slice(0, 48)}|${String(p.pagedata || "").slice(0, 48)}`;
+}
+
+/** Background BBQ orchestrator: Turnstile is manual — do not spend solver credits. */
+async function orchestrateCloudflareTurnstileSolve(tabId, seedParams = null) {
+  if (!tabId) return { ok: false, reason: "no_tab" };
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!isMassApplyJobBoardUrl(tab?.url || "")) {
+      return { ok: false, reason: "not_jobboard" };
+    }
+  } catch (_e) {
+    return { ok: false, reason: "no_tab" };
+  }
+  if (!globalThis.__amijobsCfManualLogged) globalThis.__amijobsCfManualLogged = {};
+  if (!globalThis.__amijobsCfManualLogged[tabId]) {
+    globalThis.__amijobsCfManualLogged[tabId] = Date.now();
+    await appendLog(
+      "Cloudflare Turnstile: mode manuel (cliquez le widget). reCAPTCHA: solveurs AmiJobs (exit.amijobs.com).",
+      "warn"
+    );
+  }
+  return { ok: false, reason: "manual_turnstile" };
+}
+
 async function clickTurnstileWithDebugger(tabId) {
   if (!tabId || !chrome.debugger) return { ok: false, reason: "no_debugger" };
   const target = { tabId };
@@ -1595,9 +1768,36 @@ async function clickTurnstileWithDebugger(tabId) {
   }
 }
 
+// Inject Turnstile hook ASAP on navigation (before page scripts when possible)
+try {
+  chrome.webNavigation.onCommitted.addListener((details) => {
+    try {
+      if (details.frameId !== 0) return;
+      const url = String(details.url || "");
+      // CF hook only on mass-apply job boards — never CapSolver / random sites
+      if (!isMassApplyJobBoardUrl(url)) return;
+      chrome.scripting
+        .executeScript({
+          target: { tabId: details.tabId, frameIds: [0] },
+          world: "MAIN",
+          injectImmediately: true,
+          files: ["content/turnstile-hook.js"],
+        })
+        .catch(() => {});
+      chrome.scripting
+        .executeScript({
+          target: { tabId: details.tabId, frameIds: [0] },
+          injectImmediately: true,
+          files: ["content/cf-bridge.js"],
+        })
+        .catch(() => {});
+    } catch (_e) {}
+  });
+} catch (_e) {}
+
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   const url = changeInfo.url || tab?.url || "";
-  if (!url || (changeInfo.status === "loading" && !changeInfo.url)) return;
+  if (!url && !changeInfo.title && changeInfo.status !== "complete") return;
 
   // Indeed "Signaler un problème" opens hrtechprivacy.com — close immediately during sessions
   if (/hrtechprivacy\.com|requests\.hrtechprivacy/i.test(url)) {
@@ -1611,45 +1811,33 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     return;
   }
 
-  // Proactively inject Turnstile clicker on Indeed/Glassdoor when a session is active
-  // BUT never on every CF Ray-ID refresh — that was the "bruteforce" loop.
+  // Cloudflare Turnstile is manual. Log once when a challenge tab is seen.
+  // Do NOT inject CF hooks on healthy SERPs.
+  const cfTab = { title: changeInfo.title || tab?.title || "", url: url || tab?.url || "" };
   if (
-    changeInfo.status === "complete" &&
-    /(indeed\.com|indeed\.fr|glassdoor\.(com|fr)|challenges\.cloudflare\.com)/i.test(url)
+    (changeInfo.status === "complete" || changeInfo.title) &&
+    isMassApplyJobBoardUrl(cfTab.url || url || "")
   ) {
     try {
-      if (await isCloudflarePauseActive()) return;
-      if (tabLooksLikeCloudflareChallenge(tab)) {
-        // One calm inject max per minute while CF is showing
+      if (tabLooksLikeCloudflareChallenge(cfTab) || tabLooksLikeCloudflareChallenge(tab)) {
         const now = Date.now();
         if (!globalThis.__amijobsCfTabInjectAt) globalThis.__amijobsCfTabInjectAt = {};
         const last = globalThis.__amijobsCfTabInjectAt[tabId] || 0;
-        if (now - last < 60000) return;
-        globalThis.__amijobsCfTabInjectAt[tabId] = now;
-        chrome.scripting
-          .executeScript({
-            target: { tabId, allFrames: true },
-            files: ["content/turnstile-hook.js", "content/cloudflare-turnstile.js"],
-          })
-          .catch(() => {});
+        if (now - last >= 20000) {
+          globalThis.__amijobsCfTabInjectAt[tabId] = now;
+          orchestrateCloudflareTurnstileSolve(tabId).catch(() => {});
+        }
         return;
       }
-      const { sessionIndeed, sessionGlassdoor } = await chrome.storage.local.get([
-        "sessionIndeed",
-        "sessionGlassdoor",
-      ]);
-      if (sessionIndeed?.active || sessionGlassdoor?.active) {
-        const now = Date.now();
-        if (!globalThis.__amijobsCfTabInjectAt) globalThis.__amijobsCfTabInjectAt = {};
-        const last = globalThis.__amijobsCfTabInjectAt[tabId] || 0;
-        if (now - last < 30000) return;
-        globalThis.__amijobsCfTabInjectAt[tabId] = now;
-        chrome.scripting
-          .executeScript({
-            target: { tabId, allFrames: true },
-            files: ["content/turnstile-hook.js", "content/cloudflare-turnstile.js"],
-          })
-          .catch(() => {});
+      // Healthy SERP: clear any leftover CF pause so mass-apply can run
+      if (changeInfo.status === "complete") {
+        try {
+          const { amijobsCfPause = null } = await chrome.storage.local.get(["amijobsCfPause"]);
+          if (amijobsCfPause?.until) {
+            await chrome.storage.local.set({ amijobsCfPause: null });
+            await appendLog("CF pause cleared — SERP OK (pas de challenge)", "info");
+          }
+        } catch (_e) {}
       }
     } catch (_e) {
       /* ignore */
@@ -1976,6 +2164,16 @@ async function askMistral(systemPrompt, userPrompt, maxTokens = 300) {
   }
 }
 
+async function loadSecretsLocalFile() {
+  try {
+    const res = await fetch(chrome.runtime.getURL("secrets.local.json"));
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (_e) {
+    return null;
+  }
+}
+
 async function getTwoCaptchaApiKey() {
   try {
     const { twoCaptchaApiKey } = await chrome.storage.local.get(["twoCaptchaApiKey"]);
@@ -1983,17 +2181,138 @@ async function getTwoCaptchaApiKey() {
   } catch (_e) {}
   // Optional local-only file (gitignored) — never ship a real key in the public zip
   try {
-    const res = await fetch(chrome.runtime.getURL("secrets.local.json"));
-    if (res.ok) {
-      const data = await res.json();
-      const k = String(data?.twoCaptchaApiKey || "").trim();
-      if (k) {
-        await chrome.storage.local.set({ twoCaptchaApiKey: k });
-        return k;
-      }
+    const data = await loadSecretsLocalFile();
+    const k = String(data?.twoCaptchaApiKey || "").trim();
+    if (k) {
+      await chrome.storage.local.set({ twoCaptchaApiKey: k });
+      return k;
     }
   } catch (_e) {}
   return "";
+}
+
+async function getCapSolverApiKey() {
+  try {
+    const { capSolverApiKey } = await chrome.storage.local.get(["capSolverApiKey"]);
+    if (capSolverApiKey) return String(capSolverApiKey).trim();
+  } catch (_e) {}
+  try {
+    const data = await loadSecretsLocalFile();
+    const k = String(data?.capSolverApiKey || "").trim();
+    if (k) {
+      await chrome.storage.local.set({ capSolverApiKey: k });
+      return k;
+    }
+  } catch (_e) {}
+  return "";
+}
+
+/**
+ * Parse user proxy string into CapSolver + 2captcha shapes.
+ * Accepts: http://user:pass@host:port | socks5://… | host:port:user:pass | host:port
+ */
+function parseCaptchaProxy(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  try {
+    // URL form: http://user:pass@host:port
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
+      const u = new URL(s);
+      const proto = (u.protocol.replace(":", "") || "http").toLowerCase();
+      const proxyType = proto === "socks5" || proto === "socks4" ? proto : "http";
+      const host = u.hostname;
+      const port = Number(u.port || (proxyType.startsWith("socks") ? 1080 : 8080));
+      if (!host || !port) return null;
+      const user = decodeURIComponent(u.username || "");
+      const pass = decodeURIComponent(u.password || "");
+      const capParts = [proxyType === "http" ? "http" : proxyType, host, String(port)];
+      if (user) {
+        capParts.push(user);
+        capParts.push(pass);
+      }
+      return {
+        proxyType,
+        proxyAddress: host,
+        proxyPort: port,
+        proxyLogin: user || undefined,
+        proxyPassword: pass || undefined,
+        capSolverProxy: capParts.join(":"),
+      };
+    }
+    // colon form: type:host:port:user:pass OR host:port:user:pass OR host:port
+    const parts = s.split(":");
+    let proxyType = "http";
+    let host;
+    let port;
+    let user = "";
+    let pass = "";
+    if (/^(https?|socks4|socks5)$/i.test(parts[0]) && parts.length >= 3) {
+      proxyType = parts[0].toLowerCase() === "https" ? "http" : parts[0].toLowerCase();
+      host = parts[1];
+      port = Number(parts[2]);
+      user = parts[3] || "";
+      pass = parts.slice(4).join(":") || "";
+    } else if (parts.length >= 2) {
+      host = parts[0];
+      port = Number(parts[1]);
+      user = parts[2] || "";
+      pass = parts.slice(3).join(":") || "";
+    } else {
+      return null;
+    }
+    if (!host || !Number.isFinite(port) || port <= 0) return null;
+    const capParts = [proxyType, host, String(port)];
+    if (user) {
+      capParts.push(user);
+      capParts.push(pass);
+    }
+    return {
+      proxyType,
+      proxyAddress: host,
+      proxyPort: port,
+      proxyLogin: user || undefined,
+      proxyPassword: pass || undefined,
+      capSolverProxy: capParts.join(":"),
+    };
+  } catch (_e) {
+    return null;
+  }
+}
+
+async function getCaptchaProxy() {
+  try {
+    const { captchaProxy } = await chrome.storage.local.get(["captchaProxy"]);
+    const parsed = parseCaptchaProxy(captchaProxy);
+    if (parsed) return parsed;
+  } catch (_e) {}
+  try {
+    const data = await loadSecretsLocalFile();
+    const parsed = parseCaptchaProxy(data?.captchaProxy || data?.proxy || "");
+    if (parsed) {
+      await chrome.storage.local.set({ captchaProxy: String(data.captchaProxy || data.proxy).trim() });
+      return parsed;
+    }
+  } catch (_e) {}
+  return null;
+}
+
+/** Seed both captcha keys from secrets.local.json when present. */
+async function seedCaptchaApiKeysFromSecrets() {
+  const data = await loadSecretsLocalFile();
+  if (!data) return;
+  const patch = {};
+  try {
+    const existing = await chrome.storage.local.get(["twoCaptchaApiKey", "capSolverApiKey"]);
+    const two = String(data?.twoCaptchaApiKey || "").trim();
+    const cap = String(data?.capSolverApiKey || "").trim();
+    if (two && !existing.twoCaptchaApiKey) patch.twoCaptchaApiKey = two;
+    if (cap && !existing.capSolverApiKey) patch.capSolverApiKey = cap;
+  } catch (_e) {}
+  if (Object.keys(patch).length) {
+    try {
+      await chrome.storage.local.set(patch);
+    } catch (_e) {}
+  }
 }
 
 /** Serialize Indeed Smart Apply across Indeed mass-apply + Glassdoor Easy Apply.
@@ -2144,6 +2463,533 @@ async function releaseSmartApplyLock(owner, { fair = false } = {}) {
   return { ok: false, owner: amijobsSmartApplyLock.owner };
 }
 
+async function solveTurnstileWithCapSolver({
+  websiteURL,
+  websiteKey,
+  pageAction = "",
+  data = "",
+  pagedata = "",
+  userAgent = "",
+} = {}) {
+  const clientKey = await getCapSolverApiKey();
+  if (!clientKey) return { ok: false, reason: "missing_capsolver_key" };
+  const pageUrl = String(websiteURL || "").trim();
+  const siteKey = String(websiteKey || "").trim();
+  if (!pageUrl || !siteKey) return { ok: false, reason: "missing_sitekey_or_url" };
+
+  const metadata = {};
+  if (pageAction) metadata.action = String(pageAction);
+  if (data) metadata.cdata = String(data);
+  // Forward pagedata when present (managed CF); CapSolver may ignore unknown keys
+  if (pagedata) metadata.pagedata = String(pagedata);
+
+  const task = {
+    type: "AntiTurnstileTaskProxyLess",
+    websiteURL: pageUrl,
+    websiteKey: siteKey,
+  };
+  if (Object.keys(metadata).length) task.metadata = metadata;
+
+  try {
+    await appendLog(
+      `CapSolver Turnstile… key=${siteKey.slice(0, 14)}… action=${pageAction || "-"} cdata=${data ? "yes" : "no"} pagedata=${pagedata ? "yes" : "no"}`,
+      "warn"
+    );
+    const createRes = await fetch(CAPSOLVER_CREATE, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientKey, task }),
+    });
+    const created = await createRes.json();
+    if (created?.errorId) {
+      return {
+        ok: false,
+        reason: created.errorDescription || created.errorCode || "create_failed",
+        errorId: created.errorId,
+      };
+    }
+    const taskId = created?.taskId;
+    if (!taskId) return { ok: false, reason: "no_task_id" };
+
+    const deadline = Date.now() + 90000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1200));
+      const pollRes = await fetch(CAPSOLVER_RESULT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientKey, taskId }),
+      });
+      const polled = await pollRes.json();
+      if (polled?.errorId) {
+        return {
+          ok: false,
+          reason: polled.errorDescription || polled.errorCode || "poll_failed",
+          errorId: polled.errorId,
+        };
+      }
+      if (polled?.status === "ready") {
+        const token =
+          polled?.solution?.token ||
+          polled?.solution?.gRecaptchaResponse ||
+          polled?.solution?.text ||
+          "";
+        if (!token) return { ok: false, reason: "empty_token" };
+        await appendLog("CapSolver: Turnstile résolu", "success");
+        return {
+          ok: true,
+          token,
+          taskId,
+          provider: "capsolver",
+          userAgent: polled?.solution?.userAgent || userAgent || "",
+        };
+      }
+      if (polled?.status === "failed") {
+        return { ok: false, reason: polled.errorDescription || "failed" };
+      }
+    }
+    return { ok: false, reason: "timeout" };
+  } catch (err) {
+    console.error("[AmiJobs] CapSolver error:", err);
+    return { ok: false, reason: err?.message || "network_error" };
+  }
+}
+
+function isCaptchaBalanceError(reason) {
+  return /ERROR_ZERO_BALANCE|zero.?balance|insufficient.?funds|ERROR_KEY_DOES_NOT_EXIST|missing_.*_key|ERROR_WRONG_USER_KEY|ERROR_USER_DOES_NOT_EXIST|ERROR_BALANCE|ERROR_EMPTY_KEY/i.test(
+    String(reason || "")
+  );
+}
+
+/**
+ * Real Google reCAPTCHA v2 tokens are usually long (~1–3k) and often start with 03A / 0cA.
+ * CapSolver ProxyLess has returned ~522-char "HF…" junk that Indeed rejects as
+ * CAPTCHA_VALIDATION_FAILED — reject that pattern hard.
+ */
+function isPlausibleGoogleRecaptchaToken(token) {
+  const t = String(token || "").trim();
+  if (!t || t.length < 200) return false;
+  // Observed CapSolver junk (HAR 2026-08-20): always HF… and exactly ~522 chars
+  if (/^HF[A-Za-z0-9_-]+$/.test(t) && t.length < 1000) return false;
+  if (/^(03A|0cA|03a)/i.test(t) && t.length >= 400) return true;
+  if (t.length >= 1000 && /^[A-Za-z0-9_-]+$/.test(t)) return true;
+  return false;
+}
+
+async function solveRecaptchaWithCapSolver({
+  websiteURL,
+  websiteKey,
+  isEnterprise = false,
+  isInvisible = false,
+  apiDomain = "",
+  userAgent = "",
+  enterprisePayload = null,
+  recaptchaDataSValue = "",
+  useProxy = true,
+} = {}) {
+  const clientKey = await getCapSolverApiKey();
+  if (!clientKey) return { ok: false, reason: "missing_capsolver_key" };
+  const pageUrl = String(websiteURL || "").trim();
+  const siteKey = String(websiteKey || "").trim();
+  if (!pageUrl || !siteKey) return { ok: false, reason: "missing_sitekey_or_url" };
+
+  const proxy = useProxy ? await getCaptchaProxy() : null;
+  let taskType;
+  if (isEnterprise) {
+    taskType = proxy ? "ReCaptchaV2EnterpriseTask" : "ReCaptchaV2EnterpriseTaskProxyLess";
+  } else {
+    taskType = proxy ? "ReCaptchaV2Task" : "ReCaptchaV2TaskProxyLess";
+  }
+
+  const task = {
+    type: taskType,
+    websiteURL: pageUrl,
+    websiteKey: siteKey,
+  };
+  if (isInvisible) task.isInvisible = true;
+  if (apiDomain) task.apiDomain = String(apiDomain).replace(/^https?:\/\//, "");
+  if (userAgent) task.userAgent = String(userAgent);
+  if (proxy?.capSolverProxy) task.proxy = proxy.capSolverProxy;
+  const sVal =
+    (enterprisePayload && typeof enterprisePayload === "object" && enterprisePayload.s) ||
+    recaptchaDataSValue ||
+    "";
+  if (sVal) {
+    if (isEnterprise) task.enterprisePayload = { s: String(sVal) };
+    else task.recaptchaDataSValue = String(sVal);
+  }
+
+  try {
+    await appendLog(
+      `CapSolver reCAPTCHA ${task.type} key=${siteKey.slice(0, 14)}… api=${task.apiDomain || "-"} proxy=${proxy ? "yes" : "no"} s=${sVal ? "yes" : "no"}`,
+      "warn"
+    );
+    const createRes = await fetch(CAPSOLVER_CREATE, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientKey, task }),
+    });
+    const created = await createRes.json();
+    if (created?.errorId) {
+      return {
+        ok: false,
+        reason: created.errorDescription || created.errorCode || "create_failed",
+        errorId: created.errorId,
+      };
+    }
+    const taskId = created?.taskId;
+    if (!taskId) return { ok: false, reason: "no_task_id" };
+
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2500));
+      const pollRes = await fetch(CAPSOLVER_RESULT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientKey, taskId }),
+      });
+      const polled = await pollRes.json();
+      if (polled?.errorId) {
+        return {
+          ok: false,
+          reason: polled.errorDescription || polled.errorCode || "poll_failed",
+          errorId: polled.errorId,
+        };
+      }
+      if (polled?.status === "ready") {
+        const token =
+          polled?.solution?.gRecaptchaResponse ||
+          polled?.solution?.token ||
+          polled?.solution?.text ||
+          "";
+        if (!token) return { ok: false, reason: "empty_token" };
+        if (!isPlausibleGoogleRecaptchaToken(token)) {
+          await appendLog(
+            `CapSolver: token invalide (len=${String(token).length}, prefix=${String(token).slice(0, 6)}…) — rejeté`,
+            "warn"
+          );
+          return { ok: false, reason: "implausible_token", tokenPreview: String(token).slice(0, 12) };
+        }
+        await appendLog(`CapSolver: reCAPTCHA token OK (len=${token.length}, proxy=${proxy ? "yes" : "no"})`, "success");
+        return { ok: true, token, provider: "capsolver", taskId, usedProxy: !!proxy };
+      }
+    }
+    return { ok: false, reason: "timeout" };
+  } catch (err) {
+    console.error("[AmiJobs] CapSolver reCAPTCHA error:", err);
+    return { ok: false, reason: err?.message || "network_error" };
+  }
+}
+
+async function solveRecaptchaWithProviderFallback(opts = {}) {
+  const twoKey = await getTwoCaptchaApiKey();
+  const capKey = await getCapSolverApiKey();
+  const proxy = await getCaptchaProxy();
+  const order = [];
+
+  // Indeed Enterprise: proxy tasks first (IP match). ProxyLess last — often returns junk.
+  if (proxy) {
+    if (capKey) order.push({ p: "capsolver", useProxy: true });
+    if (twoKey) order.push({ p: "2captcha", useProxy: true });
+  }
+  if (capKey) order.push({ p: "capsolver", useProxy: false });
+  if (twoKey) order.push({ p: "2captcha", useProxy: false });
+
+  // Dedupe identical provider+proxy flags
+  const seen = new Set();
+  const uniq = [];
+  for (const step of order) {
+    const k = `${step.p}|${step.useProxy}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(step);
+  }
+
+  if (!uniq.length) return { ok: false, reason: "missing_solver_keys" };
+
+  if (!proxy && /smartapply\.indeed|indeed\./i.test(String(opts.websiteURL || ""))) {
+    await appendLog(
+      "reCAPTCHA Indeed sans proxy — ProxyLess souvent rejeté. Ajoutez un proxy résidentiel dans Options.",
+      "warn"
+    );
+  }
+
+  let last = { ok: false, reason: "no_provider" };
+  for (let i = 0; i < uniq.length; i++) {
+    const step = uniq[i];
+    const stepOpts = { ...opts, useProxy: step.useProxy };
+    if (step.p === "2captcha") {
+      last = await solveCaptchaWith2Captcha(stepOpts);
+      if (last?.ok) return { ...last, provider: "2captcha" };
+    } else {
+      last = await solveRecaptchaWithCapSolver(stepOpts);
+      if (last?.ok) return last;
+    }
+    const next = uniq[i + 1];
+    if (next) {
+      const why = last?.reason || "?";
+      const bal = isCaptchaBalanceError(why) ? " (plus de solde)" : "";
+      await appendLog(
+        `reCAPTCHA ${step.p}${step.useProxy ? "+proxy" : ""} échec (${why})${bal} → fallback ${next.p}${next.useProxy ? "+proxy" : ""}`,
+        "warn"
+      );
+    }
+  }
+  return last;
+}
+
+/**
+ * Captcha router:
+ * - Cloudflare Turnstile → manual (user clicks widget)
+ * - reCAPTCHA → AmiJobs exit API (server CapSolver/2captcha + user-IP exit when ready)
+ * - Falls back to local keys / manual for Indeed if server fails
+ */
+async function solveCaptchaRouted(opts = {}) {
+  const t = String(opts.type || opts.captchaType || "").toLowerCase();
+  const isTurnstile = t.includes("turnstile") || t.includes("cloudflare");
+  if (isTurnstile) {
+    return { ok: false, reason: "manual_turnstile" };
+  }
+
+  const page = String(opts.websiteURL || opts.pageUrl || opts.url || "");
+  const onIndeed = /smartapply\.indeed|indeed\.(com|[a-z]{2})/i.test(page);
+
+  // Prefer AmiJobs cloud solvers (keys on server). User-IP exit when WS is up.
+  const remote = await solveCaptchaViaExitApi(opts);
+  if (remote?.ok && remote.token) {
+    return remote;
+  }
+
+  if (onIndeed) {
+    await appendLog(
+      `reCAPTCHA Indeed: solveur cloud indisponible (${remote?.reason || "fail"}) — cochez la case dans le navigateur (même IP).`,
+      "warn"
+    );
+    return { ok: false, reason: "manual_indeed_recaptcha", remote };
+  }
+  return solveRecaptchaWithProviderFallback(opts);
+}
+
+async function getOrCreateDeviceId() {
+  const { amijobsDeviceId } = await chrome.storage.local.get(["amijobsDeviceId"]);
+  if (amijobsDeviceId) return String(amijobsDeviceId);
+  const id = `ext_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  await chrome.storage.local.set({ amijobsDeviceId: id });
+  return id;
+}
+
+function stopExitSessionLocal() {
+  if (__exitPingTimer) {
+    clearInterval(__exitPingTimer);
+    __exitPingTimer = null;
+  }
+  try {
+    __exitWs?.close?.();
+  } catch (_e) {}
+  __exitWs = null;
+}
+
+async function stopExitSession() {
+  const sid = __exitSession?.sessionId;
+  stopExitSessionLocal();
+  if (sid) {
+    try {
+      await fetch(`${AMIJOBS_EXIT_BASE}/v1/session/${encodeURIComponent(sid)}`, {
+        method: "DELETE",
+        headers: { "X-AmiJobs-Gate": AMIJOBS_EXIT_GATE },
+      });
+    } catch (_e) {}
+  }
+  __exitSession = null;
+}
+
+async function ensureExitSession() {
+  if (__exitSession?.sessionId && __exitWs && __exitWs.readyState <= 1) {
+    return __exitSession;
+  }
+  stopExitSessionLocal();
+  const deviceId = await getOrCreateDeviceId();
+  const res = await fetch(`${AMIJOBS_EXIT_BASE}/v1/session`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-AmiJobs-Gate": AMIJOBS_EXIT_GATE,
+    },
+    body: JSON.stringify({ deviceId }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.ok || !data.sessionId) {
+    throw new Error(data?.reason || `exit_session_http_${res.status}`);
+  }
+  __exitSession = {
+    sessionId: data.sessionId,
+    proxy: data.proxy || null,
+    deviceId,
+    wsUrl: data.wsUrl,
+  };
+  await connectExitWs(__exitSession);
+  await appendLog(
+    `Exit AmiJobs connecté (session ${String(data.sessionId).slice(0, 8)}…) — CapSolver via IP utilisateur si tunnel OK`,
+    "success"
+  );
+  return __exitSession;
+}
+
+function connectExitWs(session) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      resolve(session);
+    };
+    try {
+      const u = new URL(session.wsUrl || `${AMIJOBS_EXIT_BASE.replace(/^http/, "ws")}/v1/exit`);
+      u.searchParams.set("sessionId", session.sessionId);
+      u.searchParams.set("gate", AMIJOBS_EXIT_GATE);
+      const ws = new WebSocket(u.toString());
+      __exitWs = ws;
+      ws.addEventListener("open", () => {
+        try {
+          // MV3 cannot open raw TCP for CapSolver CONNECT — announce capability
+          ws.send(JSON.stringify({ t: "caps", tcpCapable: false, fetchCapable: true }));
+        } catch (_e) {}
+        if (__exitPingTimer) clearInterval(__exitPingTimer);
+        __exitPingTimer = setInterval(() => {
+          try {
+            if (ws.readyState === 1) ws.send(JSON.stringify({ t: "ping" }));
+          } catch (_e) {}
+        }, 25000);
+        done();
+      });
+      ws.addEventListener("message", (ev) => {
+        let msg;
+        try {
+          msg = JSON.parse(String(ev.data || ""));
+        } catch (_e) {
+          return;
+        }
+        handleExitWsMessage(ws, msg).catch(() => {});
+      });
+      ws.addEventListener("close", () => {
+        if (__exitWs === ws) __exitWs = null;
+      });
+      ws.addEventListener("error", () => done());
+      setTimeout(done, 8000);
+    } catch (_e) {
+      done();
+    }
+  });
+}
+
+async function handleExitWsMessage(ws, msg) {
+  if (!msg || typeof msg !== "object") return;
+  if (msg.t === "open") {
+    // CapSolver HTTPS needs raw TCP CONNECT. Chrome MV3 has no sockets API.
+    try {
+      ws.send(JSON.stringify({ t: "error", id: msg.id, error: "tcp_unsupported_mv3" }));
+    } catch (_e) {}
+    return;
+  }
+  if (msg.t === "fetch") {
+    try {
+      const headers = msg.headers || {};
+      const init = { method: msg.method || "GET", headers, redirect: "follow" };
+      if (msg.bodyB64) {
+        init.body = Uint8Array.from(atob(msg.bodyB64), (c) => c.charCodeAt(0));
+      }
+      const r = await fetch(msg.url, init);
+      const buf = new Uint8Array(await r.arrayBuffer());
+      let bodyB64 = "";
+      {
+        let s = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < buf.length; i += chunk) {
+          s += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
+        }
+        bodyB64 = btoa(s);
+      }
+      const rh = {};
+      r.headers.forEach((v, k) => {
+        rh[k] = v;
+      });
+      ws.send(
+        JSON.stringify({
+          t: "fetchResult",
+          id: msg.id,
+          ok: true,
+          status: r.status,
+          statusText: r.statusText,
+          headers: rh,
+          bodyB64,
+        })
+      );
+    } catch (e) {
+      try {
+        ws.send(JSON.stringify({ t: "error", id: msg.id, error: String(e?.message || e) }));
+      } catch (_e) {}
+    }
+    return;
+  }
+  if (msg.t === "close" || msg.t === "data") {
+    // TCP streams unsupported — ignore
+  }
+}
+
+async function solveCaptchaViaExitApi(opts = {}) {
+  try {
+    await ensureExitSession();
+  } catch (e) {
+    return { ok: false, reason: "exit_session_failed", error: String(e?.message || e) };
+  }
+  const sessionId = __exitSession?.sessionId;
+  if (!sessionId) return { ok: false, reason: "no_exit_session" };
+
+  const websiteURL = opts.websiteURL || opts.pageUrl || opts.url || "";
+  const websiteKey = opts.websiteKey || opts.siteKey || "";
+  if (!websiteURL || !websiteKey) return { ok: false, reason: "missing_url_or_key" };
+
+  // Only ask CapSolver to use user-exit proxy when we can actually tunnel CONNECT (we can't on MV3).
+  // preferProxy still true enables RESIDENTIAL_PROXY on server if configured.
+  const preferProxy = true;
+
+  try {
+    const res = await fetch(`${AMIJOBS_EXIT_BASE}/v1/solve`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-AmiJobs-Gate": AMIJOBS_EXIT_GATE,
+      },
+      body: JSON.stringify({
+        sessionId,
+        websiteURL,
+        websiteKey,
+        isEnterprise: !!opts.isEnterprise || /enterprise/i.test(String(opts.type || "")),
+        apiDomain: opts.apiDomain || "",
+        userAgent: opts.userAgent || navigator.userAgent || "",
+        enterprisePayload: opts.enterprisePayload || null,
+        recaptchaDataSValue: opts.recaptchaDataSValue || "",
+        preferProxy,
+        provider: "auto",
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data?.ok && data.token) {
+      await appendLog(
+        `reCAPTCHA OK via exit (${data.provider}, ${data.proxyMode}, len=${String(data.token).length})`,
+        "success"
+      );
+      return { ok: true, token: data.token, provider: data.provider, proxyMode: data.proxyMode };
+    }
+    return {
+      ok: false,
+      reason: data?.reason || data?.error || `exit_solve_${res.status}`,
+      proxyMode: data?.proxyMode,
+    };
+  } catch (e) {
+    return { ok: false, reason: "exit_solve_exception", error: String(e?.message || e) };
+  }
+}
+
 async function solveCaptchaWith2Captcha({
   type = "recaptcha_v2",
   websiteURL,
@@ -2155,6 +3001,9 @@ async function solveCaptchaWith2Captcha({
   apiDomain = "",
   isEnterprise = false,
   isInvisible = false,
+  enterprisePayload = null,
+  recaptchaDataSValue = "",
+  useProxy = true,
 } = {}) {
   const clientKey = await getTwoCaptchaApiKey();
   if (!clientKey) {
@@ -2166,8 +3015,10 @@ async function solveCaptchaWith2Captcha({
     return { ok: false, reason: "missing_sitekey_or_url" };
   }
 
+  const proxy = useProxy ? await getCaptchaProxy() : null;
+
   // Deduplicate parallel identical solves (many frames used to spam 2captcha)
-  const dedupeKey = `${String(type).toLowerCase()}|${siteKey}|${pageUrl}|${!!isEnterprise}|${pageAction}|${data}`;
+  const dedupeKey = `${String(type).toLowerCase()}|${siteKey}|${pageUrl}|${!!isEnterprise}|${!!proxy}|${pageAction}|${data}`;
   if (!globalThis.__amijobsCaptchaInflight) globalThis.__amijobsCaptchaInflight = new Map();
   const inflight = globalThis.__amijobsCaptchaInflight;
   if (inflight.has(dedupeKey)) {
@@ -2181,6 +3032,10 @@ async function solveCaptchaWith2Captcha({
   const run = (async () => {
   let task;
   const t = String(type || "").toLowerCase();
+  const sVal =
+    (enterprisePayload && typeof enterprisePayload === "object" && enterprisePayload.s) ||
+    recaptchaDataSValue ||
+    "";
   if (t.includes("turnstile") || t.includes("cloudflare")) {
     task = {
       type: "TurnstileTaskProxyless",
@@ -2194,24 +3049,46 @@ async function solveCaptchaWith2Captcha({
     if (userAgent) task.userAgent = userAgent;
   } else if (isEnterprise || t.includes("enterprise")) {
     task = {
-      type: "RecaptchaV2EnterpriseTaskProxyless",
+      type: proxy ? "RecaptchaV2EnterpriseTask" : "RecaptchaV2EnterpriseTaskProxyless",
       websiteURL: pageUrl,
       websiteKey: siteKey,
       isInvisible: !!isInvisible,
     };
     if (apiDomain) task.apiDomain = apiDomain.replace(/^https?:\/\//, "");
+    if (userAgent) task.userAgent = userAgent;
+    if (sVal) task.enterprisePayload = { s: String(sVal) };
+    if (proxy) {
+      task.proxyType = proxy.proxyType;
+      task.proxyAddress = proxy.proxyAddress;
+      task.proxyPort = proxy.proxyPort;
+      if (proxy.proxyLogin) task.proxyLogin = proxy.proxyLogin;
+      if (proxy.proxyPassword) task.proxyPassword = proxy.proxyPassword;
+    }
   } else {
     task = {
-      type: "RecaptchaV2TaskProxyless",
+      type: proxy ? "RecaptchaV2Task" : "RecaptchaV2TaskProxyless",
       websiteURL: pageUrl,
       websiteKey: siteKey,
       isInvisible: !!isInvisible,
     };
     if (apiDomain) task.apiDomain = apiDomain.replace(/^https?:\/\//, "");
+    if (userAgent) task.userAgent = userAgent;
+    if (sVal) task.recaptchaDataSValue = String(sVal);
+    if (proxy) {
+      task.proxyType = proxy.proxyType;
+      task.proxyAddress = proxy.proxyAddress;
+      task.proxyPort = proxy.proxyPort;
+      if (proxy.proxyLogin) task.proxyLogin = proxy.proxyLogin;
+      if (proxy.proxyPassword) task.proxyPassword = proxy.proxyPassword;
+    }
   }
 
   try {
-    const deadline = Date.now() + 150000;
+    await appendLog(
+      `2captcha ${task.type} key=${siteKey.slice(0, 12)}… proxy=${proxy ? "yes" : "no"}`,
+      "warn"
+    );
+    const deadline = Date.now() + 180000;
     let taskId = null;
     let recreates = 0;
     const createTask = async () => {
@@ -2250,13 +3127,13 @@ async function solveCaptchaWith2Captcha({
       if (polled?.errorId) {
         const reason = polled.errorDescription || "poll_failed";
         await appendLog(`2captcha poll: ${reason}`, "warn");
-        // Fresh task often succeeds after "Workers could not solve"
+        // Fresh task rarely helps after "Workers could not solve" — fall through to CapSolver faster
         if (
-          recreates < 2 &&
+          recreates < 1 &&
           /workers could not solve|unsolvable|ERROR_CAPTCHA_UNSOLVABLE/i.test(reason)
         ) {
           recreates += 1;
-          await appendLog(`2captcha recreateTask ${recreates}/2…`, "warn");
+          await appendLog(`2captcha recreateTask ${recreates}/1…`, "warn");
           const again = await createTask();
           if (again.ok) {
             taskId = again.taskId;
@@ -2275,11 +3152,19 @@ async function solveCaptchaWith2Captcha({
           polled?.solution?.text ||
           "";
         if (!token) return { ok: false, reason: "empty_token" };
-        await appendLog(`2captcha: captcha résolu (${task.type})`, "success");
+        if (!isPlausibleGoogleRecaptchaToken(token)) {
+          await appendLog(
+            `2captcha: token invalide (len=${String(token).length}, prefix=${String(token).slice(0, 6)}…) — rejeté`,
+            "warn"
+          );
+          return { ok: false, reason: "implausible_token" };
+        }
+        await appendLog(`2captcha: captcha OK (${task.type}, len=${token.length}, proxy=${proxy ? "yes" : "no"})`, "success");
         return {
           ok: true,
           token,
           taskId,
+          usedProxy: !!proxy,
           userAgent: polled?.solution?.userAgent || userAgent || "",
         };
       }
@@ -2302,6 +3187,25 @@ async function solveCaptchaWith2Captcha({
 function answerYesNoCredential(question, cv, profile = {}) {
   const q = String(question || "").toLowerCase();
   const blob = `${cv || ""} ${profile.education || ""} ${profile.title || ""} ${profile.stack || ""}`.toLowerCase();
+  const country =
+    self.AmiJobsQuestionPref?.extractCountry?.(q) || (/france|french|francais/.test(q) ? "france" : "");
+  if (
+    country &&
+    /live|living|reside|resid|habit|based|located|leaving|stay|vivre|work|travail|travailler|autoris|right to work|visa|eligible|allowed to/.test(
+      q
+    )
+  ) {
+    const locBlob = `${blob} ${profile.location || ""} ${profile.country || ""}`.toLowerCase();
+    const countryHints = {
+      france: /france|paris|île-de-france|ile-de-france|lyon|marseille|lille|toulouse|nantes|bordeaux|\bidf\b/,
+      germany: /allemagne|germany|berlin|munich|deutschland/,
+      belgium: /belgique|belgium|bruxelles|brussels/,
+      switzerland: /suisse|switzerland|geneve|geneva|zurich/,
+      uk: /united kingdom|royaume-uni|london|england/,
+      eu: /europe|ue\b|eu\b|européen/,
+    };
+    if ((countryHints[country] || new RegExp(country, "i")).test(locBlob)) return "Oui";
+  }
   const isYn =
     /avez-vous|êtes-vous|etes-vous|poss[eè]dez|disposez|titulaire|do you (have|hold)|are you (a |an )?/i.test(q) ||
     (/dipl[oô]me|certificat|habilitation|permis|licence|qualification/.test(q) &&
@@ -2361,6 +3265,33 @@ async function generateAnswer(question, fieldType, options, jobInfo, profile, cv
   const q = String(question || "");
   const cv = String(cvText || profile?.cvText || "");
   const loc = String(profile.location || profile.country || "France").toLowerCase();
+  const Q = self.AmiJobsQuestionPref;
+  try {
+    const { questionPreferences = [] } = await chrome.storage.local.get(["questionPreferences"]);
+    const pref = Q?.findMatchingPreference?.(questionPreferences, q);
+    if (pref?.answer) {
+      if (options?.length) {
+        const want = String(pref.answer);
+        const hit =
+          options.find((o) => String(o).toLowerCase() === want.toLowerCase()) ||
+          options.find(
+            (o) =>
+              String(o).toLowerCase().includes(want.toLowerCase()) ||
+              want.toLowerCase().includes(String(o).toLowerCase())
+          );
+        if (hit) return hit;
+        if (/^(oui|yes)$/i.test(want)) {
+          const y = options.find((o) => /oui|yes/i.test(String(o)));
+          if (y) return y;
+        }
+        if (/^(non|no)$/i.test(want)) {
+          const n = options.find((o) => /non|no/i.test(String(o)));
+          if (n) return n;
+        }
+      }
+      return pref.answer;
+    }
+  } catch (_e) {}
 
   // Credential / diplôme yes-no BEFORE education fallback (was answering Bac+5 / Oui blindly)
   const yn = answerYesNoCredential(q, cv, profile || {});
@@ -2461,8 +3392,9 @@ Poste: ${jobInfo?.title || "?"} @ ${jobInfo?.company || "?"}
 
 RÈGLES STRICTES:
 - Réponds UNIQUEMENT avec la valeur du champ, sans explication ni phrase.
-- Base-toi UNIQUEMENT sur le CV texte et le profil. N'invente AUCUNE compétence, diplôme ou certification absente du CV.
+- Base-toi UNIQUEMENT sur le CV texte, le profil, et les préférences de questions de l'utilisateur.
 - Questions oui/non sur diplôme/certificat/permis: réponds "Non" si le CV ne le mentionne pas explicitement.
+- Questions résidence / droit de travailler dans le pays du profil: réponds "Oui" si le CV ou la localisation le confirment.
 - Pour antiquité / années d'expérience: réponds avec un nombre entier uniquement (ex: 5).
 - Interdit: inventer "Oui", "we", "n/a", anglais générique.
 - Si l'info manque dans le CV, préfère "Non" (credentials) ou une valeur minimale factuelle.
@@ -2470,6 +3402,16 @@ RÈGLES STRICTES:
   let userPrompt = `Question: "${question}"\nType: ${fieldType}`;
   if (options?.length) userPrompt += `\nOptions: ${JSON.stringify(options)}`;
   if (!cv) userPrompt += `\n(ATTENTION: aucun texte CV fourni — ne pas inventer de diplômes)`;
+  try {
+    const { questionPreferences = [] } = await chrome.storage.local.get(["questionPreferences"]);
+    if (questionPreferences?.length) {
+      const lines = questionPreferences
+        .slice(0, 40)
+        .map((p) => `- ${p.question} → ${p.answer}`)
+        .join("\n");
+      userPrompt += `\n\nPréférences questions (corrections manuelles de l'utilisateur):\n${lines}`;
+    }
+  } catch (_e) {}
   const ai = await askMistral(systemPrompt, userPrompt, 200);
   if (!ai) {
     // No AI — safe credential default
@@ -2528,6 +3470,27 @@ async function getActivePlatforms() {
   return active;
 }
 
+async function openAmiJobsPopup() {
+  try {
+    if (chrome.action?.openPopup) {
+      await chrome.action.openPopup();
+      return true;
+    }
+  } catch (_e) {}
+  try {
+    await chrome.windows.create({
+      url: chrome.runtime.getURL("popup.html"),
+      type: "popup",
+      width: 420,
+      height: 620,
+      focused: true,
+    });
+    return true;
+  } catch (_e2) {
+    return false;
+  }
+}
+
 async function finalizeMetaSession() {
   const { amijobsMeta = null, stats = { applied: 0, skipped: 0, errors: 0, lastRun: null } } =
     await chrome.storage.local.get(["amijobsMeta", "stats"]);
@@ -2539,11 +3502,12 @@ async function finalizeMetaSession() {
       enabled: false,
     });
   }
+  await stopExitSession().catch(() => {});
 }
 
 const HARD_STOP_REASON = /arr[êe]t|demand|objectif|atteint|manuel|\bstop\b|limite/i;
 
-async function endPlatformSession(platform, reason = "") {
+async function endPlatformSession(platform, reason = "", options = {}) {
   const key = SESSION_KEYS[platform];
   const lastKey = LAST_SESSION_KEYS[platform];
   const { [key]: session = null, stats = { applied: 0, skipped: 0, errors: 0, lastRun: null } } =
@@ -2630,6 +3594,11 @@ async function endPlatformSession(platform, reason = "") {
   if (!stillActive) {
     await finalizeMetaSession();
     await appendLog("Toutes les sessions AmiJobs sont terminées", "success");
+    if (options.openPopup) {
+      setTimeout(() => {
+        openAmiJobsPopup().catch(() => {});
+      }, 280);
+    }
   }
 }
 
@@ -3168,6 +4137,11 @@ async function startMultiSession(msg) {
     lastPlatformReopenAt[p] = 0;
     delete platformWindowIds[p];
   }
+  try {
+    await ensureExitSession();
+  } catch (e) {
+    await appendLog(`Exit AmiJobs: connexion différée (${String(e?.message || e)})`, "warn");
+  }
   await appendLog(
     `Session AmiJobs démarrée (${platforms.join(" + ")}): "${keywords}" @ "${locationsOrEmpty.join(", ")}"` +
       (contracts.length ? ` [${contracts.join(", ")}]` : ""),
@@ -3296,60 +4270,22 @@ function handleMessage(msg, sendResponse, sender = null) {
         sendResponse({ ok: false, reason: "no_tab" });
         return;
       }
-      const calm = !!msg.calm;
-      // Hard throttle — re-inject + CDP clicks were refreshing Cloudflare Ray IDs in a loop
-      const now = Date.now();
-      if (!globalThis.__amijobsCfInjectAt) globalThis.__amijobsCfInjectAt = 0;
-      if (now - globalThis.__amijobsCfInjectAt < (calm ? 45000 : 20000)) {
-        sendResponse({ ok: true, throttled: true });
+      // BBQ path: full background orchestrator (Verify click → 2captcha → callback)
+      const r = await orchestrateCloudflareTurnstileSolve(tabId, msg.params || null);
+      sendResponse(r);
+    })();
+    return true;
+  }
+
+  if (msg.action === "orchestrateCloudflareTurnstile") {
+    (async () => {
+      const tabId = msg.tabId || sender?.tab?.id;
+      if (!tabId) {
+        sendResponse({ ok: false, reason: "no_tab" });
         return;
       }
-      globalThis.__amijobsCfInjectAt = now;
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId, allFrames: true },
-          files: ["content/turnstile-hook.js", "content/cloudflare-turnstile.js"],
-        });
-        // Soft click once (content script rate-limits further attempts)
-        const results = await chrome.scripting.executeScript({
-          target: { tabId, allFrames: true },
-          func: () => {
-            try {
-              if (typeof window.__AmijobsClickTurnstile === "function") {
-                return { clicked: !!window.__AmijobsClickTurnstile(), href: location.href.slice(0, 120) };
-              }
-            } catch (_e) {
-              /* ignore */
-            }
-            return { clicked: false, href: location.href.slice(0, 120) };
-          },
-        });
-        await chrome.scripting.executeScript({
-          target: { tabId, allFrames: true },
-          func: () => {
-            try {
-              if (typeof window.__AmijobsSolveTurnstile === "function") {
-                window.__AmijobsSolveTurnstile(true);
-                return true;
-              }
-            } catch (_e) {}
-            return false;
-          },
-        });
-        // CDP click only when NOT calm — calm mode avoids Ray ID thrash
-        let trusted = { ok: false, skipped: true };
-        if (!calm) {
-          trusted = await clickTurnstileWithDebugger(tabId);
-        }
-        sendResponse({
-          ok: true,
-          frames: (results || []).map((r) => r?.result).filter(Boolean),
-          trusted,
-          calm,
-        });
-      } catch (err) {
-        sendResponse({ ok: false, error: String(err?.message || err) });
-      }
+      const r = await orchestrateCloudflareTurnstileSolve(tabId, msg.params || null);
+      sendResponse(r);
     })();
     return true;
   }
@@ -3358,32 +4294,14 @@ function handleMessage(msg, sendResponse, sender = null) {
     (async () => {
       const tabId = msg.tabId || sender?.tab?.id;
       const token = msg.token || "";
+      const ua = String(msg.userAgent || "").trim();
       if (!tabId || !token) {
         sendResponse({ ok: false, reason: "missing" });
         return;
       }
       try {
-        await chrome.scripting.executeScript({
-          target: { tabId, allFrames: true },
-          world: "MAIN",
-          func: (tok) => {
-            try {
-              window.postMessage({ source: "amijobs-cf-token", token: tok }, "*");
-              for (const input of document.querySelectorAll(
-                '[name="cf-turnstile-response"], input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], [name="g-recaptcha-response"]'
-              )) {
-                input.value = tok;
-                input.dispatchEvent(new Event("input", { bubbles: true }));
-                input.dispatchEvent(new Event("change", { bubbles: true }));
-              }
-              if (typeof window.__AmijobsCfCallback === "function") window.__AmijobsCfCallback(tok);
-              if (typeof window.cfCallback === "function") window.cfCallback(tok);
-              if (typeof window.tsCallback === "function") window.tsCallback(tok);
-            } catch (_e) {}
-          },
-          args: [token],
-        });
-        sendResponse({ ok: true });
+        const r = await injectCloudflareTurnstileToken(tabId, token, ua);
+        sendResponse(r);
       } catch (e) {
         sendResponse({ ok: false, reason: e.message });
       }
@@ -3482,7 +4400,9 @@ function handleMessage(msg, sendResponse, sender = null) {
   }
 
   if (msg.action === "endPlatformSession") {
-    endPlatformSession(msg.platform, msg.reason || "").then(() => sendResponse({ ok: true }));
+    endPlatformSession(msg.platform, msg.reason || "", { openPopup: !!msg.openPopup }).then(() =>
+      sendResponse({ ok: true })
+    );
     return true;
   }
 
@@ -3570,6 +4490,29 @@ function handleMessage(msg, sendResponse, sender = null) {
     askMistral(msg.systemPrompt || "", msg.userPrompt || "", msg.maxTokens || 300).then((answer) =>
       sendResponse({ answer })
     );
+    return true;
+  }
+
+  if (msg.action === "recordQuestionPreference") {
+    (async () => {
+      const Q = self.AmiJobsQuestionPref;
+      const question = String(msg.question || "").trim();
+      const answer = String(msg.answer || "").trim();
+      if (!Q || !question || !answer) {
+        sendResponse({ ok: false, reason: "invalid" });
+        return;
+      }
+      const { questionPreferences = [] } = await chrome.storage.local.get(["questionPreferences"]);
+      const r = Q.upsertQuestionPreference(questionPreferences, question, answer);
+      if (r.changed) {
+        await chrome.storage.local.set({ questionPreferences: r.prefs });
+        await appendLog(
+          `Question preference ${r.updated ? "mise à jour" : "ajoutée"}: «${question.slice(0, 80)}» → ${answer}`,
+          "info"
+        );
+      }
+      sendResponse({ ok: true, changed: !!r.changed, updated: !!r.updated, skipped: r.skipped || "" });
+    })();
     return true;
   }
 
@@ -3707,31 +4650,54 @@ function handleMessage(msg, sendResponse, sender = null) {
 
   if (msg.action === "solveCaptcha" || msg.action === "solve2Captcha") {
     (async () => {
-      const r = await solveCaptchaWith2Captcha({
+      const browserUa = String(msg.userAgent || "").trim();
+      const pageUrl = msg.websiteURL || msg.pageUrl || msg.url || "";
+      let apiDomain = msg.apiDomain || "";
+      if (!apiDomain && /smartapply\.indeed|indeed\.(com|[a-z]{2})/i.test(pageUrl)) {
+        apiDomain = "www.recaptcha.net";
+      }
+      let r = await solveCaptchaRouted({
         type: msg.type || msg.captchaType || "recaptcha_v2",
-        websiteURL: msg.websiteURL || msg.pageUrl || msg.url || "",
+        websiteURL: pageUrl,
         websiteKey: msg.websiteKey || msg.sitekey || msg.siteKey || "",
         pageAction: msg.pageAction || msg.actionName || "",
         data: msg.data || msg.cData || "",
         pagedata: msg.pagedata || msg.chlPageData || msg.pageData || "",
-        userAgent: msg.userAgent || "",
-        apiDomain: msg.apiDomain || "",
+        userAgent: browserUa,
+        apiDomain,
         isEnterprise: !!msg.isEnterprise || /enterprise/i.test(String(msg.type || "")),
         isInvisible: !!msg.isInvisible,
+        enterprisePayload: msg.enterprisePayload || null,
+        recaptchaDataSValue: msg.recaptchaDataSValue || "",
+        preferCapSolver: !!msg.preferCapSolver,
       });
+      // Never inject CapSolver junk (HF… ~500 chars) even if a provider mis-flags ok
+      if (r?.ok && r.token && !isPlausibleGoogleRecaptchaToken(r.token)) {
+        await appendLog(
+          `solveCaptcha: token invraisemblable rejeté (len=${String(r.token).length})`,
+          "warn"
+        );
+        r = { ok: false, reason: "implausible_token" };
+      }
       // Always push token into the tab that asked (all frames) so host page gets it
       if (r?.ok && r.token && sender?.tab?.id && msg.injectInTab !== false) {
         const tabId = sender.tab.id;
+        const isTurnstile = /turnstile|cloudflare/i.test(String(msg.type || msg.captchaType || ""));
+        if (isTurnstile) {
+          await appendLog("solveCaptcha: Turnstile ignoré (mode manuel — cliquez le widget)", "warn");
+        } else {
         try {
           await chrome.tabs.sendMessage(tabId, { action: "injectRecaptchaToken", token: r.token });
         } catch (_e) {}
-        // MAIN world: Indeed reads grecaptcha.getResponse(), not only the textarea
+        // MAIN world: Indeed reads grecaptcha.getResponse() + visible client callback
         try {
           await chrome.scripting.executeScript({
             target: { tabId, allFrames: true },
             world: "MAIN",
             func: (token) => {
               try {
+                const visibleKey = "6Ldn8QwpAAAAAAYahgoiLgJ0lHSu9PRHngswlkls";
+                const invisibleKey = "6Lcr30spAAAAANOd2aQVyfNwAwHyAW6WsatMvrqU";
                 window.__AmijobsRecaptchaToken = token;
                 const fill = () => {
                   let area =
@@ -3770,23 +4736,71 @@ function handleMessage(msg, sendResponse, sender = null) {
                   } catch (_e) {}
                 };
                 patch(window.grecaptcha);
-                const walk = (obj, depth) => {
+                // Only visible widget success callback — never invisible promise-callback
+                const shouldInvoke = (key) => {
+                  const k = String(key || "");
+                  if (/expired|error|timeout|reset|cancel|close/i.test(k)) return false;
+                  return /^(callback|success-callback|successCallback)$/i.test(k);
+                };
+                const tryCall = (fn) => {
+                  if (typeof fn !== "function") return;
+                  try {
+                    fn(token);
+                  } catch (_e) {}
+                };
+                const findSitekeys = (obj, depth, out) => {
+                  if (!obj || depth > 8) return;
+                  try {
+                    if (typeof obj === "string" && /^6L[A-Za-z0-9_-]{20,}/.test(obj)) out.push(obj);
+                    else if (typeof obj === "object") {
+                      for (const k of Object.keys(obj)) {
+                        const v = obj[k];
+                        if (typeof v === "string" && /sitekey|siteKey|^k$/i.test(k) && /^6L/.test(v)) out.push(v);
+                        else if (v && typeof v === "object") findSitekeys(v, depth + 1, out);
+                      }
+                    }
+                  } catch (_e) {}
+                };
+                const clientKind = (client) => {
+                  const keys = [];
+                  findSitekeys(client, 0, keys);
+                  if (keys.some((k) => k === visibleKey || k.indexOf("6Ldn8Qwp") === 0)) return "visible";
+                  if (keys.some((k) => k === invisibleKey || k.indexOf("6Lcr30sp") === 0)) return "invisible";
+                  return "unknown";
+                };
+                const walkSuccess = (obj, depth) => {
                   if (!obj || depth > 10) return;
                   try {
                     for (const k of Object.keys(obj)) {
                       const v = obj[k];
-                      if (typeof v === "function" && /callback|promise|resolve|success/i.test(String(k))) {
-                        try {
-                          v(token);
-                        } catch (_e) {}
-                      } else if (v && typeof v === "object") walk(v, depth + 1);
+                      if (typeof v === "function" && shouldInvoke(k)) tryCall(v);
+                      else if (v && typeof v === "object") walkSuccess(v, depth + 1);
                     }
                   } catch (_e) {}
                 };
                 try {
                   if (window.___grecaptcha_cfg?.clients) {
-                    for (const id of Object.keys(window.___grecaptcha_cfg.clients)) {
-                      walk(window.___grecaptcha_cfg.clients[id], 0);
+                    const ids = Object.keys(window.___grecaptcha_cfg.clients);
+                    const ranked = ids
+                      .map((id) => {
+                        const client = window.___grecaptcha_cfg.clients[id];
+                        const kind = clientKind(client);
+                        let score = 0;
+                        if (kind === "visible") score = 100;
+                        else if (kind === "invisible") score = -50;
+                        else if (String(id) === "0") score = 40;
+                        else if (Number(id) >= 100000) score = -40;
+                        return { id, client, kind, score };
+                      })
+                      .sort((a, b) => b.score - a.score);
+                    for (const row of ranked) {
+                      if (row.kind === "invisible" || row.score < 0) continue;
+                      try {
+                        const gg = row.client?.G?.G;
+                        if (gg) tryCall(gg.callback);
+                      } catch (_e) {}
+                      walkSuccess(row.client, 0);
+                      if (row.kind === "visible" || row.score >= 40) break;
                     }
                   }
                 } catch (_e) {}
@@ -3819,6 +4833,7 @@ function handleMessage(msg, sendResponse, sender = null) {
             args: [r.token],
           });
         } catch (_e) {}
+        }
       }
       sendResponse(r);
     })().catch((e) => sendResponse({ ok: false, reason: e.message }));
@@ -4244,6 +5259,7 @@ function handleMessage(msg, sendResponse, sender = null) {
       }
       const platforms = await getActivePlatforms();
       for (const p of platforms) await endPlatformSession(p, "Arrêt demandé");
+      await stopExitSession().catch(() => {});
       sendResponse({ ok: true });
     })();
     return true;
@@ -4257,8 +5273,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return handleMessage(msg, sendResponse, sender);
 });
 
-// Seed local 2captcha key from secrets.local.json on every SW wake (local installs only)
+// Seed captcha keys from secrets.local.json on every SW wake (local installs only)
+seedCaptchaApiKeysFromSecrets().catch(() => {});
 getTwoCaptchaApiKey().catch(() => {});
+getCapSolverApiKey().catch(() => {});
 
 chrome.runtime.onInstalled.addListener(async () => {
   const existing = await chrome.storage.local.get([
@@ -4268,6 +5286,7 @@ chrome.runtime.onInstalled.addListener(async () => {
     "uiSettings",
     "enabled",
     "twoCaptchaApiKey",
+    "capSolverApiKey",
   ]);
   const patch = {};
   if (!existing.profile) patch.profile = { ...DEFAULT_PROFILE };
@@ -4277,9 +5296,11 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (!existing.uiSettings) patch.uiSettings = { language: "auto" };
   if (typeof existing.enabled !== "boolean") patch.enabled = true;
   if (Object.keys(patch).length) await chrome.storage.local.set(patch);
-  // Local-only: seed 2captcha from secrets.local.json if present (gitignored)
+  // Local-only: seed captcha keys from secrets.local.json if present (gitignored)
   try {
+    await seedCaptchaApiKeysFromSecrets();
     await getTwoCaptchaApiKey();
+    await getCapSolverApiKey();
   } catch (_e) {}
   await appendLog(`AmiJobs v${EXT_VERSION} installé — amijobs.com`, "success");
 });

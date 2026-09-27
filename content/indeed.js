@@ -4,7 +4,7 @@
   window.__AmijobsIndeedLoaded = true;
 
   const PLATFORM = "indeed";
-  const VERSION = "1.4.61";
+  const VERSION = "1.5.7";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -37,9 +37,35 @@
     const captureSubmit = (text, url) => {
       try {
         const blob = `${url || ""} ${text || ""}`;
-        if (!/SubmitApplication/i.test(blob)) return;
-        // Successful mutation responses include data.submitApplication / applicationId
-        if (/SubmitApplication|submitApplication/i.test(String(text || ""))) {
+        if (!/SubmitApplication|submitApplication/i.test(blob)) return;
+        const raw = String(text || "");
+        // GraphQL errors / Indeed soft-fails must NOT count as applied
+        if (
+          /CAPTCHA_VALIDATION_FAILED|Invalid ReCaptcha token/i.test(raw) ||
+          /"errors"\s*:\s*\[/.test(raw) ||
+          /submitApplication"\s*:\s*null/i.test(raw)
+        ) {
+          window.__AmijobsSubmitApplicationFail = Date.now();
+          window.__AmijobsCaptchaRejected = Date.now();
+          window.__AmijobsRejectedToken = String(window.__AmijobsRecaptchaToken || "");
+          window.__AmijobsCaptchaRejectCount = (window.__AmijobsCaptchaRejectCount || 0) + 1;
+          try {
+            const why = /CAPTCHA_VALIDATION_FAILED/i.test(raw)
+              ? "CAPTCHA_VALIDATION_FAILED"
+              : /Invalid ReCaptcha/i.test(raw)
+                ? "Invalid ReCaptcha token"
+                : "submit_errors";
+            chrome.runtime
+              .sendMessage({
+                action: "appendLog",
+                message: `[indeed] Indeed a rejeté le captcha (${why}) — token solveur invalide`,
+                level: "error",
+              })
+              .catch(() => {});
+          } catch (_e) {}
+          return;
+        }
+        if (/applicationId|submittedAt/i.test(raw)) {
           window.__AmijobsSubmitApplicationOk = Date.now();
         }
       } catch (_e) {}
@@ -81,11 +107,7 @@
             const u = this.__amijobsUrl || "";
             if (/apply\.indeed\.com\/api\/v1\/env/i.test(u)) captureEnv(this.responseText);
             if (/apis\.indeed\.com\/graphql/i.test(u)) captureSubmit(this.responseText, u);
-            // Also catch operation name in request body
-            const body = args[0];
-            if (typeof body === "string" && /SubmitApplication/i.test(body) && this.status >= 200 && this.status < 300) {
-              window.__AmijobsSubmitApplicationOk = Date.now();
-            }
+            // Do NOT mark success from request body alone — response may be CAPTCHA_VALIDATION_FAILED
           } catch (_e) {}
         });
         return XS.apply(this, args);
@@ -366,7 +388,7 @@
     if (pageApplied < perPage) return null;
     if (total >= maxJobs) return null;
     const nextPage = (session.currentPage || 0) + 1;
-    if (nextPage > maxIndeedSerpPages(session, settings)) return null;
+    if (!hasIndeedNextSerpPage() || nextPage > maxIndeedSerpPages(session, settings)) return null;
     const nextUrl = buildSearchUrl(session.keywords, session.location, nextPage, session);
     S().log(
       PLATFORM,
@@ -386,24 +408,101 @@
   }
 
   async function endSession(reason) {
-    await chrome.runtime.sendMessage({ action: "endPlatformSession", platform: PLATFORM, reason });
+    try {
+      playSessionBeep("done");
+    } catch (_e) {}
+    await chrome.runtime.sendMessage({
+      action: "endPlatformSession",
+      platform: PLATFORM,
+      reason,
+      openPopup: true,
+    });
     if (reason) S().log(PLATFORM, `Session terminée: ${reason}`, "warn");
+  }
+
+  function playSessionBeep(type = "done") {
+    try {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const gainNode = audioCtx.createGain();
+      gainNode.connect(audioCtx.destination);
+      gainNode.gain.value = 0.35;
+      if (type === "done") {
+        [0, 180].forEach((delay, i) => {
+          const osc = audioCtx.createOscillator();
+          osc.connect(gainNode);
+          osc.type = "sine";
+          osc.frequency.value = i === 0 ? 740 : 980;
+          osc.start(audioCtx.currentTime + delay / 1000);
+          osc.stop(audioCtx.currentTime + delay / 1000 + 0.16);
+        });
+        setTimeout(() => audioCtx.close(), 900);
+      } else {
+        const osc = audioCtx.createOscillator();
+        osc.connect(gainNode);
+        osc.type = "sine";
+        osc.frequency.value = 660;
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.25);
+        setTimeout(() => audioCtx.close(), 800);
+      }
+    } catch (_e) {}
+  }
+
+  async function humanSleep(minMs, maxMs) {
+    const a = Math.max(0, Math.min(minMs, maxMs));
+    const b = Math.max(minMs, maxMs);
+    await S().sleep(S().randomDelay(a, b || a + 1));
+  }
+
+  /** True when SERP still has a usable Next control (or enough cards to imply another page). */
+  function hasIndeedNextSerpPage() {
+    const nextSels = [
+      'a[data-testid="pagination-page-next"]',
+      'button[data-testid="pagination-page-next"]',
+      'a[aria-label="Next Page"]',
+      'a[aria-label="Next"]',
+      'a[aria-label="Suivant"]',
+      'nav[role="navigation"] a[aria-label*="Next" i]',
+      'nav[role="navigation"] a[aria-label*="Suivant" i]',
+      'a[data-testid="pagination-page-next-button"]',
+    ];
+    for (const sel of nextSels) {
+      let el;
+      try {
+        el = document.querySelector(sel);
+      } catch (_e) {
+        continue;
+      }
+      if (!el) continue;
+      if (el.getAttribute("aria-disabled") === "true" || el.hasAttribute("disabled")) continue;
+      if (/disabled|inactive|aria-disabled/i.test(`${el.className || ""} ${el.getAttribute("aria-disabled") || ""}`)) {
+        continue;
+      }
+      return true;
+    }
+    // No Next control → last page (do not invent start=N URLs forever)
+    return false;
   }
 
   function detectCloudflareChallenge() {
     const text = (document.body?.innerText || "").toLowerCase();
     const title = (document.title || "").toLowerCase();
+    // If job cards are visible, this is a healthy SERP — not a CF wall
+    try {
+      if (document.querySelectorAll('[data-jk], .job_seen_beacon, .cardOutline, a[data-jk]').length >= 3) {
+        return false;
+      }
+    } catch (_e) {}
     return (
       text.includes("verify you are human") ||
       text.includes("vérifiez que vous êtes humain") ||
       text.includes("additional verification required") ||
-      text.includes("je ne suis pas un robot") ||
-      text.includes("i'm not a robot") ||
       text.includes("checking your browser") ||
       text.includes("just a moment") ||
       title.includes("just a moment") ||
       title.includes("un instant") ||
-      /ray id/i.test(text) ||
+      title.includes("additional verification") ||
+      title.includes("security check") ||
       !!document.querySelector(
         '#challenge-stage, .cf-turnstile, iframe[src*="challenges.cloudflare.com"], #cf-challenge-running'
       )
@@ -419,56 +518,49 @@
   }
 
   async function tryPassCloudflareChallenge() {
+    // Job cards visible ⇒ already past CF
+    try {
+      if (collectJobCards().length > 0 || isSmartApplyPage()) {
+        try {
+          await chrome.storage.local.set({ amijobsCfPause: null });
+        } catch (_e) {}
+        return false;
+      }
+    } catch (_e) {}
+
     const text = (document.body?.innerText || "").toLowerCase();
     const hasWidget =
       detectCloudflareChallenge() ||
       text.includes("vérifiez que vous êtes humain") ||
       text.includes("verify you are human") ||
+      text.includes("additional verification required") ||
       !!S().$('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile');
     if (!hasWidget) return false;
 
-    // Freeze mass-apply / tab thrash while CF is up — spam reload = Ray ID "bruteforce"
-    await markCloudflarePause(120000);
+    // Freeze mass-apply while the user solves Cloudflare Turnstile by hand
+    await markCloudflarePause(600000);
     S().log(
       PLATFORM,
-      "Challenge Cloudflare — pause calme (pas de refresh). Cliquez la case ou attendez 2captcha.",
+      "Cloudflare Turnstile — cliquez le widget manuellement. AmiJobs attend (reCAPTCHA reste auto)…",
       "warn"
     );
 
-    // ONE inject + one soft click + one 2captcha kick — never loop inject/CDP
-    if (!window.__AmijobsCfSolveStartedAt || Date.now() - window.__AmijobsCfSolveStartedAt > 60000) {
-      window.__AmijobsCfSolveStartedAt = Date.now();
-      try {
-        await chrome.runtime.sendMessage({ action: "injectTurnstileClicker", calm: true });
-      } catch (_e) {}
-      try {
-        if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
-        if (typeof window.__AmijobsSolveTurnstile === "function") window.__AmijobsSolveTurnstile(true);
-      } catch (_e) {}
-    }
-
     const start = Date.now();
-    const maxMs = 120000;
-    let lastClickAt = 0;
+    const maxMs = 600000;
+    let lastHint = 0;
     while (Date.now() - start < maxMs) {
       if (shouldStop) return false;
-
-      // At most one soft click every 8s — never spam the widget
-      if (Date.now() - lastClickAt > 8000) {
-        lastClickAt = Date.now();
-        try {
-          if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
-        } catch (_e) {}
+      if (Date.now() - lastHint > 25000) {
+        lastHint = Date.now();
+        S().log(PLATFORM, "En attente du Turnstile Cloudflare (manuel)…", "warn");
+        await markCloudflarePause(600000);
       }
-
-      await S().sleep(4000);
-      const still = detectCloudflareChallenge();
-      if (!still && !detectBlockedPage()) {
-        S().log(PLATFORM, "Challenge Cloudflare passé", "success");
+      await S().sleep(2000);
+      if (!detectCloudflareChallenge() && !detectBlockedPage()) {
+        S().log(PLATFORM, "Challenge Cloudflare passé (manuel)", "success");
         try {
           await chrome.storage.local.set({ amijobsCfPause: null });
         } catch (_e) {}
-        window.__AmijobsCfSolveStartedAt = 0;
         return true;
       }
       if (collectJobCards().length > 0 || isSmartApplyPage()) {
@@ -476,13 +568,12 @@
         try {
           await chrome.storage.local.set({ amijobsCfPause: null });
         } catch (_e) {}
-        window.__AmijobsCfSolveStartedAt = 0;
         return true;
       }
     }
     S().log(
       PLATFORM,
-      "Challenge Cloudflare toujours présent — session en pause (ne pas recharger)",
+      "Turnstile toujours présent — cliquez le widget Cloudflare, puis relancez si besoin",
       "warn"
     );
     await markCloudflarePause(180000);
@@ -621,14 +712,9 @@
       const easy = cardLooksLikeEasyApply(shell) || cardLooksLikeEasyApply(el);
       out.push({ element: shell || el, jobId: jk, title, company, easyApply: easy });
     }
-    // SERP already filtered with applicationType=1 / iafilter=1 — keep all cards
-    try {
-      const u = new URL(location.href);
-      if (u.searchParams.get("applicationType") === "1" || u.searchParams.get("iafilter") === "1") {
-        return out.map((c) => ({ ...c, easyApply: true }));
-      }
-    } catch (_e) {}
-    // If any card has Easy Apply badge, drop cards without it
+    // Prefer cards that show Easy Apply / candidature simplifiée.
+    // Do NOT force easyApply=true just because applicationType=1 — Indeed still lists
+    // company-site jobs that cost ~20s each if we wait for a Postuler CTA that never comes.
     if (out.some((c) => c.easyApply)) {
       return out.filter((c) => c.easyApply);
     }
@@ -691,12 +777,23 @@
   }
 
   function getJobInfoFromPage(jobId) {
-    const title =
+    let title =
       S().$('[data-testid="jobsearch-JobInfoHeader-title"]')?.textContent?.trim() ||
       S().$(".jobsearch-JobInfoHeader-title")?.textContent?.trim() ||
       S().$("h1.jobsearch-JobInfoHeader-title")?.textContent?.trim() ||
-      S().$("h1")?.textContent?.trim() ||
+      S().$('[data-testid="jobTitle"]')?.textContent?.trim() ||
       "";
+    // SERP h1 is often "Emplois freelance (Île-de-France)" — never treat as job title
+    if (
+      !title ||
+      /^(emplois|jobs|offres)\b/i.test(title) ||
+      /\(île-de-france|ile-de-france\)/i.test(title) ||
+      title === (document.title || "").split("|")[0].trim()
+    ) {
+      const h2 = S().$(".jobsearch-JobInfoHeader-title-container h2, [data-testid='jobsearch-JobInfoHeader-title'] span")?.textContent?.trim();
+      if (h2 && !/^(emplois|jobs|offres)\b/i.test(h2)) title = h2;
+      else title = "";
+    }
     const company =
       S().$('[data-testid="inlineHeader-companyName"]')?.textContent?.trim() ||
       S().$('[data-testid="company-name"]')?.textContent?.trim() ||
@@ -724,11 +821,77 @@
     return m ? decodeURIComponent(m[1]) : `indeed_${Date.now()}`;
   }
 
-  function findIndeedEasyApplyButton() {
+  function isDisplayedEl(el) {
+    if (!el) return false;
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 2 && rect.height > 2;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function applyCtaLabel(el) {
+    if (!el) return "";
+    return `${el.innerText || el.textContent || ""} ${el.getAttribute?.("aria-label") || ""}`
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function isApplyCtaLoading(el) {
+    if (!el) return true;
+    const visible = `${el.innerText || el.textContent || ""}`.replace(/\s+/g, " ").trim().toLowerCase();
+    if (/^chargement(\s+en\s+cours)?\.?$|^loading(\.\.\.)?$|please wait/i.test(visible)) return true;
+    if (el.disabled || el.getAttribute("aria-disabled") === "true") return true;
+    return false;
+  }
+
+  function isIndeedEasyApplyLabel(text) {
+    const t = (text || "").replace(/\s+/g, " ").trim();
+    if (!t || t.length > 160) return false;
+    if (/^\s*candidature simplifi[ée]e\s*$/i.test(t)) return false;
+    if (/continuer (pour |à )?postuler|continue (to )?apply|postuler sur le site|company site/i.test(t)) {
+      return false;
+    }
+    return (
+      /postuler sur indeed|postuler maintenant|indeed apply|apply with indeed|apply on indeed|apply now|postuler facilement|candidature facile/i.test(
+        t
+      ) || /^\s*postuler(\s+maintenant)?\s*$/i.test(t)
+    );
+  }
+
+  function resolveIndeedApplyClickable(el) {
+    if (!el) return null;
+    if (el.matches?.("button, a, [role='button']")) return el;
+    const btn =
+      el.closest?.("#jobsearch-ViewJobButtons-container")?.querySelector?.(
+        'button[aria-label*="Postuler" i], button[aria-label*="Apply" i], button[data-testid$="-test"]'
+      ) ||
+      el.closest?.("button, a, [role='button']") ||
+      el.querySelector?.("button, a, [role='button']");
+    return btn || el;
+  }
+
+  /**
+   * Live FR SERP (browser-use probe 2026-08-16):
+   * - Visible CTA: BUTTON[data-testid$="-test"] aria="Postuler sur Indeed opens in a new tab"
+   * - Wrapper SPAN.indeed-apply-status-not-applied[data-indeed-apply-jk] (hashed testid, no -test suffix)
+   * - contentHtml model may say "Postuler maintenant" while painted text is "Postuler sur Indeed"
+   * - During hydrate, button text is "chargement en cours" and often disabled — wait, don't skip
+   */
+  function findIndeedEasyApplyButton(opts = {}) {
+    const allowLoading = !!opts.allowLoading;
     // Already-applied jobs often keep a dead Postuler control — never click it
     if (detectAlreadyAppliedUi()) return null;
 
-    const roots = [document];
+    const roots = [];
+    const panel = getIndeedJobPanelRoot();
+    if (panel) roots.push(panel);
+    roots.push(document);
     try {
       for (const frame of document.querySelectorAll("iframe")) {
         try {
@@ -738,73 +901,78 @@
       }
     } catch (_e) {}
 
+    const pick = (el) => {
+      if (!el || !isDisplayedEl(el) || isCompanySiteApplyButton(el) || isContinueToApplyButton(el)) {
+        return null;
+      }
+      const clickable = resolveIndeedApplyClickable(el);
+      if (!clickable || !isDisplayedEl(clickable)) return null;
+      if (isCompanySiteApplyButton(clickable) || isContinueToApplyButton(clickable)) return null;
+      const label = applyCtaLabel(clickable);
+      const loading = isApplyCtaLoading(clickable) || clickable.disabled || clickable.getAttribute("aria-disabled") === "true";
+      if (loading && !allowLoading) return null;
+      // Prefer labelled CTAs; allow data-indeed-apply-jk shells while loading
+      if (!isIndeedEasyApplyLabel(label) && !clickable.closest?.("[data-indeed-apply-jk], [class*='indeed-apply-status']")) {
+        return null;
+      }
+      if (!isIndeedEasyApplyLabel(label) && !loading) return null;
+      return clickable;
+    };
+
     const selectors = [
+      // Highest confidence — live FR panel
+      '#jobsearch-ViewJobButtons-container button[aria-label*="Postuler" i]',
+      '#jobsearch-ViewJobButtons-container button[aria-label*="Apply" i]',
+      "#jobsearch-ViewJobButtons-container button[data-testid$='-test']",
+      "#jobsearch-ViewJobButtons-container button",
+      "[class*='indeed-apply-status-not-applied']",
+      "[data-indeed-apply-jk]",
+      '[data-indeed-apply-onapplied]',
       '[data-testid="indeedApplyButton"]',
       "#indeedApplyButton",
-      '[data-indeed-apply-button]',
+      "[data-indeed-apply-button]",
       "button.ia-IndeedApplyButton",
       'button[aria-label*="Postuler sur Indeed" i]',
+      'button[aria-label*="Postuler maintenant" i]',
       'button[aria-label*="Indeed Apply" i]',
-      'button[aria-label*="opens in a new tab" i]',
+      'button[aria-label*="Apply now" i]',
       'a[aria-label*="Postuler sur Indeed" i]',
-      'a[data-indeed-apply-button]',
+      'a[aria-label*="Postuler maintenant" i]',
       "#applyButtonLinkContainer button",
       ".jobsearch-IndeedApplyButton-newDesign",
       'button[id*="indeedApply"]',
-      '[data-indeed-apply-status]',
-      // Live FR SERP (2026): hashed data-testid + text "Postuler sur Indeed"
+      // Hashed ids (scoped check via label)
       'button[data-testid$="-test"]',
       '[data-testid$="-test"][aria-label*="Postuler" i]',
       '[data-testid$="-test"][aria-label*="Indeed" i]',
     ];
-    for (const root of roots) {
-      for (const sel of selectors) {
-        for (const btn of root.querySelectorAll(sel)) {
-          if (!btn || !S().isVisible(btn) || isCompanySiteApplyButton(btn) || isContinueToApplyButton(btn)) {
-            continue;
-          }
-          // Hashed -test ids / generic "opens in a new tab" — require Postuler/Apply wording
-          if (sel.includes("-test") || /opens in a new tab/i.test(sel)) {
-            const t = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""}`;
-            if (!/postuler|indeed apply|apply with indeed|apply on indeed/i.test(t)) continue;
-          }
-          return btn;
-        }
-      }
-    }
 
     for (const root of roots) {
-      for (const el of root.querySelectorAll("button, a, [role='button'], div[role='button']")) {
-        if (!S().isVisible(el) || isCompanySiteApplyButton(el) || isContinueToApplyButton(el)) continue;
-        const text = `${el.innerText || el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.replace(
-          /\s+/g,
-          " "
-        );
-        // Badge / filter label — not an apply CTA
-        if (/^\s*candidature simplifi[ée]e\s*$/i.test(text.trim())) continue;
-        // Reject huge containers (job cards / panels) that merely contain the word somewhere
-        if (text.trim().length > 64) continue;
-        if (
-          /postuler sur indeed|indeed apply|apply with indeed|postuler facilement|candidature facile/i.test(
-            text
-          ) ||
-          /^\s*postuler\s*$/i.test(text)
-        ) {
-          return el;
+      for (const sel of selectors) {
+        let nodes;
+        try {
+          nodes = root.querySelectorAll(sel);
+        } catch (_e) {
+          continue;
+        }
+        for (const btn of nodes) {
+          const hit = pick(btn);
+          if (hit) return hit;
         }
       }
-      for (const span of root.querySelectorAll("span, div")) {
-        const t = (span.textContent || "").trim();
-        // Never match SERP filter chips — only real apply CTAs in the job panel
-        if (
-          !/^postuler sur indeed$/i.test(t) &&
-          !/^indeed apply$/i.test(t) &&
-          !/^postuler$/i.test(t) &&
-          !/^candidature facile$/i.test(t)
-        )
-          continue;
-        const clickable = span.closest("button, a, [role='button']") || span.parentElement;
-        if (clickable && S().isVisible(clickable) && !isCompanySiteApplyButton(clickable)) return clickable;
+
+      for (const el of root.querySelectorAll("button, a, [role='button']")) {
+        const label = applyCtaLabel(el);
+        if (!isIndeedEasyApplyLabel(label)) continue;
+        const hit = pick(el);
+        if (hit) return hit;
+      }
+
+      for (const span of root.querySelectorAll(
+        "span.indeed-apply-status-not-applied, [class*='indeed-apply-status-not-applied'], span[data-indeed-apply-jk], [data-indeed-apply-jk]"
+      )) {
+        const hit = pick(span);
+        if (hit) return hit;
       }
     }
     return null;
@@ -845,6 +1013,19 @@
     return /site (de l['’]entreprise|de l['’]employeur)|company (site|website)|sur le site|externe|external apply/i.test(
       text
     );
+  }
+
+  function panelShowsNonEasyApplyOnly() {
+    if (findContinueToApplyButton()) return true;
+    const root =
+      document.querySelector("#jobsearch-ViewJobButtons-container") ||
+      document.querySelector("[data-testid='jobsearch-ViewJobButtons-container']") ||
+      document;
+    for (const btn of root.querySelectorAll("button, a[role='button'], a")) {
+      if (!isDisplayedEl(btn)) continue;
+      if (isCompanySiteApplyButton(btn) || isContinueToApplyButton(btn)) return true;
+    }
+    return false;
   }
 
   async function ensureEasyApplyOnlyFilter() {
@@ -1016,20 +1197,71 @@
     return false;
   }
 
-  async function waitForApplyButton(timeoutMs = 14000) {
+  async function waitForApplyButton(timeoutMs = 2800) {
     // Easy Apply / candidature simplifiée only — ignore "Continuer pour postuler"
     const start = Date.now();
     let dismissed = false;
     while (Date.now() - start < timeoutMs) {
-      if (!dismissed || Date.now() - start < 2500) {
+      if (!dismissed || Date.now() - start < 900) {
         dismissed = (await dismissIndeedPopups().catch(() => false)) || dismissed;
       }
       if (detectAlreadyAppliedUi()) return null;
-      const easy = findIndeedEasyApplyButton();
-      if (easy) return easy;
-      await S().sleep(400);
+      if (findContinueToApplyButton() || panelShowsNonEasyApplyOnly()) {
+        // Definitive non-Easy-Apply CTA — don't burn the timeout
+        return null;
+      }
+      const easy = findIndeedEasyApplyButton({ allowLoading: true });
+      if (easy && !isApplyCtaLoading(easy) && isIndeedEasyApplyLabel(applyCtaLabel(easy))) {
+        return easy;
+      }
+      await humanSleep(120, 280);
     }
     return null;
+  }
+
+  async function waitForSerpJobPanel(jobId, title, timeoutMs = 1100) {
+    const start = Date.now();
+    let sawShell = false;
+    let sawLoading = false;
+    const titleNeedle = (title || "").slice(0, 24).toLowerCase();
+    while (Date.now() - start < timeoutMs) {
+      if (detectAlreadyAppliedUi()) return "applied";
+      if (detectCloudflareChallenge() || /v[ée]rification suppl[ée]mentaire|just a moment/i.test(document.title || "")) {
+        return "blocked";
+      }
+      // Company-site / Continuer pour postuler → skip immediately
+      if (findContinueToApplyButton() || panelShowsNonEasyApplyOnly()) return "no_easy_apply";
+
+      const jkSel = jobId ? `[data-indeed-apply-jk="${String(jobId).replace(/"/g, "")}"]` : null;
+      const shell =
+        (jkSel && document.querySelector(jkSel)) ||
+        document.querySelector(
+          "#jobsearch-ViewjobButtons-container, #jobsearch-ViewJobButtons-container, [data-testid='jobsearch-JobInfoHeader-title'], .jobsearch-JobInfoHeader-title"
+        );
+      if (shell) sawShell = true;
+
+      const btn = findIndeedEasyApplyButton({ allowLoading: true });
+      if (btn && !isApplyCtaLoading(btn) && isIndeedEasyApplyLabel(applyCtaLabel(btn))) return "ready";
+      if (btn && isApplyCtaLoading(btn)) {
+        sawLoading = true;
+        await humanSleep(180, 360);
+        continue;
+      }
+
+      // Panel hydrated with no Easy Apply CTA → fast skip (500–1000ms budget)
+      if (sawShell && !sawLoading && Date.now() - start >= 450) {
+        const header =
+          document.querySelector(
+            '[data-testid="jobsearch-JobInfoHeader-title"], .jobsearch-JobInfoHeader-title'
+          )?.textContent || "";
+        if (!titleNeedle || !header || header.toLowerCase().includes(titleNeedle.slice(0, 10))) {
+          return "no_easy_apply";
+        }
+      }
+      await humanSleep(100, 220);
+    }
+    if (findIndeedEasyApplyButton({ allowLoading: true })) return "loading";
+    return "no_easy_apply";
   }
 
   function cardLooksLikeEasyApply(cardEl) {
@@ -1545,6 +1777,12 @@
   }
 
   function isSmartApplyLoading() {
+    const path = String(location.pathname || location.href || "");
+    // Review owns its own wait/retry (preview fail → Réessayer, modal → Vérifier).
+    // Never soft-deadlock the wizard on lingering "préparation de l'aperçu" copy.
+    if (/review/i.test(path)) {
+      return false;
+    }
     // Narrow loaders only — broad "[class*=Spinner]" / aria-busy matched chrome and blocked forever
     const loaders = [
       '[data-testid="loading-indicator"]',
@@ -1571,6 +1809,7 @@
     const t = (document.body?.innerText || "").replace(/\s+/g, " ").toLowerCase();
     if (/chargement en cours|préparation de l['’]aperçu|loading\.\.\.|please wait/i.test(t)) {
       if (findSubmitButton(true)) return false;
+      if (/relisez|passez en revue|coordonn[ée]es|d[ée]poser ma candidature/i.test(t)) return false;
       for (const btn of S().$$("button")) {
         if (!isDisplayed(btn)) continue;
         if (/^continuer$|^continue$|déposer|submit/i.test((btn.textContent || "").trim())) return false;
@@ -1596,31 +1835,46 @@
       /postuler maintenant/i,
       /^apply now$/i,
       /candidater/i,
+      // Live FR review footer sometimes short-labels
+      /^postuler$/i,
+      /^envoyer$/i,
     ];
     const testIds = [
+      '[data-testid="submit-application-button"]',
       '[data-testid="submit-application"]',
       '[data-testid="submit-button"]',
       '[data-testid="indeed-apply-submit"]',
       '[data-testid="ia-submitApplication-footerButton"]',
+      '[data-testid="ia-continueButton"]',
       '[data-testid*="submitApplication"]',
       '[data-testid*="SubmitApplication"]',
       '[data-testid*="submitApplication-footer"]',
-      'button[data-testid*="submit"]',
+      '[data-testid*="footerButton" i]',
+      'footer button[type="submit"]',
       'button[type="submit"]',
       'button.ia-continueButton[type="submit"]',
+      'button.ia-Button--primary[type="submit"]',
     ];
     // IMPORTANT: do NOT use S().isVisible here — it treats disabled as invisible,
     // and Indeed keeps "Déposer" disabled until the captcha UI flips.
     // Also NEVER treat generic primary/continue classes as submit without text match.
     for (const sel of testIds) {
-      for (const el of S().$$(sel)) {
+      let nodes = [];
+      try {
+        nodes = S().$$(sel);
+      } catch (_e) {
+        continue;
+      }
+      for (const el of nodes) {
         if (!isDisplayed(el)) continue;
         if (!includeDisabled && (el.disabled || el.getAttribute("aria-disabled") === "true")) continue;
         const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
-        if (/enregistrer et fermer|signaler|retour|quitter|1 new update/i.test(text)) continue;
+        if (/enregistrer et fermer|signaler|retour|quitter|1 new update|^continuer$|^continue$|^suivant$/i.test(text)) {
+          continue;
+        }
         // Generic type=submit / data-testid*submit can match non-apply chrome — require wording when ambiguous
-        if (/type="submit"|data-testid\*="submit"/.test(sel) || sel.includes('[data-testid*="submit"]')) {
-          if (text && !submitRe.some((p) => p.test(text)) && !/submit|déposer|soumettre|envoyer|apply/i.test(text)) {
+        if (/type="submit"|data-testid\*="submit"|footerButton/i.test(sel) || sel.includes('[data-testid*="submit"]')) {
+          if (text && !submitRe.some((p) => p.test(text)) && !/submit|déposer|soumettre|envoyer|apply|postuler/i.test(text)) {
             continue;
           }
         }
@@ -1628,11 +1882,11 @@
       }
     }
     // Primary/continue class candidates — TEXT must look like submit
-    for (const el of S().$$("button.ia-continueButton, button.ia-Button--primary, button[class*='Primary']")) {
+    for (const el of S().$$("button.ia-continueButton, button.ia-Button--primary, button[class*='Primary'], footer button")) {
       if (!isDisplayed(el)) continue;
       if (!includeDisabled && (el.disabled || el.getAttribute("aria-disabled") === "true")) continue;
       const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
-      if (!text || /enregistrer et fermer|signaler|retour|quitter|continuer|continue|suivant|next/i.test(text)) {
+      if (!text || /enregistrer et fermer|signaler|retour|quitter|^continuer$|^continue$|^suivant$|^next$/i.test(text)) {
         continue;
       }
       if (submitRe.some((p) => p.test(text))) return el;
@@ -1653,7 +1907,278 @@
       }
       if (submitRe.some((p) => p.test(text))) return btn;
     }
+    // Sticky footer below the fold: rect can be 0 until we scroll
+    for (const btn of S().$$("button, a[role='button'], input[type='submit'], [role='button']")) {
+      const text = `${btn.textContent || ""} ${btn.getAttribute("aria-label") || ""} ${btn.value || ""}`
+        .replace(/\s+/g, " ")
+        .trim();
+      if (submitRe.some((p) => p.test(text))) return btn;
+    }
     return null;
+  }
+
+  function hasRecaptchaWidget() {
+    return (
+      !!document.querySelector(
+        'iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey], textarea[name="g-recaptcha-response"]'
+      ) || /je ne suis pas un robot|i'?m not a robot|test de validation/i.test(document.body?.innerText || "")
+    );
+  }
+
+  /**
+   * HAR 2026-08-16 review stuck: CreatePreview.reCaptchaKey=null but invisible
+   * 6Lcr30sp still mounts (clr). That must NOT block Déposer / force-submit.
+   * Only the visible checkbox (6Ldn8Qwp / size=normal / "Je ne suis pas un robot") requires 2captcha.
+   */
+  function hasVisibleRecaptchaChallenge() {
+    const body = document.body?.innerText || "";
+    if (/je ne suis pas un robot|i'?m not a robot/i.test(body)) return true;
+    if (recaptchaExpiredUi()) return true;
+    for (const iframe of document.querySelectorAll('iframe[src*="recaptcha"]')) {
+      const src = iframe.getAttribute("src") || "";
+      if (/[?&]size=invisible\b/i.test(src)) continue;
+      if (/[?&]size=normal\b/i.test(src) || /[?&]type=image\b/i.test(src)) return true;
+      // visible Indeed Smart Apply key
+      if (/k=6Ldn8Qwp/i.test(src)) return true;
+      try {
+        const r = iframe.getBoundingClientRect();
+        // Invisible badges are tiny; checkbox iframe is ~300x70+
+        if (r.width >= 120 && r.height >= 40) return true;
+      } catch (_e) {}
+    }
+    const box = document.querySelector(
+      '#recaptcha-anchor, .recaptcha-checkbox, .g-recaptcha[data-size="normal"], [data-sitekey="6Ldn8QwpAAAAAAYahgoiLgJ0lHSu9PRHngswlkls"]'
+    );
+    if (box) {
+      try {
+        const r = box.getBoundingClientRect();
+        if (r.width > 8 && r.height > 8) return true;
+      } catch (_e) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function acceptReviewDisclaimers() {
+    // click-to-call / email alias / legal opt-ins that keep Déposer aria-disabled
+    let n = 0;
+    for (const box of S().$$('input[type="checkbox"]')) {
+      if (!S().isVisible(box) || box.checked || box.disabled) continue;
+      const lab =
+        `${box.getAttribute("aria-label") || ""} ${
+          (box.id && document.querySelector(`label[for="${CSS.escape(box.id)}"]`)?.textContent) || ""
+        } ${box.closest("label")?.textContent || ""} ${box.closest('[class*="Disclaimer"], [data-testid*="disclaimer" i]')?.textContent || ""}`.toLowerCase();
+      if (
+        !lab ||
+        /click.?to.?call|appel|opt.?in|disclaimer|j['’]accepte|conditions|confidentialit|indeed email|alias|autoris/i.test(
+          lab
+        )
+      ) {
+        try {
+          box.click();
+          n++;
+        } catch (_e) {
+          box.checked = true;
+          box.dispatchEvent(new Event("change", { bubbles: true }));
+          n++;
+        }
+      }
+    }
+    if (n) S().log(PLATFORM, `Review: ${n} case(s) disclaimer/opt-in cochée(s)`, "info");
+    return n;
+  }
+
+  async function dismissSubmitFailModal() {
+    const body = (document.body?.innerText || "").replace(/\s+/g, " ");
+    // Indeed FR: "Nous rencontrons des difficultés pour envoyer votre candidature"
+    if (
+      !/difficultés? pour envoyer|unable to (send|submit)|trouble (sending|submitting)|error sending your application|difficultés? à envoyer/i.test(
+        body
+      )
+    ) {
+      return false;
+    }
+    S().log(PLATFORM, "Indeed: échec envoi candidature (modal) — fermeture + nouveau captcha", "warn");
+    try {
+      if (typeof window.__AmijobsClearRecaptcha === "function") {
+        window.__AmijobsClearRecaptcha("submit_fail_modal");
+      }
+    } catch (_e) {}
+    // Prefer closing the modal over "Enregistrer et quitter" (that abandons the job)
+    const closeLabels = [
+      /^fermer$/i,
+      /^close$/i,
+      /^ok$/i,
+      /^r[ée]essayer$/i,
+      /^retry$/i,
+      /^dismiss$/i,
+    ];
+    for (const el of S().$$("button, a[role='button'], [role='button'], [aria-label]")) {
+      if (!isDisplayed(el)) continue;
+      const t = (el.textContent || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      if (closeLabels.some((re) => re.test(t))) {
+        await S().humanClick(el);
+        await S().sleep(900);
+        return true;
+      }
+    }
+    // Escape / click backdrop
+    try {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    } catch (_e) {}
+    await S().sleep(600);
+    return true;
+  }
+
+  async function handleReviewBlockers() {
+    const body = (document.body?.innerText || "").replace(/\s+/g, " ");
+    // Modal after CreatePreview: employer answers invalid → must go back and fix
+    if (
+      /v[ée]rifiez vos r[ée]ponses|probl[èe]me est survenu concernant.*(questions|r[ée]ponses)|problem.*(employer|question)/i.test(
+        body
+      )
+    ) {
+      for (const el of S().$$("button, a[role='button'], [role='button']")) {
+        if (!isDisplayed(el)) continue;
+        const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!/^v[ée]rifier$/i.test(t)) continue;
+        S().log(PLATFORM, "Review: réponses employeur invalides — clic Vérifier", "warn");
+        await S().humanClick(el);
+        await S().sleep(1500);
+        return "fix_answers";
+      }
+    }
+    // Preview mosaic failure — Déposer is not mounted until preview succeeds
+    if (
+      /difficultés? à charger l['’]aperçu|unable to load.*(preview|application)|failed to load.*(preview|aperçu)/i.test(
+        body
+      )
+    ) {
+      for (const el of S().$$("button, a[role='button'], [role='button']")) {
+        if (!isDisplayed(el)) continue;
+        const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!/^r[ée]essayer$/i.test(t) && !/^retry$/i.test(t)) continue;
+        S().log(PLATFORM, "Aperçu candidature en échec — Réessayer", "warn");
+        await S().humanClick(el);
+        await S().sleep(2500);
+        return "retry_preview";
+      }
+      return "preview_failed";
+    }
+    if (/préparation de l['’]aperçu|preparing (your )?preview|loading preview/i.test(body) && !findSubmitButton(true)) {
+      return "wait_preview";
+    }
+    return null;
+  }
+
+  async function waitForReviewPreviewReady(maxMs = 20000) {
+    const start = Date.now();
+    let retries = 0;
+    while (Date.now() - start < maxMs) {
+      if (findSubmitButton(true)) return "ready";
+      const block = await handleReviewBlockers();
+      if (block === "fix_answers") return "fix_answers";
+      if (block === "retry_preview") {
+        retries += 1;
+        if (retries > 4) return "preview_failed";
+        continue;
+      }
+      if (block === "preview_failed") return "preview_failed";
+      if (block === "wait_preview") {
+        await S().sleep(500);
+        continue;
+      }
+      // Preview content present even if submit not yet enabled
+      if (
+        document.querySelector('[data-testid="contactInfoSection"], [data-testid="fullName"], [data-testid="application"]') ||
+        /relisez votre candidature|passez en revue|coordonn[ée]es/i.test(document.body?.innerText || "")
+      ) {
+        await revealReviewSubmitButton({ quick: true });
+        if (findSubmitButton(true)) return "ready";
+      }
+      await S().sleep(350);
+    }
+    return findSubmitButton(true) ? "ready" : "timeout";
+  }
+
+  async function revealReviewSubmitButton(opts = {}) {
+    const quick = !!opts.quick;
+    // Prefer direct jump to Déposer — full-page scroll loops made review feel stuck
+    let btn = findSubmitButton(true);
+    if (btn) {
+      try {
+        btn.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+      } catch (_e) {
+        try {
+          btn.scrollIntoView({ block: "center", inline: "nearest" });
+        } catch (_e2) {}
+      }
+      return btn;
+    }
+    const scrollAll = () => {
+      try {
+        window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+      } catch (_e) {}
+      const nodes = [
+        document.scrollingElement,
+        document.documentElement,
+        document.body,
+        ...document.querySelectorAll(
+          'main, [class*="Page"], [class*="scroll"], [class*="Content"], [class*="Footer"], [data-testid*="footer" i]'
+        ),
+      ];
+      for (const el of nodes) {
+        if (!el) continue;
+        try {
+          el.scrollTop = el.scrollHeight;
+        } catch (_e2) {}
+      }
+    };
+    scrollAll();
+    if (!quick) await S().sleep(120);
+    try {
+      const foot = document.querySelector(
+        'footer, [class*="Footer"], [data-testid*="footer" i], [class*="ia-Footer"], [class*="ApplicationFooter"]'
+      );
+      foot?.scrollIntoView?.({ block: "end", inline: "nearest", behavior: "instant" });
+    } catch (_e2) {}
+    btn = findSubmitButton(true);
+    if (btn) {
+      try {
+        btn.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+      } catch (_e3) {}
+    }
+    return btn;
+  }
+
+  async function clickReviewSubmit(btn, label = "Clic submit") {
+    if (!btn) return false;
+    try {
+      btn.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+    } catch (_e) {
+      try {
+        btn.scrollIntoView({ block: "center", inline: "nearest" });
+      } catch (_e2) {}
+    }
+    await acceptReviewDisclaimers();
+    // HAR 2026-08-16: CreatePreview.reCaptchaKey=null (+ invisible-only) — force enable
+    if (!hasVisibleRecaptchaChallenge()) {
+      forceEnableClickable(btn);
+    }
+    S().log(PLATFORM, `${label}: ${(btn.textContent || btn.getAttribute("aria-label") || "").trim().slice(0, 48)}`);
+    // Fast click — skip shared humanClick (smooth scroll + 200–500ms)
+    try {
+      btn.focus?.();
+    } catch (_e) {}
+    await S().sleep(80 + Math.floor(Math.random() * 60));
+    try {
+      btn.click();
+    } catch (_e) {}
+    try {
+      btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    } catch (_e2) {}
+    return true;
   }
 
   function isSubmitButtonReady(btn) {
@@ -1663,11 +2188,7 @@
   }
 
   function isRecaptchaWidgetReady() {
-    const hasWidget =
-      !!document.querySelector(
-        'iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey], textarea[name="g-recaptcha-response"]'
-      ) || /je ne suis pas un robot|i'?m not a robot/i.test(document.body?.innerText || "");
-    if (!hasWidget) return true;
+    if (!hasVisibleRecaptchaChallenge()) return true;
     if (typeof window.__AmijobsRecaptchaWidgetReady === "function") {
       try {
         return !!window.__AmijobsRecaptchaWidgetReady();
@@ -1688,27 +2209,50 @@
     return true;
   }
 
-  async function waitForEnabledSubmitButton(maxMs = 25000) {
+  async function waitForEnabledSubmitButton(maxMs = 8000) {
     const start = Date.now();
     let lastLog = 0;
+    let tick = 0;
+    const noCaptcha = !hasVisibleRecaptchaChallenge();
     while (Date.now() - start < maxMs) {
-      const btn = findSubmitButton(true);
-      if (btn && isSubmitButtonReady(btn) && isRecaptchaWidgetReady()) return btn;
+      if (tick % 3 === 0) await acceptReviewDisclaimers();
+      // Only heavy-scroll when button missing; otherwise re-check readiness quickly
+      let btn = findSubmitButton(true);
+      if (!btn || tick % 4 === 0) {
+        btn = (await revealReviewSubmitButton({ quick: true })) || findSubmitButton(true);
+      }
+      if (btn) {
+        if (noCaptcha) {
+          forceEnableClickable(btn);
+          if (isDisplayed(btn)) return btn;
+        } else if (isSubmitButtonReady(btn) && isRecaptchaWidgetReady()) {
+          return btn;
+        }
+      }
       try {
         const tok = window.__AmijobsRecaptchaToken || "";
         if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
           window.__AmijobsInjectRecaptchaToken(tok);
         }
       } catch (_e) {}
-      if (Date.now() - lastLog > 5000) {
+      if (Date.now() - lastLog > 4000) {
         lastLog = Date.now();
-        const btn = findSubmitButton(true);
-        const state = btn
-          ? `${(btn.textContent || "").trim().slice(0, 24)}${btn.disabled ? "[dis]" : ""}`
+        const b = findSubmitButton(true);
+        const state = b
+          ? `${(b.textContent || "").trim().slice(0, 24)}${b.disabled || b.getAttribute("aria-disabled") === "true" ? "[dis]" : ""}`
           : "aucun";
-        S().log(PLATFORM, `Attente Déposer activé… (${state})`, "warn");
+        S().log(PLATFORM, `Attente Déposer activé… (${state}${noCaptcha ? ", no-captcha/invis-only" : ""})`, "warn");
       }
-      await S().sleep(700);
+      tick += 1;
+      await S().sleep(220);
+    }
+    // Last chance: no visible captcha — return disabled button for force-click
+    if (noCaptcha) {
+      const btn = findSubmitButton(true);
+      if (btn) {
+        forceEnableClickable(btn);
+        return btn;
+      }
     }
     return null;
   }
@@ -1766,6 +2310,9 @@
       /^continuer$/i,
       /^next$/i,
       /^suivant$/i,
+      /^examiner ma candidature$/i,
+      /^review my application$/i,
+      /^modifier$/i,
       /review( your)?( application)?/i,
       /vérifier/i,
       /examiner/i,
@@ -1815,6 +2362,9 @@
       /nombre|combien|années?|year|ans\b|de combien/i.test(label || "");
     // Credential yes/no from CV text first (before AI invents Oui)
     if (fieldType === "radio" || /avez-vous|dipl[oô]me|certificat|infirmier|titulaire/i.test(label || "")) {
+      const Q = window.AmiJobsQuestionPref;
+      const prefHit = Q?.findMatchingPreference?.(window.__AmijobsQuestionPreferences || [], label);
+      if (prefHit?.answer) return prefHit.answer;
       const yn = S().answerYesNoFromCv?.(label, profile.cvText || "", profile);
       if (yn) return yn;
     }
@@ -1868,6 +2418,11 @@
   }
 
   function fieldLabelFor(el) {
+    const pref = window.AmiJobsQuestionPref;
+    if (pref?.extractQuestionText) {
+      const extracted = pref.extractQuestionText(el);
+      if (extracted) return extracted;
+    }
     if (!el) return "";
     const byFor =
       (el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`)?.textContent) || "";
@@ -1876,16 +2431,17 @@
     const block = el.closest(
       '[class*="question"], [data-testid*="question"], fieldset, .ia-Questions-item, [class*="Question"]'
     );
-    // Prefer the visible question heading (Indeed screening modules)
     const heading =
-      block?.querySelector?.("h1, h2, h3, legend, [data-testid*='label'], label")?.textContent || "";
-    const named = block?.querySelector?.("label, legend, [id*='label'], span")?.textContent || "";
+      block?.querySelector?.("legend, h1, h2, h3, [data-testid*='questionLabel' i]")?.textContent || "";
+    const named = block?.querySelector?.("legend")?.textContent || "";
     const pageH1 = /questions|présélection|prescreen/i.test(document.title || "")
       ? S().$("h1, h2")?.textContent || ""
       : "";
-    return (heading || byFor || wrap || aria || named || pageH1 || el.getAttribute("name") || "")
+    const raw = (heading || named || aria || byFor || wrap || pageH1 || el.getAttribute("name") || "")
       .replace(/\s+/g, " ")
       .trim();
+    if (pref?.isYnOptionText?.(raw)) return "";
+    return raw.replace(/(\s*(oui|non|yes|no)){1,4}\s*$/gi, "").trim();
   }
 
   function questionHasNumericError(el) {
@@ -1907,10 +2463,14 @@
       const label = fieldLabelFor(el);
       const badVal = String(el.value || "").trim();
       const needsFix =
+        (/^number-input/i.test(el.id || "") && !/^\d+(\.\d+)?$/.test(badVal)) ||
         questionHasNumericError(el) ||
         (S().wantsNumericAnswer?.(label, el) && badVal && !/^\d+(\.\d+)?$/.test(badVal)) ||
         (/\d+\s*ans?/i.test(badVal) &&
-          /exp[eé]rience|année|year|combien|anciennet|antiquit/i.test(label));
+          /exp[eé]rience|année|year|combien|anciennet|antiquit/i.test(label)) ||
+        (/^(oui|non|yes|no)$/i.test(badVal) &&
+          (/^number-input/i.test(el.id || "") ||
+            /combien|expérience|experience|année|nombre/i.test(label)));
       if (!needsFix) continue;
       const num =
         (S().coerceNumericAnswer && S().coerceNumericAnswer(badVal || (await S().getProfile()).experience || "3")) ||
@@ -2022,6 +2582,10 @@
         if (!/sélectionn|select an option|choisir/i.test(current)) continue;
       }
       const label = fieldLabelFor(trigger) || current;
+      // Don't invent BTS/engineering diplomas for "titulaire d'un des diplômes" lists
+      if (/titulaire|dipl[oô]mes?\s+cit|avez-vous.*(bts|dipl[oô]me)/i.test(label)) {
+        continue;
+      }
       await S().humanClick(trigger);
       await S().sleep(350);
       let listbox =
@@ -2051,10 +2615,24 @@
         await S().humanClick(target);
         S().log(PLATFORM, `Liste: "${label.slice(0, 48)}" → ${picked}`, "info");
       } else {
-        // Escape closed empty list
+        // Keyboard fallback — Indeed listboxes often ignore programmatic option clicks
         try {
-          trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-        } catch (_e) {}
+          trigger.focus();
+          trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+          await S().sleep(80);
+          trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+          await S().sleep(120);
+          const after = (trigger.textContent || "").replace(/\s+/g, " ").trim();
+          if (isPlaceholderOptionText(after) || /sélectionn|select an option|choisir/i.test(after)) {
+            trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+          } else {
+            S().log(PLATFORM, `Liste(kbd): "${label.slice(0, 48)}" → ${after.slice(0, 40)}`, "info");
+          }
+        } catch (_e) {
+          try {
+            trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+          } catch (_e2) {}
+        }
       }
       await S().sleep(180);
     }
@@ -2062,22 +2640,30 @@
 
   function hasUnfilledRequiredQuestions() {
     for (const sel of S().$$("select")) {
-      if (selectLooksUnfilled(sel)) {
-        const req =
-          sel.required ||
-          sel.getAttribute("aria-required") === "true" ||
-          /\*/.test(fieldLabelFor(sel)) ||
-          !!sel.closest('[class*="error"], [aria-invalid="true"]') ||
-          /sélectionn/i.test(
-            sel.closest('[class*="question"], fieldset, .ia-Questions-item')?.textContent || ""
-          );
-        if (req || selectLooksUnfilled(sel)) return true;
-      }
+      if (!selectLooksUnfilled(sel)) continue;
+      const req =
+        sel.required ||
+        sel.getAttribute("aria-required") === "true" ||
+        /\*/.test(fieldLabelFor(sel)) ||
+        !!sel.closest('[class*="error"], [aria-invalid="true"]') ||
+        /obligatoire|required/i.test(
+          sel.closest('[class*="question"], fieldset, .ia-Questions-item')?.textContent || ""
+        );
+      // Only required/errored selects block Continuer — optional empty selects must not stall mass-apply
+      if (req) return true;
     }
     for (const trigger of S().$$('button[role="combobox"], [role="combobox"]:not(select)')) {
       if (!S().isVisible(trigger)) continue;
       const t = (trigger.textContent || "").replace(/\s+/g, " ").trim();
-      if (isPlaceholderOptionText(t) || /sélectionn|select an option/i.test(t)) return true;
+      if (!(isPlaceholderOptionText(t) || /sélectionn|select an option|choisir/i.test(t))) continue;
+      const req =
+        trigger.getAttribute("aria-required") === "true" ||
+        /\*/.test(fieldLabelFor(trigger)) ||
+        /obligatoire|required/i.test(
+          trigger.closest('[class*="question"], fieldset, .ia-Questions-item')?.textContent || ""
+        ) ||
+        trigger.closest('[class*="error"], [aria-invalid="true"]');
+      if (req) return true;
     }
     // Visible validation errors (incl. numeric screening)
     const err = [...document.querySelectorAll('[class*="error"], [role="alert"], [aria-invalid="true"]')].some(
@@ -2088,19 +2674,129 @@
         )
     );
     if (err) return true;
-    for (const el of S().$$("input[type='text'], input[type='number'], input:not([type])")) {
+    for (const el of S().$$("input[type='text'], input[type='number'], input:not([type]), textarea")) {
       if (!S().isVisible(el)) continue;
       if (questionHasNumericError(el)) return true;
+      const req =
+        el.required ||
+        el.getAttribute("aria-required") === "true" ||
+        /\*/.test(fieldLabelFor(el)) ||
+        el.getAttribute("aria-invalid") === "true";
+      if (!req) continue;
       const v = String(el.value || "").trim();
+      if (!v) return true;
       if (/\d+\s*ans?/i.test(v) && /exp[eé]rience|année|combien/i.test(fieldLabelFor(el))) return true;
+    }
+    // Unchecked required radio groups
+    const radioNames = new Set();
+    for (const radio of S().$$('input[type="radio"]')) {
+      if (!S().isVisible(radio) || !radio.name || radioNames.has(radio.name)) continue;
+      radioNames.add(radio.name);
+      const group = S().$$(`input[type="radio"][name="${CSS.escape(radio.name)}"]`).filter((r) =>
+        S().isVisible(r)
+      );
+      if (!group.length || group.some((r) => r.checked)) continue;
+      const req = group.some(
+        (r) =>
+          r.required ||
+          r.getAttribute("aria-required") === "true" ||
+          /\*/.test(fieldLabelFor(r)) ||
+          /obligatoire|required/i.test(
+            r.closest('[class*="question"], fieldset, .ia-Questions-item')?.textContent || ""
+          )
+      );
+      if (req) return true;
     }
     return false;
   }
 
   async function fillQuestionsStep() {
     const profile = await S().getProfile();
+    const Q = window.AmiJobsQuestionPref;
+    window.__AmijobsFilling = true;
+    try {
+    const isDemographic =
+      /demographic/i.test(smartApplyPath()) ||
+      /auto-identification|identification volontaire|demographic|equal employment|eeo/i.test(
+        document.body?.innerText || ""
+      );
 
-    // Radios: CV-aware Oui/Non — never invent diplômes (e.g. infirmier)
+    // Demographic / EEO: prefer "ne pas répondre" before inventing answers
+    if (isDemographic) {
+      for (const el of S().$$("input[type='radio'], input[type='checkbox'], label, [role='option'], button")) {
+        if (!S().isVisible(el)) continue;
+        const t = `${el.textContent || ""} ${el.value || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase();
+        if (
+          /pr[eé]f[eè]re?r? (de )?ne pas|ne (souhaite|d[eé]sire) pas|prefer not|decline|i do not wish|choose not to/i.test(
+            t
+          )
+        ) {
+          if (/approuver|accept|confidentialit|privacy|avis de/i.test(t) && !/ne pas/i.test(t)) continue;
+          try {
+            await S().humanClick(el);
+          } catch (_e) {
+            try {
+              el.click();
+            } catch (_e2) {}
+          }
+          await S().sleep(80);
+        }
+      }
+      // Click short "Approuver" / agree labels
+      for (const el of S().$$("label, [role='option'], button, span")) {
+        if (!S().isVisible(el)) continue;
+        const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!/^(approuver|j['’]accepte|i agree|accept)$/i.test(t)) continue;
+        try {
+          await S().humanClick(el);
+        } catch (_e) {
+          try {
+            el.click();
+          } catch (_e2) {}
+        }
+        await S().sleep(80);
+      }
+      // Privacy / attestation checkboxes unlock "Examiner ma candidature"
+      for (const box of S().$$('input[type="checkbox"]')) {
+        if (!S().isVisible(box) || box.disabled) continue;
+        const lab =
+          `${fieldLabelFor(box)} ${box.closest("label")?.textContent || ""} ${
+            box.closest('[class*="question"], fieldset')?.textContent || ""
+          }`.toLowerCase();
+        const needs =
+          box.getAttribute("aria-invalid") === "true" ||
+          /accept|confidentialit|privacy|j['’]ai lu|d[eé]clare|attest|consent|avis de|approuver|obligatoire/i.test(
+            lab
+          );
+        if (!needs) continue;
+        try {
+          const labEl =
+            (box.id && document.querySelector(`label[for="${CSS.escape(box.id)}"]`)) ||
+            box.closest("label") ||
+            box;
+          await S().humanClick(labEl);
+        } catch (_e) {
+          try {
+            box.click();
+          } catch (_e2) {}
+        }
+        if (!box.checked) {
+          try {
+            const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
+            if (desc?.set) desc.set.call(box, true);
+            else box.checked = true;
+          } catch (_e) {
+            box.checked = true;
+          }
+          box.dispatchEvent(new Event("click", { bubbles: true }));
+          box.dispatchEvent(new Event("input", { bubbles: true }));
+          box.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      await S().sleep(80);
+    }
+  }
+
+    // Radios: preferences first, then CV-aware Oui/Non — never invent diplômes
     const radioNames = new Set();
     const cvText = profile.cvText || "";
     for (const radio of S().$$('input[type="radio"]')) {
@@ -2115,7 +2811,9 @@
         radio.closest('[class*="question"], [data-testid*="question"], fieldset, .ia-Questions-item')
           ?.innerText ||
         "";
+      const prefHit = Q?.findMatchingPreference?.(window.__AmijobsQuestionPreferences || [], qText);
       const yn =
+        (prefHit?.answer && String(prefHit.answer)) ||
         (S().answerYesNoFromCv && S().answerYesNoFromCv(qText, cvText, profile)) ||
         (await answerFromCvOrAi(qText, "radio", radio));
       const wantOui = /^(oui|yes|true|1)$/i.test(String(yn || "").trim());
@@ -2130,6 +2828,7 @@
       } else if (wantOui) {
         preferred = group.find((r) => /oui|yes|true|1/i.test(labelOf(r)));
       }
+
       // Soft questions (disponibilité) → Oui; credential unknown → Non
       if (!preferred) {
         const isCred = /dipl[oô]me|certificat|infirmier|permis|habilitation|titulaire|avez-vous/i.test(qText);
@@ -2137,13 +2836,16 @@
           ? group.find((r) => /non|no/i.test(labelOf(r))) || group[group.length - 1]
           : group.find((r) => /oui|yes|disponible/i.test(labelOf(r))) || group[0];
       }
-      S().log(
-        PLATFORM,
-        `Radio: "${String(qText).slice(0, 50)}" → ${wantNon ? "Non" : wantOui ? "Oui" : preferred?.value || "?"}`,
-        "info"
-      );
+      const chosen =
+        wantNon ? "Non" : wantOui ? "Oui" : (preferred?.value || labelOf(preferred) || "?").trim();
+      S().log(PLATFORM, `Radio: "${String(qText).slice(0, 70)}" → ${chosen}`, "info");
+      if (qText && S().rememberAutoAnswer) S().rememberAutoAnswer(qText, chosen);
       try {
-        preferred.click();
+        const lab =
+          (preferred.id && document.querySelector(`label[for="${CSS.escape(preferred.id)}"]`)) ||
+          preferred.closest("label");
+        if (lab) await S().humanClick(lab);
+        else preferred.click();
       } catch (_e) {
         preferred.checked = true;
         preferred.dispatchEvent(new Event("change", { bubbles: true }));
@@ -2216,6 +2918,7 @@
       const hint = `${label} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`.toLowerCase();
       const numericQ =
         el.type === "number" ||
+        /^number-input/i.test(el.id || "") ||
         S().wantsNumericAnswer?.(labelRaw, el) ||
         questionHasNumericError(el) ||
         /de combien|combien d['’]?ann|années?\s*d['’]?exp|years?\s*(of\s*)?exp/i.test(label);
@@ -2257,9 +2960,49 @@
         const ai = await answerFromCvOrAi(labelRaw || "question candidature", "text", el);
         await S().humanType(el, ai && !/^(we)\.?$/i.test(ai) ? ai : "Oui");
       }
+      // React-controlled fields sometimes ignore humanType — native setter + blur
+      try {
+        const v = String(el.value || "").trim();
+        if (!v) {
+          const fallback = numericQ ? "3" : "Oui";
+          const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const desc = Object.getOwnPropertyDescriptor(proto, "value");
+          if (desc?.set) desc.set.call(el, fallback);
+          else el.value = fallback;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.dispatchEvent(new Event("blur", { bubbles: true }));
+        }
+      } catch (_e) {}
       await S().sleep(120);
     }
     await fixNumericQuestionErrors();
+
+    // contenteditable / Indeed custom text boxes
+    for (const el of S().$$('[contenteditable="true"], [role="textbox"]')) {
+      if (!S().isVisible(el)) continue;
+      const cur = String(el.textContent || el.innerText || "").trim();
+      if (cur && cur.length > 1) continue;
+      const label = fieldLabelFor(el) || el.getAttribute("aria-label") || "";
+      let answer = "Oui";
+      if (/exp[eé]rience|année|ans|combien|nombre|year/i.test(label)) answer = "3";
+      else if (/salaire|salary/i.test(label)) answer = "45000";
+      else {
+        const ai = await answerFromCvOrAi(label || "question candidature", "text", el);
+        if (ai && !/^(we)\.?$/i.test(ai)) answer = ai;
+      }
+      try {
+        el.focus();
+        el.textContent = answer;
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, data: answer }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } catch (_e) {}
+      await S().sleep(80);
+    }
+    } finally {
+      await S().sleep(350);
+      window.__AmijobsFilling = false;
+    }
   }
 
   function recaptchaExpiredUi() {
@@ -2274,6 +3017,11 @@
 
   function hasFreshRecaptchaToken() {
     if (recaptchaExpiredUi()) return false;
+    // Indeed rejected last inject — do not reuse that token
+    if (window.__AmijobsCaptchaRejected && Date.now() - window.__AmijobsCaptchaRejected < 120000) {
+      const tok = String(window.__AmijobsRecaptchaToken || "");
+      if (tok && tok === window.__AmijobsRejectedToken) return false;
+    }
     if (typeof window.__AmijobsHasFreshRecaptchaToken === "function") {
       try {
         return !!window.__AmijobsHasFreshRecaptchaToken();
@@ -2284,65 +3032,111 @@
         document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
         ""
     );
-    return token.length > 40;
+    // CapSolver junk (~522 HF…) must not pass as "fresh"
+    if (token.length < 200) return false;
+    if (/^HF[A-Za-z0-9_-]+$/.test(token) && token.length < 1000) return false;
+    return /^(03A|0cA|03a)/i.test(token) || token.length >= 1000;
+  }
+
+  function readNativeRecaptchaToken() {
+    try {
+      const t = String(
+        document.querySelector('textarea[name="g-recaptcha-response"]')?.value ||
+          document.querySelector("#g-recaptcha-response")?.value ||
+          ""
+      );
+      if (t.length >= 200 && !(/^HF[A-Za-z0-9_-]+$/.test(t) && t.length < 1000)) return t;
+    } catch (_e) {}
+    return "";
   }
 
   async function waitAndSolveRecaptcha(maxMs = 240000) {
     const start = Date.now();
     const hasWidget = () =>
       !!document.querySelector(
-        'iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey], textarea[name="g-recaptcha-response"]'
+        'iframe[src*="recaptcha"][src*="size=normal"], iframe[src*="recaptcha"][src*="type=image"], .g-recaptcha[data-size="normal"], #recaptcha-anchor'
       ) || /je ne suis pas un robot|i'?m not a robot|test de validation/i.test(document.body?.innerText || "");
 
-    if (!hasWidget()) return true;
+    if (!hasWidget() && !hasVisibleRecaptchaChallenge()) return true;
 
-    // Stale / expired token from an earlier wizard step → discard and re-solve
-    if (recaptchaExpiredUi() || !hasFreshRecaptchaToken()) {
+    // Drop solver-injected / rejected junk — only native Google tokens are safe on Indeed
+    if (recaptchaExpiredUi() || window.__AmijobsCaptchaRejected) {
       try {
         if (typeof window.__AmijobsClearRecaptcha === "function") {
-          window.__AmijobsClearRecaptcha(recaptchaExpiredUi() ? "expired_ui" : "stale");
+          window.__AmijobsClearRecaptcha(window.__AmijobsCaptchaRejected ? "indeed_rejected" : "expired_ui");
         }
       } catch (_e) {}
-    } else {
-      // Fresh token already present — re-patch MAIN world and submit ASAP
-      try {
-        const tok = window.__AmijobsRecaptchaToken || "";
-        if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
-          window.__AmijobsInjectRecaptchaToken(tok);
-        }
-      } catch (_e) {}
-      if (!window.__AmijobsRecaptchaFreshLogged) {
-        window.__AmijobsRecaptchaFreshLogged = true;
-        S().log(PLATFORM, "reCAPTCHA token frais — dépôt candidature", "success");
-      }
-      return true;
+      window.__AmijobsCaptchaRejected = 0;
+      window.__AmijobsRejectedToken = "";
     }
 
-    S().log(PLATFORM, "reCAPTCHA détecté — résolution 2captcha (frais)…", "warn");
-    let loggedOk = false;
+    // Already have a native-looking token
+    {
+      const native = readNativeRecaptchaToken();
+      if (native) {
+        try {
+          if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
+            window.__AmijobsInjectRecaptchaToken(native);
+          }
+        } catch (_e) {}
+        if (!window.__AmijobsRecaptchaFreshLogged) {
+          window.__AmijobsRecaptchaFreshLogged = true;
+          S().log(PLATFORM, "reCAPTCHA OK (navigateur) — dépôt candidature", "success");
+        }
+        return true;
+      }
+    }
+
+    // Manual only: same IP + fingerprint as the user's Indeed session (no CapSolver/2captcha)
+    S().log(
+      PLATFORM,
+      "reCAPTCHA Indeed — mode manuel (même IP que votre navigateur). Cochez « Je ne suis pas un robot »",
+      "warn"
+    );
+    try {
+      chrome.runtime.sendMessage({ action: "openPopup" }).catch(() => {});
+    } catch (_e) {}
+    try {
+      const frame = document.querySelector(
+        'iframe[src*="recaptcha"][src*="size=normal"], iframe[title*="reCAPTCHA" i], .g-recaptcha'
+      );
+      frame?.scrollIntoView?.({ block: "center", inline: "nearest", behavior: "instant" });
+    } catch (_e) {}
+
     let tick = 0;
+    let reminded = false;
     while (Date.now() - start < maxMs) {
       if (shouldStop) return false;
+
       if (recaptchaExpiredUi()) {
         try {
           if (typeof window.__AmijobsClearRecaptcha === "function") window.__AmijobsClearRecaptcha("expired_loop");
         } catch (_e) {}
-        S().log(PLATFORM, "reCAPTCHA expiré — nouveau solve 2captcha…", "warn");
+        if (!reminded) {
+          S().log(PLATFORM, "reCAPTCHA expiré — cochez à nouveau la case", "warn");
+          reminded = true;
+        }
       }
-      if (hasFreshRecaptchaToken()) {
+
+      const native = readNativeRecaptchaToken();
+      if (native) {
         try {
-          const tok = window.__AmijobsRecaptchaToken || "";
-          if (tok && typeof window.__AmijobsInjectRecaptchaToken === "function") {
-            window.__AmijobsInjectRecaptchaToken(tok);
+          if (typeof window.__AmijobsInjectRecaptchaToken === "function") {
+            window.__AmijobsInjectRecaptchaToken(native);
           }
         } catch (_e) {}
-        if (!loggedOk) {
-          S().log(PLATFORM, "reCAPTCHA token présent — dépôt candidature", "success");
-          loggedOk = true;
-        }
+        S().log(PLATFORM, "reCAPTCHA coché — reprise du dépôt", "success");
+        await S().sleep(250);
         return true;
       }
-      // Keep wizard busy + lock fresh during long 2captcha polls (often 2–5 min)
+
+      // Also accept helper state if user solved and inject already ran
+      if (hasFreshRecaptchaToken() && !window.__AmijobsCaptchaRejected) {
+        S().log(PLATFORM, "reCAPTCHA token navigateur — dépôt candidature", "success");
+        await S().sleep(250);
+        return true;
+      }
+
       if (tick % 4 === 0) {
         try {
           await chrome.storage.local.set({
@@ -2359,20 +3153,14 @@
           });
         } catch (_e) {}
       }
+      if (tick > 0 && tick % 20 === 0) {
+        S().log(PLATFORM, "En attente du clic reCAPTCHA…", "warn");
+      }
       tick += 1;
-      try {
-        // Never click the checkbox after/during inject — it resets Indeed's widget to "expiré"
-        if (typeof window.__AmijobsSolveRecaptcha === "function") {
-          const ok = await window.__AmijobsSolveRecaptcha(true);
-          if (!ok) S().log(PLATFORM, "2captcha en cours / échec partiel…", "warn");
-        } else {
-          await chrome.runtime.sendMessage({ action: "solveRecaptchaNow" }).catch(() => {});
-        }
-      } catch (_e) {}
-      await S().sleep(2500);
+      await S().sleep(1000);
     }
-    S().log(PLATFORM, "reCAPTCHA non résolu à temps", "warn");
-    return hasFreshRecaptchaToken();
+    S().log(PLATFORM, "reCAPTCHA non coché à temps", "warn");
+    return !!readNativeRecaptchaToken();
   }
 
   async function runApplyWizard(jobInfo, settings) {
@@ -2415,6 +3203,7 @@
     const MAX_REVIEW_CAPTCHA = 4;
     try {
     for (let step = 0; step < 80; step++) {
+      try {
       if (shouldStop) return { success: false, reason: "stopped" };
       if (/hrtechprivacy\.com|privacy opt out|requests\.hrtechprivacy/i.test(location.href)) {
         S().log(PLATFORM, "Redirection privacy Indeed — retour Smart Apply", "warn");
@@ -2459,14 +3248,28 @@
             "warn"
           );
         }
-        if (window.__AmijobsShellWait > 45) {
+        // applybyapplyablejobid often hangs as empty chrome — soft reload once, then skip
+        const onApplyableShell = /applybyapplyablejobid/i.test(path);
+        const shellLimit = onApplyableShell ? 18 : 45;
+        if (onApplyableShell && window.__AmijobsShellWait === 8 && !window.__AmijobsApplyableReloaded) {
+          window.__AmijobsApplyableReloaded = true;
+          S().log(PLATFORM, "applybyapplyablejobid vide — soft reload", "warn");
+          try {
+            location.reload();
+          } catch (_e) {}
+          await S().sleep(2500);
+          continue;
+        }
+        if (window.__AmijobsShellWait > shellLimit) {
           S().log(PLATFORM, "Smart Apply shell vide trop longtemps — abandon offre", "error");
+          window.__AmijobsApplyableReloaded = false;
           return { success: false, reason: "wizard_shell_timeout" };
         }
-        await S().sleep(1400);
+        await S().sleep(onApplyableShell ? 1100 : 1400);
         continue;
       }
       window.__AmijobsShellWait = 0;
+      window.__AmijobsApplyableReloaded = false;
       const loader = S().$('[data-testid="loading-indicator"], [class*="LoadingSpinner"], [aria-busy="true"]');
       if (loader && S().isVisible(loader)) {
         await S().sleep(1800);
@@ -2539,9 +3342,9 @@
       if (/relevant-experience/i.test(path)) {
         await fillRelevantExperienceStep();
       }
-      if (/questions/i.test(path)) {
+      if (/questions|demographic/i.test(path)) {
         await fillQuestionsStep();
-        if (hasUnfilledRequiredQuestions()) {
+        if (hasUnfilledRequiredQuestions() && !/demographic/i.test(path)) {
           incompleteQuestionsTries += 1;
           S().log(PLATFORM, "Questions incomplètes — correction (nombre/select)", "warn");
           await fixNumericQuestionErrors();
@@ -2561,40 +3364,162 @@
             continue;
           }
         } else {
-          incompleteQuestionsTries = 0;
+          // Required fields look filled — still count Continuer-disabled stalls
+          incompleteQuestionsTries = Math.max(0, incompleteQuestionsTries);
         }
+        // Always attempt Continuer after a fill pass — even if some optional fields look empty
         const qContinue = findVisibleContinueOrSubmit();
-        if (qContinue?.kind === "next" && !qContinue.el.disabled) {
-          await S().humanClick(qContinue.el);
-          await S().sleep(
-            S().randomDelay(settings.delayBetweenSteps?.min || 500, settings.delayBetweenSteps?.max || 1400)
-          );
-          continue;
+        if (qContinue?.kind === "next" || (qContinue?.el && /questions|demographic/i.test(path))) {
+          const btn = qContinue.el;
+          if (btn.disabled || btn.getAttribute("aria-disabled") === "true") {
+            incompleteQuestionsTries += 1;
+            if (!hasUnfilledRequiredQuestions() || incompleteQuestionsTries >= 2) {
+              forceEnableClickable(btn);
+            }
+          }
+          if (!btn.disabled && btn.getAttribute("aria-disabled") !== "true") {
+            const beforeQ = smartApplyPath();
+            await S().humanClick(btn);
+            try {
+              btn.click();
+            } catch (_e) {}
+            await S().sleep(
+              S().randomDelay(settings.delayBetweenSteps?.min || 500, settings.delayBetweenSteps?.max || 1400)
+            );
+            // Continuer clicked but same questions URL — try Enter / requestSubmit
+            if (/questions/i.test(smartApplyPath()) && smartApplyPath() === beforeQ) {
+              try {
+                btn.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+                const form = btn.closest("form") || document.querySelector("form");
+                if (form?.requestSubmit) form.requestSubmit();
+              } catch (_e) {}
+              await S().sleep(900);
+            }
+            continue;
+          }
+        } else if (/questions/i.test(path)) {
+          incompleteQuestionsTries += 1;
+        }
+        // Soft advance after enough fill attempts even if Continuer stays disabled
+        if (incompleteQuestionsTries >= 3) {
+          const anyNext =
+            findVisibleContinueOrSubmit()?.el ||
+            [...S().$$("button")].find((b) =>
+              /^continuer$|^continue$|^suivant$|^next$/i.test((b.textContent || "").trim())
+            );
+          if (anyNext) {
+            forceEnableClickable(anyNext);
+            await S().humanClick(anyNext);
+            try {
+              anyNext.click();
+              anyNext.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+              const form = anyNext.closest("form") || document.querySelector("form");
+              if (form?.requestSubmit) form.requestSubmit();
+            } catch (_e) {}
+            await S().sleep(1200);
+            incompleteQuestionsTries += 1;
+            if (incompleteQuestionsTries >= 8) {
+              return { success: false, reason: "questions_stuck" };
+            }
+            continue;
+          }
         }
       } else {
         await S().fillVisibleFields(jobInfo, PLATFORM);
         await fixNumericQuestionErrors();
       }
 
-      // Review / captcha step: solve FRESH then force-submit (button often stays aria-disabled)
+      // Review / captcha step: solve FRESH then submit (HAR: reCaptchaKey often null on FR)
       const onReviewLike =
         /review/i.test(path) ||
-        (!!document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, textarea[name="g-recaptcha-response"]') &&
-          !!findSubmitButton(true));
+        (!!hasRecaptchaWidget() && !!findSubmitButton(true)) ||
+        /relisez votre candidature|passez en revue le contenu/i.test(document.body?.innerText || "");
       if (onReviewLike) {
         window.__AmijobsReviewMisses = window.__AmijobsReviewMisses || 0;
         if (reviewCaptchaAttempts >= MAX_REVIEW_CAPTCHA) {
           S().log(PLATFORM, "reCAPTCHA review bloqué — abandon offre", "error");
           return { success: false, reason: "captcha_stuck" };
         }
+
+        const previewState = await waitForReviewPreviewReady(18000);
+        if (previewState === "fix_answers") {
+          incompleteQuestionsTries += 1;
+          if (incompleteQuestionsTries >= 8) {
+            return { success: false, reason: "questions_stuck" };
+          }
+          continue;
+        }
+        if (previewState === "preview_failed" || previewState === "timeout") {
+          window.__AmijobsReviewMisses += 1;
+          await acceptReviewDisclaimers();
+          await revealReviewSubmitButton();
+          // Button may mount late after CreatePreview even when wait timed out
+          const lateBtn = findSubmitButton(true);
+          if (lateBtn) {
+            S().log(PLATFORM, "Déposer apparu après timeout aperçu — poursuite", "warn");
+          } else {
+            S().log(
+              PLATFORM,
+              `Aperçu review non prêt (${previewState}, miss=${window.__AmijobsReviewMisses})`,
+              "warn"
+            );
+            if (window.__AmijobsReviewMisses >= 6) {
+              return { success: false, reason: "preview_failed" };
+            }
+            await S().sleep(1500);
+            continue;
+          }
+        }
+
+        // No VISIBLE captcha (CreatePreview.reCaptchaKey=null / invisible-only) — force Déposer
+        if (!hasVisibleRecaptchaChallenge()) {
+          await acceptReviewDisclaimers();
+          let submitBtn = (await waitForEnabledSubmitButton(5000)) || (await revealReviewSubmitButton({ quick: true }));
+          if (submitBtn && settings.autoSubmit !== false) {
+            S().log(PLATFORM, "Review sans captcha visible (invis-only OK) — force Déposer", "warn");
+            await clickReviewSubmit(submitBtn, "Clic submit (no-captcha)");
+            await S().sleep(1200);
+            for (let i = 0; i < 14; i++) {
+              if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
+              await S().sleep(700);
+            }
+            if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
+            window.__AmijobsReviewMisses += 1;
+            if (window.__AmijobsReviewMisses >= 6) {
+              S().log(PLATFORM, "Review no-captcha sans confirmation — abandon offre", "error");
+              return { success: false, reason: "submit_no_confirm" };
+            }
+            continue;
+          }
+          window.__AmijobsReviewMisses += 1;
+          S().log(
+            PLATFORM,
+            `Bouton Déposer introuvable (path=${smartApplyPath()}, miss=${window.__AmijobsReviewMisses}) — boutons: ${[
+              ...S().$$("button"),
+            ]
+              .filter((b) => isDisplayed(b))
+              .map((b) => {
+                const t = (b.textContent || "").trim().slice(0, 28);
+                return `${t}${b.disabled || b.getAttribute("aria-disabled") === "true" ? "[dis]" : ""}`;
+              })
+              .slice(0, 10)
+              .join(" | ")}`,
+            "warn"
+          );
+          if (window.__AmijobsReviewMisses >= 8) {
+            return { success: false, reason: "submit_button_missing" };
+          }
+          await S().sleep(1200);
+          continue;
+        }
         for (let captchaTry = 0; captchaTry < 3; captchaTry++) {
           const ok = await waitAndSolveRecaptcha(150000);
           if (!ok) break;
           reviewCaptchaAttempts += 1;
-          // Wait for Indeed to enable Déposer — do not force-click a disabled button
-          let submitBtn = (await waitForEnabledSubmitButton(22000)) || findSubmitButton(true);
+          // Wait briefly for Indeed to enable Déposer — click ASAP once ready
+          let submitBtn = (await waitForEnabledSubmitButton(6000)) || findSubmitButton(true);
           if (!submitBtn || !isSubmitButtonReady(submitBtn) || !isRecaptchaWidgetReady()) {
-            submitBtn = await waitForEnabledSubmitButton(12000);
+            submitBtn = await waitForEnabledSubmitButton(3500);
           }
           if (!submitBtn || settings.autoSubmit === false) {
             if (!submitBtn) {
@@ -2635,17 +3560,14 @@
             } catch (_e2) {}
             continue;
           }
-          S().log(PLATFORM, `Clic submit: ${(submitBtn.textContent || "").trim().slice(0, 40)}`);
-          try {
-            submitBtn.scrollIntoView({ block: "center", inline: "nearest" });
-          } catch (_e) {}
-          await S().humanClick(submitBtn);
-          try {
-            submitBtn.click();
-          } catch (_e) {}
-          await S().sleep(2000);
+          await clickReviewSubmit(submitBtn);
+          await S().sleep(1100);
           for (let i = 0; i < 12; i++) {
             if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
+            if (await dismissSubmitFailModal()) {
+              S().log(PLATFORM, "Submit rejeté par Indeed — nouveau token captcha", "warn");
+              break;
+            }
             if (recaptchaExpiredUi()) {
               S().log(PLATFORM, "reCAPTCHA expiré après submit — nouveau token", "warn");
               try {
@@ -2678,14 +3600,11 @@
       if (!action) {
         if (onReviewLike) {
           await waitAndSolveRecaptcha(150000);
-          const sb = (await waitForEnabledSubmitButton(12000)) || findSubmitButton(true);
-          if (sb && isSubmitButtonReady(sb) && hasFreshRecaptchaToken() && isRecaptchaWidgetReady() && settings.autoSubmit !== false) {
+          const sb = (await waitForEnabledSubmitButton(5000)) || findSubmitButton(true);
+          if (sb && isDisplayed(sb) && settings.autoSubmit !== false && (!hasVisibleRecaptchaChallenge() || (hasFreshRecaptchaToken() && isRecaptchaWidgetReady()))) {
             S().log(PLATFORM, `Clic submit (retry): ${(sb.textContent || "").trim().slice(0, 40)}`);
-            await S().humanClick(sb);
-            try {
-              sb.click();
-            } catch (_e) {}
-            await S().sleep(2000);
+            await clickReviewSubmit(sb, "Clic submit (retry)");
+            await S().sleep(1100);
             if (detectApplySuccess() || /post-apply/i.test(smartApplyPath())) return { success: true };
           }
           window.__AmijobsReviewMisses = (window.__AmijobsReviewMisses || 0) + 1;
@@ -2727,19 +3646,19 @@
           }
         } catch (_e) {}
         if (settings.autoSubmit !== false) {
-          if (!isSubmitButtonReady(action.el) || !isRecaptchaWidgetReady()) {
+          if (hasVisibleRecaptchaChallenge() && (!isSubmitButtonReady(action.el) || !isRecaptchaWidgetReady())) {
             await S().sleep(1200);
             continue;
           }
-          S().log(PLATFORM, `Clic submit: ${(action.el.textContent || "").trim().slice(0, 40)}`);
-          await S().humanClick(action.el);
-          try {
-            action.el.click();
-          } catch (_e) {}
-          await S().sleep(2800);
+          await clickReviewSubmit(action.el, "Clic submit");
+          await S().sleep(1200);
           for (let i = 0; i < 16; i++) {
             if (detectApplySuccess()) return { success: true };
             if (/post-apply/i.test(smartApplyPath())) return { success: true };
+            if (await dismissSubmitFailModal()) {
+              S().log(PLATFORM, "Submit rejeté — clear captcha et nouvel essai", "warn");
+              break;
+            }
             // Captcha expired / cleared after failed submit — force fresh 2captcha
             if (
               document.querySelector('iframe[src*="recaptcha"]') &&
@@ -2812,6 +3731,10 @@
       await S().sleep(
         S().randomDelay(settings.delayBetweenSteps?.min || 500, settings.delayBetweenSteps?.max || 1400)
       );
+      } catch (stepErr) {
+        S().log(PLATFORM, `Wizard: ${String(stepErr?.message || stepErr)}`, "warn");
+        await S().sleep(800);
+      }
     }
     return { success: false, reason: "wizard_timeout" };
     } finally {
@@ -3288,6 +4211,14 @@
           await endSession("Aucune offre trouvée");
           return;
         }
+        if (!hasIndeedNextSerpPage()) {
+          await endSession(
+            (session.applied || 0) > 0
+              ? "Plus d'offres Easy Apply pour ce mot-clé"
+              : "Aucune offre Easy Apply pour ce mot-clé"
+          );
+          return;
+        }
         const nextPage = (session.currentPage || 0) + 1;
         S().log(PLATFORM, `Page suivante Indeed (${nextPage + 1}) — SERP vide après retries`, "warn");
         await setSession({ currentPage: nextPage, queue: [], qIndex: 0, pageApplied: 0 });
@@ -3295,16 +4226,65 @@
         return;
       }
 
-      queue = cards
-        .filter((c) => isValidIndeedJobKey(c.jobId) && c.title && c.title.length >= 3)
-        .map((c) => ({
-          jobId: c.jobId,
-          title: c.title,
-          company: c.company,
-        }));
+      queue = [];
+      for (const c of cards) {
+        if (!isValidIndeedJobKey(c.jobId) || !c.title || c.title.length < 3) continue;
+        if (cardAlreadyApplied(c.element)) continue;
+        if (await alreadyHandled(c.jobId)) continue;
+        if (await alreadyApplied(appliedJobs, c.jobId)) continue;
+        queue.push({ jobId: c.jobId, title: c.title, company: c.company });
+      }
       qIndex = 0;
       await setSession({ queue, qIndex: 0, noApplyPages: 0, emptyCardRetries: 0 });
       S().log(PLATFORM, `${queue.length} offres trouvées`);
+      if (!queue.length) {
+        // Cards on page but all already handled / no Easy Apply left
+        if (!hasIndeedNextSerpPage()) {
+          await endSession(
+            (session.applied || 0) > 0
+              ? "Plus d'offres Easy Apply pour ce mot-clé"
+              : "Aucune offre Easy Apply pour ce mot-clé"
+          );
+          return;
+        }
+      }
+    }
+
+    // After hard reload / SPA remount: stored queue IDs often miss the live DOM.
+    // Wait for cards and rebuild instead of draining "Carte absente" in 50ms.
+    if (queue.length && qIndex < queue.length) {
+      const probe = collectJobCards();
+      const liveIds = new Set(probe.map((c) => c.jobId).filter(Boolean));
+      const remaining = queue.slice(qIndex);
+      const hits = remaining.filter((q) => liveIds.has(q.jobId)).length;
+      if (probe.length < 3 || hits < Math.min(2, remaining.length)) {
+        S().log(
+          PLATFORM,
+          `File SERP stale (${hits}/${remaining.length} live) — recollect…`,
+          "warn"
+        );
+        const cards = await waitForJobCards(22000, { minCards: 8 });
+        const seen = (await getSession())?.seenJobIds || {};
+        const source = cards.length ? cards : probe;
+        const rebuilt = [];
+        for (const c of source) {
+          if (!isValidIndeedJobKey(c.jobId) || seen[c.jobId]) continue;
+          if (cardAlreadyApplied(c.element)) continue;
+          if (await alreadyHandled(c.jobId)) continue;
+          rebuilt.push({
+            jobId: c.jobId,
+            title: c.title,
+            company: c.company,
+            easyApply: c.easyApply !== false,
+          });
+        }
+        if (rebuilt.length) {
+          queue = rebuilt;
+          qIndex = 0;
+          await setSession({ queue, qIndex: 0, noApplyPages: 0 });
+          S().log(PLATFORM, `${queue.length} offres trouvées (recollect)`);
+        }
+      }
     }
 
     // Drop any stale placeholder keys left in a previous queue
@@ -3415,19 +4395,63 @@
           link.removeAttribute?.("target");
           link.setAttribute?.("target", "_self");
         } catch (_e) {}
+        // Pace SERP opens — rapid successive opens trip Indeed "Vérification supplémentaire"
+        try {
+          const coolUntil = (await getSession())?.massApplyCooldownUntil || 0;
+          const waitMs = coolUntil - Date.now();
+          if (waitMs > 0) await S().sleep(Math.min(waitMs, 8000));
+        } catch (_e) {}
         S().log(PLATFORM, `Ouverture offre SERP: ${item.title || item.jobId}`);
+        window.__AmijobsMissingCardStreak = 0;
         await setSession({
           phase: "viewjob",
           currentJk: item.jobId,
           currentTitle: item.title,
           currentCompany: item.company,
           qIndex: qIndex + 1,
+          massApplyCooldownUntil: Date.now() + S().randomDelay(500, 1100),
         });
+        // Prefer title link, then whole card — SPA panel open is flaky on FR
         await S().humanClick(link);
-        await S().sleep(S().randomDelay(1600, 2600));
+        let panelState = await waitForSerpJobPanel(item.jobId, item.title, S().randomDelay(700, 1100));
+        if (panelState === "loading") {
+          try {
+            const shell =
+              cardEl.closest?.("[data-jk]") ||
+              cardEl.querySelector?.("[data-jk]") ||
+              cardEl;
+            if (shell && shell !== link) await S().humanClick(shell);
+          } catch (_e) {}
+          panelState = await waitForSerpJobPanel(item.jobId, item.title, S().randomDelay(500, 900));
+        }
+        if (panelState === "blocked") {
+          S().log(PLATFORM, "Cloudflare / vérif supplémentaire après ouverture carte — pause", "warn");
+          await setSession({ phase: "search" });
+          return;
+        }
+        if (!panelState || panelState === "no_easy_apply" || panelState === "loading") {
+          const reason =
+            panelState === "no_easy_apply"
+              ? "Sans candidature simplifiée"
+              : "Panneau offre non chargé";
+          S().log(PLATFORM, `${reason}: ${item.title || item.jobId} — skip rapide`, "warn");
+          await chrome.runtime.sendMessage({
+            action: "markSkipped",
+            platform: PLATFORM,
+            jobId: item.jobId,
+            title: item.title,
+            reason,
+          });
+          await setSession({ phase: "search" });
+          await humanSleep(500, 1000);
+          setTimeout(() => {
+            if (!isRunning) runAutoApplySession();
+          }, S().randomDelay(200, 450));
+          return;
+        }
         await markSeenJob(item.jobId);
         // Panel may show appliedSnippet after open (dead Postuler still in DOM)
-        if (detectAlreadyAppliedUi()) {
+        if (detectAlreadyAppliedUi() || panelState === "applied") {
           S().log(PLATFORM, `Déjà postulé (panneau): ${item.title || item.jobId}`, "warn");
           await chrome.runtime.sendMessage({
             action: "markSkipped",
@@ -3437,8 +4461,14 @@
             reason: "already_applied_ui",
           });
           await setSession({ phase: "search" });
+          await humanSleep(500, 1000);
+          setTimeout(() => {
+            if (!isRunning) runAutoApplySession();
+          }, S().randomDelay(180, 400));
           return;
         }
+        // Pace clicks — rapid SERP opens trip Indeed "Vérification supplémentaire"
+        await humanSleep(450, 950);
         const fresh = await getSession();
         await handleViewJobPage(fresh || session, settings);
         return;
@@ -3448,6 +4478,20 @@
       S().log(PLATFORM, `Carte absente du DOM: ${item.title || item.jobId} — suivante`, "warn");
       qIndex++;
       await setSession({ qIndex });
+      // After several misses, rebuild queue from live cards instead of draining stale IDs
+      if (!window.__AmijobsMissingCardStreak) window.__AmijobsMissingCardStreak = 0;
+      window.__AmijobsMissingCardStreak += 1;
+      if (window.__AmijobsMissingCardStreak >= 4) {
+        window.__AmijobsMissingCardStreak = 0;
+        const live = collectJobCards()
+          .filter((c) => isValidIndeedJobKey(c.jobId))
+          .map((c) => ({ jobId: c.jobId, title: c.title, company: c.company, easyApply: c.easyApply !== false }));
+        if (live.length) {
+          S().log(PLATFORM, `File SERP reconstruite (${live.length} cartes live)`, "warn");
+          await setSession({ queue: live, qIndex: 0 });
+          return;
+        }
+      }
       continue;
     }
 
@@ -3478,8 +4522,12 @@
     }
 
     const nextPage = (session.currentPage || 0) + 1;
-    if (nextPage > maxIndeedSerpPages(session, settings)) {
-      await endSession(totalApplied > 0 ? "Plus d'offres Easy Apply (pages épuisées)" : "Aucune offre Easy Apply");
+    if (!hasIndeedNextSerpPage() || nextPage > maxIndeedSerpPages(session, settings)) {
+      await endSession(
+        totalApplied > 0
+          ? "Plus d'offres Easy Apply pour ce mot-clé"
+          : "Aucune offre Easy Apply pour ce mot-clé"
+      );
       return;
     }
     const nextUrl = buildSearchUrl(session.keywords, session.location, nextPage, session);
@@ -3498,7 +4546,7 @@
 
   async function handleViewJobPage(session, settings) {
     const jobId = session.currentJk || jkFromUrl();
-    await S().sleep(1200);
+    await humanSleep(400, 850);
 
     // Fast path: appliedSnippet / "Candidature envoyée" (Postuler may still be visible but dead)
     if (detectAlreadyAppliedUi()) {
@@ -3519,7 +4567,7 @@
       return;
     }
 
-    await S().sleep(1000);
+    await humanSleep(280, 620);
 
     if (detectMissingJobPage() || !isValidIndeedJobKey(jobId)) {
       await chrome.runtime.sendMessage({
@@ -3535,7 +4583,7 @@
     }
 
     const jobInfo = getJobInfoFromPage(jobId);
-    if (!jobInfo.title) {
+    if (!jobInfo.title || /^(emplois|jobs|offres)\b/i.test(jobInfo.title)) {
       jobInfo.title =
         session.currentTitle || session.queue?.find((q) => q.jobId === jobId)?.title || "";
     }
@@ -3590,8 +4638,33 @@
         jobInfo.company = gdMeta.company || gdMeta.currentCompany || jobInfo.company;
     }
 
-    const btn = await waitForApplyButton(gdHandoff ? 22000 : 18000);
+    const btn = await waitForApplyButton(gdHandoff ? S().randomDelay(8000, 12000) : S().randomDelay(2200, 3200));
     if (!btn) {
+      // Fallback: Smart Apply deep link sometimes present without a visible CTA yet
+      const smartUrl = extractSmartApplyUrlFromDom();
+      if (smartUrl && !gdHandoff) {
+        S().log(PLATFORM, `Postuler absent — ouverture Smart Apply URL…`, "warn");
+        const lock0 = await chrome.runtime
+          .sendMessage({ action: "acquireSmartApplyLock", owner: "indeed", handoff: false })
+          .catch(() => null);
+        if (lock0?.ok) {
+          await setSession({ phase: "apply", currentJk: jobInfo.jobId });
+          try {
+            await chrome.runtime.sendMessage({
+              action: "ensurePlatformTab",
+              platform: "indeed",
+              url: smartUrl,
+              active: true,
+              forceNavigate: true,
+            });
+            return;
+          } catch (_e) {
+            try {
+              await chrome.runtime.sendMessage({ action: "releaseSmartApplyLock", owner: "indeed" });
+            } catch (_e2) {}
+          }
+        }
+      }
       if (gdHandoff) {
         // Fail fast — don't hold GD's lock for 120s on a dead viewjob
         S().log(
@@ -3635,17 +4708,29 @@
           reason: "already_applied_ui",
         });
       } else {
+        const skipTitle =
+          session.currentTitle ||
+          jobInfo.title ||
+          session.queue?.find((q) => q.jobId === jobInfo.jobId)?.title ||
+          "";
         S().log(PLATFORM, "Bouton Postuler sur Indeed introuvable", "warn");
         await chrome.runtime.sendMessage({
           action: "markSkipped",
           platform: PLATFORM,
           jobId: jobInfo.jobId,
-          title: jobInfo.title,
+          title: skipTitle,
           reason: "Pas de candidature Indeed",
         });
       }
       await setSession({ phase: "search" });
-      window.location.href = searchReturnUrl(session);
+      // Soft return on SERP — hard nav remounts the module and burns the rest of the queue
+      if (isSearchPage()) {
+        setTimeout(() => {
+          if (!isRunning) runAutoApplySession();
+        }, 600);
+      } else {
+        window.location.href = searchReturnUrl(session);
+      }
       return;
     }
     const lock = await chrome.runtime
@@ -3990,7 +5075,16 @@
     const maxJobs = after?.maxJobs || settings.maxJobsPerSession || 25;
     const flipUrl =
       result.success ? await maybeFlipIndeedPage(after, settings, maxJobs, { navigate: false }) : null;
-    await setSession({ phase: "search" });
+    // Brief settle so markApplied / post-apply UI commit before SERP resume
+    if (result.success) {
+      await S().sleep(S().randomDelay(1200, 2200));
+      await setSession({
+        phase: "search",
+        massApplyCooldownUntil: Date.now() + S().randomDelay(2500, 4500),
+      });
+    } else {
+      await setSession({ phase: "search" });
+    }
     const resumeUrl = flipUrl || searchReturnUrl((await getSession()) || after || session);
     // Prefer closing smartapply tab and returning to search on fr.indeed
     if (/smartapply\.indeed\.com/i.test(window.location.href)) {

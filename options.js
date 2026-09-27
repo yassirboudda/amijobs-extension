@@ -1,5 +1,61 @@
 const $ = (id) => document.getElementById(id);
 
+let questionPreferencesCache = [];
+
+function renderQuestionPrefs(prefs, lang) {
+  const box = $("questionPrefList");
+  if (!box) return;
+  const list = Array.isArray(prefs) ? prefs : [];
+  questionPreferencesCache = list;
+  if (!list.length) {
+    box.innerHTML = `<p class="qpref-empty">${t("questionPrefEmpty", lang)}</p>`;
+    return;
+  }
+  box.innerHTML = list
+    .map(
+      (p, i) => `
+      <div class="qpref-row" data-idx="${i}" data-updated-at="${p.updatedAt || ""}">
+        <textarea class="qpref-q" rows="2">${escapeHtml(p.question || "")}</textarea>
+        <input class="qpref-a" value="${escapeHtml(p.answer || "")}" />
+        <button type="button" class="qpref-del" data-idx="${i}">${t("questionPrefDelete", lang)}</button>
+      </div>`
+    )
+    .join("");
+  box.querySelectorAll(".qpref-del").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = Number(btn.getAttribute("data-idx"));
+      questionPreferencesCache = questionPreferencesCache.filter((_, j) => j !== idx);
+      await chrome.storage.local.set({ questionPreferences: questionPreferencesCache });
+      renderQuestionPrefs(questionPreferencesCache, lang);
+    });
+  });
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function readQuestionPrefsFromDom() {
+  const box = $("questionPrefList");
+  if (!box) return questionPreferencesCache;
+  const rows = [...box.querySelectorAll(".qpref-row")];
+  if (!rows.length && questionPreferencesCache.length && box.querySelector(".qpref-empty")) {
+    return [];
+  }
+  if (!rows.length) return questionPreferencesCache;
+  return rows
+    .map((row) => ({
+      question: row.querySelector(".qpref-q")?.value.trim() || "",
+      answer: row.querySelector(".qpref-a")?.value.trim() || "",
+      updatedAt: Number(row.dataset.updatedAt) || Date.now(),
+    }))
+    .filter((p) => p.question && p.answer);
+}
+
 let pendingCvFile = null; // { name, mime, base64, size, savedAt } waiting to save
 
 function updateBlacklistCount(count) {
@@ -68,15 +124,18 @@ async function applyI18n() {
 
 async function load() {
   await applyI18n();
+  const lang = await getUiLang();
   const data = await chrome.storage.local.get([
     "profile",
     "autoApplySettings",
     "mistralApiKey",
     "twoCaptchaApiKey",
+    "capSolverApiKey",
     "blacklistedCompanies",
     "uiSettings",
     "cvText",
     "cvFile",
+    "questionPreferences",
   ]);
   const profile = data.profile || {};
   const settings = data.autoApplySettings || {};
@@ -105,7 +164,6 @@ async function load() {
   updateBlacklistCount(blacklist.length);
 
   $("mistralApiKey").value = data.mistralApiKey || "";
-  $("twoCaptchaApiKey").value = data.twoCaptchaApiKey || "";
   $("maxJobsPerSession").value = settings.maxJobsPerSession || 25;
   $("maxNoApplyPages").value = settings.maxConsecutiveNoApplyPages || 20;
   $("maxApplicationsPerCompany").value = settings.maxApplicationsPerCompany ?? 0;
@@ -117,6 +175,7 @@ async function load() {
   $("onlyEasyApply").checked = settings.onlyEasyApply !== false;
   $("allowExternalApply").checked = settings.allowExternalApply !== false;
   $("skipFormationOffers").checked = settings.skipFormationOffers !== false;
+  renderQuestionPrefs(data.questionPreferences || [], lang);
 }
 
 async function save() {
@@ -171,7 +230,6 @@ async function save() {
   };
 
   const mistralApiKey = $("mistralApiKey").value.trim();
-  const twoCaptchaApiKey = $("twoCaptchaApiKey").value.trim();
   const uiSettings = { language: $("uiLanguage").value || "auto" };
 
   const payload = {
@@ -181,7 +239,7 @@ async function save() {
     blacklistedCompanies,
     uiSettings,
     mistralApiKey: mistralApiKey || undefined,
-    twoCaptchaApiKey: twoCaptchaApiKey || "",
+    questionPreferences: readQuestionPrefsFromDom(),
   };
   if (pendingCvFile) {
     payload.cvFile = pendingCvFile;
@@ -233,3 +291,10 @@ $("cvFileClear")?.addEventListener("click", async () => {
 });
 
 load();
+
+try {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !changes.questionPreferences) return;
+    getUiLang().then((lang) => renderQuestionPrefs(changes.questionPreferences.newValue || [], lang));
+  });
+} catch (_e) {}

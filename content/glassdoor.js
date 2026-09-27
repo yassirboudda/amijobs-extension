@@ -5,7 +5,7 @@
   window.__AmijobsGlassdoorLoaded = true;
 
   const PLATFORM = "glassdoor";
-  const VERSION = "1.4.61";
+  const VERSION = "1.4.68";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -148,43 +148,34 @@
 
     try {
       await chrome.storage.local.set({
-        amijobsCfPause: { at: Date.now(), until: Date.now() + 120000, platform: PLATFORM },
+        amijobsCfPause: { at: Date.now(), until: Date.now() + 240000, platform: PLATFORM },
       });
     } catch (_e) {}
     S().log(
       PLATFORM,
-      "Challenge Cloudflare — pause calme (pas de refresh). Cliquez la case ou attendez 2captcha.",
+      "Cloudflare Turnstile — cliquez le widget manuellement. AmiJobs attend (reCAPTCHA reste auto)…",
       "warn"
     );
 
-    if (!window.__AmijobsCfSolveStartedAt || Date.now() - window.__AmijobsCfSolveStartedAt > 60000) {
-      window.__AmijobsCfSolveStartedAt = Date.now();
-      try {
-        await chrome.runtime.sendMessage({ action: "injectTurnstileClicker", calm: true });
-      } catch (_e) {}
-      try {
-        if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
-        if (typeof window.__AmijobsSolveTurnstile === "function") window.__AmijobsSolveTurnstile(true);
-      } catch (_e) {}
-    }
-
     const start = Date.now();
-    let lastClickAt = 0;
-    while (Date.now() - start < 120000) {
+    let lastHint = 0;
+    while (Date.now() - start < 600000) {
       if (shouldStop) return false;
-      if (Date.now() - lastClickAt > 8000) {
-        lastClickAt = Date.now();
+      if (Date.now() - lastHint > 25000) {
+        lastHint = Date.now();
+        S().log(PLATFORM, "En attente du Turnstile Cloudflare (manuel)…", "warn");
         try {
-          if (typeof window.__AmijobsClickTurnstile === "function") window.__AmijobsClickTurnstile();
+          await chrome.storage.local.set({
+            amijobsCfPause: { at: Date.now(), until: Date.now() + 600000, platform: PLATFORM },
+          });
         } catch (_e) {}
       }
-      await S().sleep(4000);
+      await S().sleep(2000);
       if (!needsCaptcha() && !S().$('iframe[src*="challenges.cloudflare.com"], .cf-turnstile')) {
-        S().log(PLATFORM, "Challenge Cloudflare passé", "success");
+        S().log(PLATFORM, "Challenge Cloudflare passé (manuel)", "success");
         try {
           await chrome.storage.local.set({ amijobsCfPause: null });
         } catch (_e) {}
-        window.__AmijobsCfSolveStartedAt = 0;
         return true;
       }
       if (collectJobCards().length > 0) {
@@ -192,11 +183,10 @@
         try {
           await chrome.storage.local.set({ amijobsCfPause: null });
         } catch (_e) {}
-        window.__AmijobsCfSolveStartedAt = 0;
         return true;
       }
     }
-    S().log(PLATFORM, "Challenge Cloudflare toujours présent — pause (ne pas recharger)", "warn");
+    S().log(PLATFORM, "Turnstile toujours présent — cliquez le widget Cloudflare", "warn");
     try {
       await chrome.storage.local.set({
         amijobsCfPause: { at: Date.now(), until: Date.now() + 180000, platform: PLATFORM },
