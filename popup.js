@@ -8,7 +8,7 @@ let loginBannerManualHide = false;
 let stickyLoginBanner = null;
 
 try {
-  const ver = chrome.runtime.getManifest()?.version || "1.6.3";
+  const ver = chrome.runtime.getManifest()?.version || "1.6.4";
   const el = $("extVersion");
   if (el) el.textContent = `v${ver}`;
 } catch (_e) {}

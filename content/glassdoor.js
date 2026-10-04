@@ -2,7 +2,7 @@
 // Glassdoor "Easy Apply" often redirects to Indeed Smart Apply (see HAR /jobs/redirects).
 (function () {
   const PLATFORM = "glassdoor";
-  const VERSION = "1.6.3";
+  const VERSION = "1.6.4";
 
   function glassdoorLoginUrl() {
     try {

@@ -1,7 +1,7 @@
 // AmiJobs — Indeed auto-apply content script (phase-based, v1.2.7)
 (function () {
   const PLATFORM = "indeed";
-  const VERSION = "1.6.3";
+  const VERSION = "1.6.4";
   const INDEED_LOGIN_URL = "https://secure.indeed.com/auth";
 
   function checkLoginStateQuick() {

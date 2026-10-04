@@ -11,7 +11,7 @@
 // v1.4.0: Direct storage reads, blacklist, improved button detection
 // ============================================================================
 (function () {
-  const VERSION = "1.6.3";
+  const VERSION = "1.6.4";
   const LOGIN_URL = "https://www.linkedin.com/login";
 
   /** Detect LinkedIn session for pre-start / mid-session gates. */
