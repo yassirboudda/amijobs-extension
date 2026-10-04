@@ -1403,6 +1403,12 @@
     // Defensive wait: two-pane search often hydrates the CTA a beat late
     let easyApplyBtn = findEasyApplyButton() || (await waitForEasyApplyButton(9000));
     if (!easyApplyBtn) {
+      // Backoff retry: the right panel sometimes re-renders the top card late
+      await sleep(1500);
+      document.querySelector(".jobs-search__job-details--container, .jobs-details")?.scrollTo?.(0, 0);
+      easyApplyBtn = await waitForEasyApplyButton(5000);
+    }
+    if (!easyApplyBtn) {
       log("Bouton Easy Apply non trouvé", "warn");
       devLog("applyToCurrentJob", "No Easy Apply button found");
       return { success: false, reason: "no_easy_apply_button" };
@@ -1891,6 +1897,17 @@
     const easyApplyCandidates = jobCards.filter((c) => hasEasyApplyBadge(c.element)).length;
 
     if (jobCards.length === 0) {
+      // Fail-open: an empty list right after load is usually a slow render / soft auth
+      // wall / transient blank SERP — reload the same search a couple of times first.
+      const retries = session?.emptySerpRetries || 0;
+      if (session?.active && retries < 2 && isLinkedInSearchUrl()) {
+        log(`Aucune offre visible (tentative ${retries + 1}/3) — rechargement de la recherche`, "warn");
+        await chrome.storage.local.set({ sessionLinkedin: { ...session, emptySerpRetries: retries + 1 } });
+        isRunning = false;
+        await sleep(2500);
+        window.location.reload();
+        return;
+      }
       log("Aucune offre trouvée — fin de session", "error");
       if (session?.active) {
         await chrome.runtime.sendMessage({ action: "endPlatformSession", platform: "linkedin" });
@@ -1898,6 +1915,9 @@
       playNotificationSound("stop");
       isRunning = false;
       return;
+    }
+    if (session?.emptySerpRetries) {
+      await chrome.storage.local.set({ sessionLinkedin: { ...session, emptySerpRetries: 0 } });
     }
 
     // ── Check daily limit before starting the loop ──
@@ -1925,6 +1945,23 @@
         if (card.jobId && appliedJobs[card.jobId]) {
           log(`Ignoré (déjà postulé): job ${card.jobId}`, "info");
           continue;
+        }
+        // One card must never take the whole platform run down (recoverable per job)
+        try {
+        // Virtualized list: the element may be detached by now — re-query by job id
+        if (card.element && !card.element.isConnected && card.jobId) {
+          const fresh = document.querySelector(
+            `[data-job-id="${card.jobId}"], [data-occludable-job-id="${card.jobId}"]`
+          );
+          if (fresh) {
+            card.element = fresh.closest("li") || fresh;
+          } else {
+            chrome.runtime.sendMessage({
+              action: "markSkipped", platform: "linkedin", jobId: card.jobId,
+              title: card.title || "", reason: "Carte détachée (liste virtualisée)",
+            }).catch(() => {});
+            continue;
+          }
         }
 
         // When company-site apply is enabled, also process non-Easy cards
@@ -2095,6 +2132,17 @@
             isRunning = false;
             return;
           }
+        }
+        } catch (cardErr) {
+          log(`Erreur carte ${i + 1}: ${String(cardErr?.message || cardErr)} — offre suivante`, "warn");
+          chrome.runtime.sendMessage({
+            action: "markError", platform: "linkedin", jobId: card.jobId || "",
+            title: card.title || "", error: String(cardErr?.message || cardErr), step: "card",
+          }).catch(() => {});
+          try {
+            await forceCloseModal();
+          } catch (_e) {}
+          await sleep(1200);
         }
       }
 

@@ -567,6 +567,31 @@
     );
   }
 
+  /**
+   * "Request blocked" (anti-bot) used to end the whole Indeed run on first sight.
+   * Pause with a growing budget instead (resume loop respects amijobsCfPause); only a
+   * persistently blocked run (4th hit) ends the session.
+   */
+  async function handleAntiBotBlock(where = "serp") {
+    let pauses = 1;
+    try {
+      const { sessionIndeed: s = null } = await chrome.storage.local.get(["sessionIndeed"]);
+      pauses = (s?.antiBotPauses || 0) + 1;
+      if (s) await chrome.storage.local.set({ sessionIndeed: { ...s, antiBotPauses: pauses } });
+    } catch (_e) {}
+    if (pauses > 3) {
+      await endSession("Indeed a bloqué la requête (anti-bot) — 3 pauses sans succès");
+      return;
+    }
+    const ms = 180000 * pauses;
+    await markCloudflarePause(ms);
+    S().log(
+      PLATFORM,
+      `Indeed anti-bot (${where}) — pause ${Math.round(ms / 60000)} min (${pauses}/3) puis reprise automatique`,
+      "warn"
+    );
+  }
+
   async function markCloudflarePause(ms = 90000) {
     try {
       await chrome.storage.local.set({
@@ -4356,7 +4381,7 @@
     if (detectBlockedPage() || detectCloudflareChallenge()) {
       const ok = await tryPassCloudflareChallenge();
       if (!ok && detectBlockedPage()) {
-        await endSession("Indeed a bloqué la requête (anti-bot)");
+        await handleAntiBotBlock("serp");
         return;
       }
     }
@@ -4780,7 +4805,7 @@
     if (detectBlockedPage() || detectCloudflareChallenge()) {
       const ok = await tryPassCloudflareChallenge();
       if (!ok && detectBlockedPage()) {
-        await endSession("Indeed a bloqué la requête (anti-bot)");
+        await handleAntiBotBlock("serp");
         return;
       }
     }
@@ -5366,7 +5391,7 @@
       if (detectCloudflareChallenge() || detectBlockedPage()) {
         const ok = await tryPassCloudflareChallenge();
         if (!ok && detectBlockedPage() && !detectCloudflareChallenge()) {
-          await endSession("Indeed a bloqué la requête (anti-bot)");
+          await handleAntiBotBlock("resume");
           return;
         }
         if (!ok && detectCloudflareChallenge()) {

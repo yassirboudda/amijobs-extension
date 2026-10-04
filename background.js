@@ -351,6 +351,16 @@ let lastIndeedLoginWallAt = 0;
 /** Armed while Glassdoor clicks Easy Apply without a scrapable Indeed href. */
 let indeedHandoffCapture = null;
 let tabEnforceLock = false;
+/** While > Date.now(), a multi-platform start is creating windows: the per-platform
+ * watchdogs (navigation merge, tab reopen) must stay out of the way, otherwise they
+ * keep the OLD active tab and cull the freshly created window (blank window / stuck start). */
+let sessionStartingUntil = 0;
+let startInFlight = false;
+const START_LOCK_MS = 25000;
+const START_KICK_DELAYS_MS = [2000, 8000, 20000];
+function isSessionStarting() {
+  return Date.now() < sessionStartingUntil;
+}
 /** platform -> chrome window id (multi-board: one window each when count>=2). */
 const platformWindowIds = Object.create(null);
 /** platform -> primary SERP/board tab id (persisted for stop/resume). */
@@ -978,9 +988,20 @@ async function clearPlatformWindowMemory(platforms = null) {
   } catch (_e) {}
 }
 
-function pickTabToKeep(tabs, preferredUrl = "") {
+function pickTabToKeep(tabs, preferredUrl = "", hints = null) {
   if (!tabs.length) return null;
   const pref = String(preferredUrl || "");
+  // Multi-window runs: the tab we opened for this platform (or any tab inside its own
+  // window) wins over `tab.active` — every window has an active tab, so with 2+ windows
+  // the old SERP tab in another window used to be kept and the new window culled.
+  if (hints?.tabId != null) {
+    const mine = tabs.find((t) => t.id === hints.tabId);
+    if (mine) return mine;
+  }
+  if (hints?.windowId != null) {
+    const inWin = tabs.find((t) => t.windowId === hints.windowId);
+    if (inWin) return inWin;
+  }
   if (/smartapply|indeedapply/i.test(pref)) {
     const sa = tabs.find((t) => /smartapply|indeedapply/i.test(t.url || ""));
     if (sa) return sa;
@@ -1166,11 +1187,13 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
 
 async function enforceOneTabPerPlatform(reason = "") {
   if (tabEnforceLock) return;
+  if (isSessionStarting() && reason !== "démarrage session") return;
   tabEnforceLock = true;
   try {
     for (const platform of SUPPORTED_PLATFORMS) {
       const tabs = await listPlatformTabs(platform);
       if (tabs.length <= 1) continue;
+      const hints = { tabId: platformTabIds[platform] ?? null, windowId: platformWindowIds[platform] ?? null };
 
       // Indeed: 1 SERP + 1 Apply max (+ keep login wall while user signs in)
       if (platform === "indeed") {
@@ -1194,7 +1217,7 @@ async function enforceOneTabPerPlatform(reason = "") {
         const loginTabs = tabs.filter((t) => isLoginTab(t));
         const applyTabs = tabs.filter((t) => isApplyTab(t));
         const boardTabs = tabs.filter((t) => !isApplyTab(t) && !isLoginTab(t));
-        const keepBoard = pickTabToKeep(boardTabs, "/jobs");
+        const keepBoard = pickTabToKeep(boardTabs, "/jobs", hints);
         const keepLogin = pickTabToKeep(loginTabs, "/auth") || loginTabs[0] || null;
         const sortedApply = [...applyTabs].sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
         const keepApply = sortedApply[0] || null;
@@ -1238,7 +1261,7 @@ async function enforceOneTabPerPlatform(reason = "") {
             /glassdoor\.(com|fr)/i.test(t.url || "")
         );
         const keepDetail = pickTabToKeep(detailTabs) || detailTabs[0] || null;
-        const keepSearch = pickTabToKeep(searchTabs, "/Job/jobs") || searchTabs[0] || null;
+        const keepSearch = pickTabToKeep(searchTabs, "/Job/jobs", hints) || searchTabs[0] || null;
         // Prefer keeping detail when both exist (apply in progress)
         if (keepDetail && keepSearch) {
           for (const t of detailTabs) {
@@ -1262,7 +1285,7 @@ async function enforceOneTabPerPlatform(reason = "") {
         }
       }
 
-      const keep = pickTabToKeep(tabs);
+      const keep = pickTabToKeep(tabs, "", hints);
       for (const t of tabs) {
         if (!keep || t.id === keep.id) continue;
         try {
@@ -1331,6 +1354,7 @@ async function openPlatformTabs(urls, platforms) {
 
   // 2+ boards → one Chrome window each (must stay reliable even if Exit/login fail later)
   const useWindows = ordered.length >= 2;
+  sessionStartingUntil = Date.now() + START_LOCK_MS;
   let first = true;
   let left = 40;
   let openedWindows = 0;
@@ -1409,10 +1433,27 @@ async function openPlatformTabs(urls, platforms) {
     );
   }
 
+  // Let every opened tab leave about:blank before sessions are armed / kicked (bounded)
+  await Promise.all(
+    results
+      .filter((r) => r.tabId != null)
+      .map(async (r) => {
+        const tab = await waitForTabComplete(r.tabId, 12000);
+        r.ready = !!tab && tab.status === "complete";
+        await appendLog(
+          `Onglet ${r.platform}: ${r.ready ? "prêt" : "pas encore chargé"} tab=${r.tabId} win=${tab?.windowId ?? "?"}`,
+          r.ready ? "info" : "warn",
+          r.platform
+        );
+      })
+  );
+
   try {
     await enforceOneTabPerPlatform("démarrage session");
   } catch (e) {
     await appendLog(`enforceOneTabPerPlatform: ${String(e?.message || e)}`, "warn");
+  } finally {
+    sessionStartingUntil = 0;
   }
 
   return { ok: openedWindows + openedTabs > 0 || ordered.length === 0, useWindows, openedWindows, openedTabs, ordered, results };
@@ -4375,7 +4416,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 let reopeningPlatformTab = false;
 chrome.tabs.onRemoved.addListener(async () => {
-  if (reopeningPlatformTab || tabEnforceLock) return;
+  if (reopeningPlatformTab || tabEnforceLock || isSessionStarting()) return;
   try {
     const data = await chrome.storage.local.get([
       "amijobsMeta",
@@ -4613,7 +4654,16 @@ async function startMultiSession(msg) {
   updates.amijobsSmartApplyPrefer = null;
   updates.amijobsSmartApplyOwners = {};
 
-  await chrome.storage.local.set(updates);
+  // Meta/shared state first (popup shows "running"); per-platform sessions are armed only
+  // AFTER the windows exist — otherwise content scripts in stale tabs start applying on the
+  // old page while windows are still being created, and the new ones get culled as duplicates.
+  const sessionUpdates = {};
+  const metaUpdates = {};
+  for (const [k, v] of Object.entries(updates)) {
+    if (/^session[A-Z]/.test(k)) sessionUpdates[k] = v;
+    else metaUpdates[k] = v;
+  }
+  await chrome.storage.local.set(metaUpdates);
   // Reset reopen storm counters + window memory for this run
   for (const p of platforms) {
     platformReopenCount[p] = 0;
@@ -4663,15 +4713,25 @@ async function startMultiSession(msg) {
     }
   }
 
+  await chrome.storage.local.set(sessionUpdates);
+  await appendLog(
+    `Sessions armées (${Object.keys(sessionUpdates).length}) après ouverture: ${openOrder.join(", ")}`,
+    "info"
+  );
+
   // Exit session is best-effort AFTER tabs/windows are visible
   ensureExitSession().catch(async (e) => {
     await appendLog(`Exit AmiJobs: connexion différée (${String(e?.message || e)})`, "warn");
   });
 
-  setTimeout(() => {
-    // First kick must force-inject — tabs are fresh and may not have content scripts yet
-    kickPlatformSessions(openOrder, { forceInject: true }).catch(() => {});
-  }, 2000);
+  // Kick several times: the first must force-inject (fresh tabs may not have content scripts
+  // yet); later ones catch tabs that were still loading / an MV3 worker restart. Each kick
+  // is awaited + retried inside kickPlatformSessions and is a no-op when already running.
+  START_KICK_DELAYS_MS.forEach((delay, attempt) =>
+    setTimeout(() => {
+      kickPlatformSessions(openOrder, { forceInject: attempt === 0, attempt }).catch(() => {});
+    }, delay)
+  );
 
   return {
     ok: true,
@@ -4701,15 +4761,35 @@ function tabLooksLikeCloudflareChallenge(tab) {
   );
 }
 
-async function kickPlatformSessions(platforms = [], { forceInject = false } = {}) {
+async function kickPlatformSessions(platforms = [], { forceInject = false, attempt = 0 } = {}) {
   if (await isCloudflarePauseActive()) {
     return; // Never kick / re-inject while CF challenge is up (Ray ID thrash)
   }
   for (const platform of platforms) {
     try {
-      const tabs = await listPlatformTabs(platform);
-      for (const tab of tabs.slice(0, 1)) {
+      // Prefer the exact tab we opened for this platform (multi-window: listPlatformTabs()[0]
+      // may be a tab in another window); fall back to the platform's tab list.
+      let targets = [];
+      const ownId = platformTabIds[platform];
+      if (ownId != null) {
+        try {
+          const own = await chrome.tabs.get(ownId);
+          if (own?.id) targets = [own];
+        } catch (_e) {
+          delete platformTabIds[platform];
+        }
+      }
+      if (!targets.length) targets = (await listPlatformTabs(platform)).slice(0, 1);
+      if (!targets.length) {
+        await appendLog(`Kick ${platform} (#${attempt + 1}): aucun onglet`, "warn", platform);
+        continue;
+      }
+      for (let tab of targets) {
         if (!tab?.id) continue;
+        if (tab.status !== "complete") {
+          const ready = await waitForTabComplete(tab.id, 12000);
+          if (ready) tab = ready;
+        }
         if (tabLooksLikeCloudflareChallenge(tab)) continue;
         let pingOk = false;
         if (!forceInject) {
@@ -4761,13 +4841,41 @@ async function kickPlatformSessions(platforms = [], { forceInject = false } = {}
         }
         // Small delay after inject so listeners register before startAutoApply
         if (forceInject || !pingOk) await new Promise((r) => setTimeout(r, 400));
-        chrome.tabs.sendMessage(tab.id, { action: "startAutoApply" }).catch(() => {});
+        // Awaited + retried: a fire-and-forget kick on a tab whose listener was not yet
+        // registered silently produced "window open on SERP, nothing happens".
+        let kicked = false;
+        let lastErr = "";
+        for (let i = 0; i < 3 && !kicked; i++) {
+          try {
+            await chrome.tabs.sendMessage(tab.id, { action: "startAutoApply" });
+            kicked = true;
+          } catch (e) {
+            lastErr = String(e?.message || e);
+            await new Promise((r) => setTimeout(r, 700 * (i + 1)));
+          }
+        }
+        await appendLog(
+          `Kick ${platform} (#${attempt + 1}) tab=${tab.id} win=${tab.windowId ?? "?"}: ${kicked ? "ok" : `injoignable (${lastErr})`}`,
+          kicked ? "info" : "warn",
+          platform
+        );
       }
-    } catch (_e) {
-      /* ignore */
+    } catch (e) {
+      await appendLog(`Kick ${platform} (#${attempt + 1}) erreur: ${String(e?.message || e)}`, "warn", platform);
     }
   }
 }
+
+// A closed platform window must not keep a stale windowId around (tabs.create({windowId})
+// would throw and the reopen path got stuck).
+chrome.windows.onRemoved.addListener((windowId) => {
+  const platform = Object.keys(platformWindowIds).find((p) => platformWindowIds[p] === windowId);
+  if (!platform) return;
+  delete platformWindowIds[platform];
+  delete platformTabIds[platform];
+  persistPlatformWindowIds().catch(() => {});
+  appendLog(`Fenêtre ${platform} fermée (id=${windowId})`, "info", platform).catch(() => {});
+});
 
 function handleMessage(msg, sendResponse, sender = null) {
   if (msg.action === "uploadCvViaDebugger") {
@@ -4968,9 +5076,19 @@ function handleMessage(msg, sendResponse, sender = null) {
   }
 
   if (msg.action === "startMultiSession" || msg.action === "startSession") {
+    // Overlapping starts (double-click / popup re-send) raced each other's windows
+    if (startInFlight) {
+      appendLog("Start ignoré: un démarrage est déjà en cours", "warn").catch(() => {});
+      sendResponse({ ok: false, reason: "start_in_progress" });
+      return false;
+    }
+    startInFlight = true;
     startMultiSession(msg)
       .then(sendResponse)
-      .catch((e) => sendResponse({ ok: false, reason: String(e?.message || e) }));
+      .catch((e) => sendResponse({ ok: false, reason: String(e?.message || e) }))
+      .finally(() => {
+        startInFlight = false;
+      });
     return true;
   }
 

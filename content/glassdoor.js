@@ -2024,15 +2024,18 @@
 
     try {
       let appliedThisRun = 0;
+      let pausedForProtection = false;
       const processedIds = new Set();
       for (let i = 0; i < cards.length && !shouldStop; i++) {
         if (isBlockedPage()) {
-          S().log(PLATFORM, "Protection Glassdoor détectée — arrêt session", "warn");
-          await chrome.runtime.sendMessage({
-            action: "endPlatformSession",
-            platform: PLATFORM,
-            reason: "Arrêt: protection Glassdoor",
-          });
+          // Pause (resume loop honours amijobsCfPause) instead of ending the whole run
+          S().log(PLATFORM, "Protection Glassdoor détectée — pause 3 min puis reprise", "warn");
+          try {
+            await chrome.storage.local.set({
+              amijobsCfPause: { at: Date.now(), until: Date.now() + 180000, platform: PLATFORM },
+            });
+          } catch (_e) {}
+          pausedForProtection = true;
           break;
         }
 
@@ -2054,6 +2057,8 @@
         const card = cards[i];
         const titleKey = String(card.title || "").trim().toLowerCase();
         if (processedIds.has(card.jobId) || (titleKey && processedIds.has(`t:${titleKey}`))) continue;
+        // One card must never take the whole platform run down (recoverable per job)
+        try {
         if (
           alreadyApplied(liveApplied, card.jobId) ||
           alreadyApplied(appliedJobs, card.jobId) ||
@@ -2111,7 +2116,12 @@
           continue;
         }
 
-        const btn = await waitForEasyApplyButton(8000);
+        let btn = await waitForEasyApplyButton(8000);
+        if (!btn && !findCompanySiteButton()) {
+          // Backoff retry: the detail panel sometimes swaps its CTA late
+          await S().sleep(1200);
+          btn = await waitForEasyApplyButton(4000);
+        }
         const companyBtn = !btn ? findCompanySiteButton() : null;
         if (!btn && !companyBtn) {
           await chrome.runtime.sendMessage({
@@ -2247,9 +2257,34 @@
           } catch (_e) {}
         }
 
+        } catch (cardErr) {
+          S().log(PLATFORM, `Erreur carte ${i + 1}: ${String(cardErr?.message || cardErr)} — offre suivante`, "warn");
+          chrome.runtime
+            .sendMessage({
+              action: "markError",
+              platform: PLATFORM,
+              jobId: card.jobId || "",
+              title: card.title || "",
+              error: String(cardErr?.message || cardErr),
+              step: "card",
+            })
+            .catch(() => {});
+          try {
+            await chrome.runtime.sendMessage({ action: "releaseSmartApplyLock", owner: "glassdoor" });
+          } catch (_e) {}
+          await S().sleep(1200);
+        }
+
         const jobDelay = Math.max(settings.delayBetweenJobs?.min || 400, 900);
         const jobDelayMax = Math.max(settings.delayBetweenJobs?.max || jobDelay, jobDelay + 600);
         await S().sleep(S().randomDelay(jobDelay, jobDelayMax));
+      }
+
+      if (pausedForProtection) {
+        // Do not paginate into the challenge page (Ray ID thrash) — resume loop retries later
+        isRunning = false;
+        await clearGlassdoorRunLock();
+        return;
       }
 
       const { sessionGlassdoor: updated } = await chrome.storage.local.get(["sessionGlassdoor"]);
