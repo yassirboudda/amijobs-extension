@@ -3,9 +3,12 @@ let uiLang = "fr";
 // Set as soon as the user edits any form input. Prevents the async
 // restoreFormInputs() from clobbering what the user just typed/checked.
 let formTouched = false;
+let loginBannerManualHide = false;
+/** Keeps the pre-start login banner visible across refresh() polls. */
+let stickyLoginBanner = null;
 
 try {
-  const ver = chrome.runtime.getManifest()?.version || "1.5.7";
+  const ver = chrome.runtime.getManifest()?.version || "1.6.3";
   const el = $("extVersion");
   if (el) el.textContent = `v${ver}`;
 } catch (_e) {}
@@ -58,6 +61,12 @@ function selectedPlatforms() {
 
 const PLATFORM_OPEN_ORDER = ["hellowork", "linkedin", "indeed", "glassdoor"];
 const PLATFORM_LABEL = { hellowork: "HW", linkedin: "LI", indeed: "IN", glassdoor: "GD" };
+const PLATFORM_FULL = {
+  hellowork: "Hellowork",
+  linkedin: "LinkedIn",
+  indeed: "Indeed",
+  glassdoor: "Glassdoor",
+};
 const SESSION_KEY = {
   hellowork: "sessionHellowork",
   linkedin: "sessionLinkedin",
@@ -72,6 +81,79 @@ function SUPPORTED_LAST_SESSION(state) {
     state.lastSessionIndeed ||
     state.lastSessionGlassdoor
   );
+}
+
+function hideLoginBanner() {
+  stickyLoginBanner = null;
+  const banner = $("loginBanner");
+  if (banner) banner.classList.remove("visible");
+}
+
+function showLoginBanner(items, { midSession = false, sticky = true } = {}) {
+  const banner = $("loginBanner");
+  const list = $("loginBannerList");
+  const hint = $("loginBannerHint");
+  if (!banner || !list || !items?.length) return;
+
+  loginBannerManualHide = false;
+  if (sticky) stickyLoginBanner = { items, midSession: !!midSession };
+  if (hint) {
+    hint.textContent = t(midSession ? "loginRequiredMidHint" : "loginRequiredSoftHint", uiLang);
+  }
+  list.innerHTML = "";
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "login-banner-row";
+    const name = document.createElement("span");
+    name.textContent = PLATFORM_FULL[item.platform] || item.platform;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = t("openLogin", uiLang);
+    btn.addEventListener("click", async () => {
+      await sendBg({
+        action: "openPlatformLogin",
+        platform: item.platform,
+        url: item.loginUrl || "",
+        location: getLocationsFromInput()[0] || "",
+      });
+    });
+    row.appendChild(name);
+    row.appendChild(btn);
+    list.appendChild(row);
+  }
+  banner.classList.add("visible");
+}
+
+function updateStartSelfCheck({ activeSession = false } = {}) {
+  const el = $("startReady");
+  if (!el) return;
+  const platforms = selectedPlatforms();
+  const keywords = ($("keywords")?.value || "").trim();
+  const n = platforms.length;
+  const labels = platforms.map((p) => PLATFORM_LABEL[p] || p).join(" · ") || "—";
+  const windowsNote = n >= 2 ? t("selfCheckWindows", uiLang).replace("{n}", String(n)) : t("selfCheckSingleTab", uiLang);
+
+  if (activeSession) {
+    el.textContent = t("selfCheckRunning", uiLang);
+    el.className = "self-check ok";
+    return;
+  }
+
+  const ready = n > 0 && !!keywords;
+  if (!n) {
+    el.textContent = t("selfCheckNoPlatform", uiLang);
+    el.className = "self-check warn";
+    return;
+  }
+  if (!keywords) {
+    el.textContent = `${t("selfCheckNeedKeywords", uiLang)} · ${n} ${t("selfCheckBoards", uiLang)} (${labels})`;
+    el.className = "self-check warn";
+    return;
+  }
+  el.textContent = ready
+    ? `${t("selfCheckReady", uiLang)} · ${n} ${t("selfCheckBoards", uiLang)} (${labels}) · ${windowsNote}`
+    : t("selfCheckNotReady", uiLang);
+  el.className = ready ? "self-check ok" : "self-check warn";
 }
 
 async function applyI18n() {
@@ -89,7 +171,10 @@ async function applyI18n() {
 async function refresh() {
   await applyI18n();
   const state = await sendBg({ action: "getState" });
-  if (!state) return;
+  if (!state) {
+    updateStartSelfCheck();
+    return;
+  }
 
   $("applied").textContent = state.stats?.applied || 0;
   $("skipped").textContent = state.stats?.skipped || 0;
@@ -97,25 +182,47 @@ async function refresh() {
 
   const statusEl = $("status");
   const active = state.activePlatforms || [];
+  const loginRequired = state.loginRequired || [];
+
+  if (loginRequired.length && !loginBannerManualHide) {
+    showLoginBanner(loginRequired, { midSession: true });
+  } else if (stickyLoginBanner?.items?.length && !loginBannerManualHide) {
+    showLoginBanner(stickyLoginBanner.items, {
+      midSession: !!stickyLoginBanner.midSession,
+      sticky: true,
+    });
+  } else if (!loginRequired.length && !stickyLoginBanner) {
+    hideLoginBanner();
+  }
+
   if (active.length > 0) {
     const parts = active.map((p) => {
       const s = state[SESSION_KEY[p]];
       return s ? `${PLATFORM_LABEL[p]} ${s.applied || 0}/${s.maxJobs || 25}` : PLATFORM_LABEL[p];
     });
-    statusEl.textContent = `${t("statusActive", uiLang)} — ${parts.join(" · ")}`;
-    statusEl.style.background = "#dcfce7";
-    statusEl.style.color = "#166534";
+    if (loginRequired.length) {
+      const names = loginRequired.map((i) => PLATFORM_FULL[i.platform] || i.platform).join(", ");
+      statusEl.textContent = `${t("loginRequiredTitle", uiLang)}: ${names}`;
+      statusEl.style.background = "rgba(180, 120, 70, 0.14)";
+      statusEl.style.color = "#7a4a28";
+    } else {
+      statusEl.textContent = `${t("statusActive", uiLang)} · ${parts.join(" · ")}`;
+      statusEl.style.background = "rgba(61, 122, 122, 0.14)";
+      statusEl.style.color = "#2a5555";
+    }
     $("stopBtn").disabled = false;
     $("startBtn").disabled = true;
     $("resumeBtn").disabled = true;
+    updateStartSelfCheck({ activeSession: true });
   } else {
     statusEl.textContent = t("statusInactive", uiLang);
-    statusEl.style.background = "#f1f5f9";
-    statusEl.style.color = "#475569";
+    statusEl.style.background = "rgba(232, 238, 244, 0.85)";
+    statusEl.style.color = "#243447";
     $("stopBtn").disabled = true;
     $("startBtn").disabled = false;
     const hasLast = SUPPORTED_LAST_SESSION(state);
     $("resumeBtn").disabled = !hasLast;
+    updateStartSelfCheck();
   }
 
   const lines = state.log || [];
@@ -152,6 +259,14 @@ async function restoreFormInputs() {
     if ($("platformIndeed")) $("platformIndeed").checked = saved.lastPlatforms.includes("indeed");
     if ($("platformGlassdoor")) $("platformGlassdoor").checked = saved.lastPlatforms.includes("glassdoor");
   }
+  updateStartSelfCheck();
+}
+
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
 }
 
 $("startBtn").addEventListener("click", async () => {
@@ -164,18 +279,53 @@ $("startBtn").addEventListener("click", async () => {
 
   if (platforms.length === 0) {
     $("status").textContent = t("selectPlatform", uiLang);
+    updateStartSelfCheck();
     return;
   }
   if (!keywords) {
     $("status").textContent = t("keywordsPh", uiLang);
+    updateStartSelfCheck();
     return;
   }
+
+  $("startBtn").disabled = true;
+  $("status").textContent =
+    platforms.length >= 2
+      ? t("startingWindows", uiLang).replace("{n}", String(platforms.length))
+      : t("startingSession", uiLang);
+  $("status").style.background = "rgba(58, 110, 165, 0.14)";
+  $("status").style.color = "#2f5b8a";
 
   if (locations.length) {
     const norm = await sendBg({ action: "normalizeLocations", locations });
     if (norm?.locations?.length) {
       locations = norm.locations;
       if ($("locations")) $("locations").value = locations.join("\n");
+    }
+  }
+
+  // Soft login probe: never abort Start. Windows must open even if probe is slow/wrong.
+  const boardsNeedingLogin = platforms.filter((p) => p === "linkedin" || p === "indeed" || p === "glassdoor");
+  if (boardsNeedingLogin.length) {
+    $("status").textContent = t("checkingLogin", uiLang);
+    const loginCheck = await withTimeout(
+      sendBg({
+        action: "checkPlatformLogins",
+        platforms: boardsNeedingLogin,
+        location: locations[0] || "",
+      }),
+      4500,
+      { ok: true, needsLogin: [], timedOut: true }
+    );
+    const needs = loginCheck?.needsLogin || [];
+    if (needs.length) {
+      showLoginBanner(needs, { midSession: false });
+      const names = needs.map((i) => PLATFORM_FULL[i.platform] || i.platform).join(", ");
+      $("status").textContent = `${t("loginSoftContinue", uiLang)}: ${names}`;
+      $("status").style.background = "rgba(180, 120, 70, 0.14)";
+      $("status").style.color = "#7a4a28";
+    } else {
+      hideLoginBanner();
     }
   }
 
@@ -187,22 +337,43 @@ $("startBtn").addEventListener("click", async () => {
     lastPlatforms: platforms,
   });
 
-  const result = await sendBg({
-    action: "startMultiSession",
-    platforms,
-    keywords,
-    locations,
-    location: locations[0] || "",
-    contracts,
-    maxJobs,
-  });
+  $("status").textContent =
+    platforms.length >= 2
+      ? t("startingWindows", uiLang).replace("{n}", String(platforms.length))
+      : t("startingSession", uiLang);
+
+  let result = null;
+  try {
+    result = await sendBg({
+      action: "startMultiSession",
+      platforms,
+      keywords,
+      locations,
+      location: locations[0] || "",
+      contracts,
+      maxJobs,
+    });
+  } catch (_e) {
+    result = null;
+  }
 
   if (!result?.ok) {
-    $("status").textContent = t("selectPlatform", uiLang);
+    $("status").textContent = t("startFailed", uiLang);
+    $("status").style.background = "rgba(180, 120, 70, 0.14)";
+    $("status").style.color = "#7a4a28";
+    $("startBtn").disabled = false;
+    updateStartSelfCheck();
     return;
   }
 
-  // Tabs are opened by background (exactly 1 per platform) — do not create more here
+  const opened = result.open?.openedWindows ?? result.open?.openedTabs;
+  if (platforms.length >= 2 && typeof opened === "number" && opened < platforms.length) {
+    $("status").textContent = t("startPartialWindows", uiLang)
+      .replace("{ok}", String(opened))
+      .replace("{n}", String(platforms.length));
+  }
+
+  // Tabs/windows are opened by background (exactly 1 per platform)
   window.close();
 });
 
@@ -212,19 +383,30 @@ $("stopBtn").addEventListener("click", async () => {
 });
 
 $("resumeBtn").addEventListener("click", async () => {
+  $("resumeBtn").disabled = true;
+  $("status").textContent = t("resumingSession", uiLang);
+  $("status").style.background = "rgba(58, 110, 165, 0.14)";
+  $("status").style.color = "#2f5b8a";
+
   const saved = await chrome.storage.local.get(["lastPlatforms"]);
-  const platforms = saved.lastPlatforms?.length
+  const platforms = (saved.lastPlatforms?.length
     ? saved.lastPlatforms
-    : ["hellowork", "linkedin", "indeed", "glassdoor"];
+    : PLATFORM_OPEN_ORDER
+  ).filter((p) => PLATFORM_OPEN_ORDER.includes(p));
+
   const urls = {};
   for (const platform of platforms) {
     const resumed = await sendBg({ action: "resumeLastSession", platform });
     if (!resumed?.ok || !resumed.targetUrl) continue;
     urls[platform] = resumed.targetUrl;
   }
-  const opened = Object.keys(urls);
-  if (!opened.length) return;
-  await sendBg({ action: "openPlatformTabs", urls, platforms: opened });
+  const opened = PLATFORM_OPEN_ORDER.filter((p) => urls[p]);
+  if (!opened.length) {
+    $("status").textContent = t("resumeFailed", uiLang);
+    $("resumeBtn").disabled = false;
+    return;
+  }
+  await sendBg({ action: "openPlatformTabs", urls, platforms: opened, kick: true });
   window.close();
 });
 
@@ -244,6 +426,14 @@ $("resetStats").addEventListener("click", async () => {
   await refresh();
 });
 
+const dismissBtn = $("loginBannerDismiss");
+if (dismissBtn) {
+  dismissBtn.addEventListener("click", () => {
+    loginBannerManualHide = true;
+    hideLoginBanner();
+  });
+}
+
 const FORM_INPUT_IDS = [
   "keywords",
   "locations",
@@ -262,6 +452,7 @@ for (const id of FORM_INPUT_IDS) {
   if (!el) continue;
   const markTouched = () => {
     formTouched = true;
+    updateStartSelfCheck();
   };
   el.addEventListener("input", markTouched);
   el.addEventListener("change", markTouched);
@@ -306,6 +497,7 @@ function showLocationSuggestions(items) {
       ta.value = `${text.slice(0, lineStart)}${item}${text.slice(lineEnd)}`;
       formTouched = true;
       hideLocationSuggestions();
+      updateStartSelfCheck();
     });
     box.appendChild(btn);
   }
@@ -316,6 +508,7 @@ const locationsInput = $("locations");
 if (locationsInput) {
   locationsInput.addEventListener("input", () => {
     formTouched = true;
+    updateStartSelfCheck();
     clearTimeout(locationSuggestTimer);
     locationSuggestTimer = setTimeout(async () => {
       const { currentLine } = getCurrentLocationLine(locationsInput);

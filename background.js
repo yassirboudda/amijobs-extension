@@ -6,7 +6,7 @@
 importScripts("content/geo-boards.js");
 importScripts("content/question-pref.js");
 
-const EXT_VERSION = "1.5.7";
+const EXT_VERSION = "1.6.3";
 let lastGlassdoorSerpRestoreAt = 0;
 const MISTRAL_MODEL = "mistral-large-latest";
 const MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions";
@@ -296,6 +296,8 @@ function buildLinkedInSearchUrl(keywords, location, contracts, opts = {}) {
   params.set("f_TPR", "r86400");
   const codes = [...new Set(asArray(contracts).map((c) => LINKEDIN_JT[c.toLowerCase()]).filter(Boolean))];
   if (codes.length) params.set("f_JT", codes.join(","));
+  const page = Number(opts.page || opts.currentPage || 0) || 0;
+  if (page > 0) params.set("start", String(page * 25));
   return `https://www.linkedin.com/jobs/search/?${params.toString()}`;
 }
 
@@ -349,8 +351,10 @@ let lastIndeedLoginWallAt = 0;
 /** Armed while Glassdoor clicks Easy Apply without a scrapable Indeed href. */
 let indeedHandoffCapture = null;
 let tabEnforceLock = false;
-/** platform -> chrome window id (dual mode uses separate windows). */
+/** platform -> chrome window id (multi-board: one window each when count>=2). */
 const platformWindowIds = Object.create(null);
+/** platform -> primary SERP/board tab id (persisted for stop/resume). */
+const platformTabIds = Object.create(null);
 const lastPlatformReopenAt = Object.create(null);
 const platformReopenCount = Object.create(null);
 
@@ -562,6 +566,319 @@ function urlLooksIndeedLoggedIn(url = "") {
   }
 }
 
+function platformLoginUrl(platform, location = "") {
+  if (platform === "linkedin") return "https://www.linkedin.com/login";
+  if (platform === "indeed") return "https://secure.indeed.com/auth";
+  if (platform === "glassdoor") {
+    const origin = boardsForQuery(location).glassdoorOrigin || "https://www.glassdoor.com";
+    return `${origin}/profile/login_input.htm`;
+  }
+  return "";
+}
+
+function platformProbeUrl(platform, location = "") {
+  if (platform === "linkedin") return "https://www.linkedin.com/feed/";
+  const boards = boardsForQuery(location);
+  // Prefer SERP-like URLs so heuristics / CHECK_LOGIN can see job UI, not bare home.
+  if (platform === "indeed") return `${boards.indeedOrigin || "https://fr.indeed.com"}/jobs`;
+  if (platform === "glassdoor") {
+    const origin = boards.glassdoorOrigin || "https://www.glassdoor.fr";
+    return `${origin}/Job/jobs.htm`;
+  }
+  return "";
+}
+
+function urlHeuristicLoggedIn(platform, url = "") {
+  const u = String(url || "");
+  if (!u || u.startsWith("chrome") || u === "about:blank") return null;
+  if (platform === "linkedin") {
+    if (/\/(login|authwall|checkpoint|uas\/login)/i.test(u)) return false;
+    if (/\/(feed|jobs)\//i.test(u)) return true;
+    return null;
+  }
+  if (platform === "indeed") {
+    if (isIndeedLoginWallUrl(u)) return false;
+    if (urlLooksIndeedLoggedIn(u)) return true;
+    // Bare indeed host /jobs landing without auth host → uncertain, not logged-out
+    try {
+      const parsed = new URL(u);
+      if (/(^|\.)indeed\.(com|[a-z]{2})$/i.test(parsed.hostname) && !/(^|\.)secure\.|^account\./i.test(parsed.hostname)) {
+        return null;
+      }
+    } catch (_e) {}
+    return null;
+  }
+  if (platform === "glassdoor") {
+    if (/\/profile\/login|\/join\//i.test(u)) return false;
+    if (/\/Job\/|job-listing|\/member\//i.test(u)) return true;
+    return null;
+  }
+  return null;
+}
+
+/** Hard evidence only — soft/unknown must not block Start (false positives killed multi-window). */
+function isClearLoggedOutReason(reason = "") {
+  return /^(login_wall|login_wall_url|auth_url|login_url|login_form|login_path|account_host|url_heuristic_auth|checkpoint)$/i.test(
+    String(reason || "")
+  );
+}
+
+async function waitForTabComplete(tabId, timeoutMs = 18000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === "complete" && tab.url && !String(tab.url).startsWith("chrome")) {
+        await new Promise((r) => setTimeout(r, 700));
+        return tab;
+      }
+    } catch (_e) {
+      return null;
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch (_e) {
+    return null;
+  }
+}
+
+async function injectPlatformContent(tabId, platform) {
+  if (!tabId) return;
+  try {
+    if (platform === "glassdoor") {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: false },
+        files: [
+          "content/geo-boards.js",
+          "content/question-pref.js",
+          "content/shared-autofill.js",
+          "content/company-site.js",
+          "content/glassdoor.js",
+          "content/cloudflare-turnstile.js",
+          "content/google-recaptcha.js",
+        ],
+      });
+    } else if (platform === "linkedin") {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: false },
+        files: ["content/company-site.js", "content/linkedin.js"],
+      });
+    } else if (platform === "indeed") {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: false },
+        files: [
+          "content/geo-boards.js",
+          "content/question-pref.js",
+          "content/shared-autofill.js",
+          "content/company-site.js",
+          "content/indeed.js",
+          "content/cloudflare-turnstile.js",
+          "content/google-recaptcha.js",
+        ],
+      });
+    }
+  } catch (_e) {
+    /* already injected or restricted page */
+  }
+}
+
+async function askTabLogin(tabId, platform) {
+  try {
+    const r = await chrome.tabs.sendMessage(tabId, { action: "CHECK_LOGIN" });
+    if (r && typeof r.loggedIn === "boolean") return r;
+  } catch (_e) {}
+  await injectPlatformContent(tabId, platform);
+  await new Promise((r) => setTimeout(r, 500));
+  try {
+    const r = await chrome.tabs.sendMessage(tabId, { action: "CHECK_LOGIN" });
+    if (r && typeof r.loggedIn === "boolean") return r;
+  } catch (_e) {}
+  try {
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => (typeof window.__AmijobsCheckLogin === "function" ? window.__AmijobsCheckLogin() : null),
+    });
+    const result = injected?.[0]?.result;
+    if (result && typeof result.loggedIn === "boolean") return result;
+  } catch (_e) {}
+  return null;
+}
+
+/**
+ * Pre-start login probe for LinkedIn / Indeed / Glassdoor.
+ * HelloWork is skipped (unchanged behavior).
+ * Fail-open on uncertain probes so Start still opens one window per platform.
+ */
+async function checkPlatformLogins(platforms = [], location = "") {
+  const needCheck = (platforms || []).filter((p) => p === "linkedin" || p === "indeed" || p === "glassdoor");
+  const results = {};
+  const needsLogin = [];
+
+  async function probeOne(platform) {
+    const loginUrl = platformLoginUrl(platform, location);
+    const probeUrl = platformProbeUrl(platform, location);
+    let tabId = null;
+    let created = false;
+    try {
+      const existing = await listPlatformTabs(platform);
+      if (existing[0]?.id) {
+        tabId = existing[0].id;
+      } else if (probeUrl) {
+        const tab = await chrome.tabs.create({ url: probeUrl, active: false });
+        tabId = tab?.id || null;
+        created = !!tabId;
+        if (tabId) await waitForTabComplete(tabId, 12000);
+      }
+
+      let verdict = tabId ? await askTabLogin(tabId, platform) : null;
+      if (!verdict) {
+        const tab = tabId ? await chrome.tabs.get(tabId).catch(() => null) : null;
+        const heur = urlHeuristicLoggedIn(platform, tab?.url || "");
+        verdict = {
+          // Uncertain (null) → optimistic allow; only hard auth URL blocks
+          loggedIn: heur !== false,
+          reason: heur === true ? "url_heuristic_ok" : heur === false ? "url_heuristic_auth" : "probe_failed",
+          platform,
+          loginUrl,
+          uncertain: heur == null,
+        };
+      }
+      if (!verdict.loginUrl) verdict.loginUrl = loginUrl;
+      verdict.platform = platform;
+      results[platform] = verdict;
+
+      if (verdict.loggedIn) return;
+
+      const reason = verdict.reason || "logged_out";
+      // Soft signals (signin_cta, unknown, guest_nav, …) used to false-block Start.
+      if (!isClearLoggedOutReason(reason) && reason !== "url_heuristic_auth") {
+        await appendLog(
+          `Login ${platform}: signal flou (${reason}) — démarrage autorisé (fail-open)`,
+          "warn",
+          platform
+        );
+        verdict.uncertain = true;
+        verdict.loggedIn = true;
+        results[platform] = verdict;
+        return;
+      }
+
+      needsLogin.push({
+        platform,
+        loginUrl: verdict.loginUrl || loginUrl,
+        reason,
+      });
+    } catch (e) {
+      // Probe errors must not abort multi-window start
+      results[platform] = {
+        loggedIn: true,
+        reason: "error_fail_open",
+        platform,
+        loginUrl,
+        uncertain: true,
+        error: String(e?.message || e),
+      };
+      await appendLog(
+        `Login ${platform}: erreur probe — démarrage autorisé (${String(e?.message || e)})`,
+        "warn",
+        platform
+      );
+    } finally {
+      if (created && tabId) {
+        try {
+          await chrome.tabs.remove(tabId);
+        } catch (_e) {}
+      }
+    }
+  }
+
+  // Parallel probes — sequential 3×18s waits starved SW / delayed windows
+  await Promise.all(needCheck.map((p) => probeOne(p)));
+
+  for (const p of platforms || []) {
+    if (p === "hellowork") {
+      results.hellowork = { loggedIn: true, reason: "skipped", platform: "hellowork" };
+    }
+  }
+
+  return { ok: true, results, needsLogin };
+}
+
+/** Mid-session login gate for LinkedIn / Glassdoor (Indeed uses handleIndeedLoginWall). */
+async function handlePlatformLoginRequired(platform, { url = "", reason = "", loginUrl = "" } = {}) {
+  if (platform === "indeed") {
+    return handleIndeedLoginWall(null, url);
+  }
+  if (platform !== "linkedin" && platform !== "glassdoor") {
+    return { ok: false, reason: "unsupported_platform" };
+  }
+  const key = SESSION_KEYS[platform];
+  const data = await chrome.storage.local.get(["amijobsMeta", key]);
+  const meta = data.amijobsMeta || {};
+  const session = data[key];
+  const flagKey = `${platform}LoginRequired`;
+  const already = !!meta[flagKey];
+  await chrome.storage.local.set({
+    amijobsMeta: {
+      ...meta,
+      [flagKey]: true,
+      [`${platform}LoginAt`]: meta[`${platform}LoginAt`] || new Date().toISOString(),
+      [`${platform}LoginUrl`]: loginUrl || platformLoginUrl(platform),
+      [`${platform}LoginReason`]: reason || "",
+    },
+  });
+  if (session?.active) {
+    await chrome.storage.local.set({
+      [key]: {
+        ...session,
+        pausedForLogin: true,
+        lastRunAt: Date.now(),
+        runLockAt: 0,
+      },
+    });
+  }
+  if (!already) {
+    const label = platform === "linkedin" ? "LinkedIn" : "Glassdoor";
+    await appendLog(
+      `Connexion ${label} requise — connectez-vous dans l'onglet puis relancez (Login required)`,
+      "warn",
+      platform
+    );
+  }
+  return { ok: true, paused: true };
+}
+
+function collectLoginRequiredFromState(amijobsMeta = {}, sessions = {}) {
+  const items = [];
+  if (amijobsMeta?.indeedLoginRequired || sessions.sessionIndeed?.pausedForLogin) {
+    items.push({
+      platform: "indeed",
+      loginUrl: platformLoginUrl("indeed"),
+      reason: "mid_session",
+      midSession: true,
+    });
+  }
+  if (amijobsMeta?.linkedinLoginRequired || sessions.sessionLinkedin?.pausedForLogin) {
+    items.push({
+      platform: "linkedin",
+      loginUrl: amijobsMeta.linkedinLoginUrl || platformLoginUrl("linkedin"),
+      reason: amijobsMeta.linkedinLoginReason || "mid_session",
+      midSession: true,
+    });
+  }
+  if (amijobsMeta?.glassdoorLoginRequired || sessions.sessionGlassdoor?.pausedForLogin) {
+    items.push({
+      platform: "glassdoor",
+      loginUrl: amijobsMeta.glassdoorLoginUrl || platformLoginUrl("glassdoor"),
+      reason: amijobsMeta.glassdoorLoginReason || "mid_session",
+      midSession: true,
+    });
+  }
+  return items;
+}
+
 function detectPlatformFromUrl(url = "") {
   const raw = String(url || "");
   if (!raw || raw.startsWith("chrome") || raw.startsWith("about:")) return null;
@@ -626,7 +943,37 @@ async function persistPlatformWindowIds() {
     const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
     if (!amijobsMeta) return;
     await chrome.storage.local.set({
-      amijobsMeta: { ...amijobsMeta, platformWindowIds: { ...platformWindowIds } },
+      amijobsMeta: {
+        ...amijobsMeta,
+        platformWindowIds: { ...platformWindowIds },
+        platformTabIds: { ...platformTabIds },
+      },
+    });
+  } catch (_e) {}
+}
+
+function rememberPlatformTab(platform, tabId) {
+  if (!platform || tabId == null) return;
+  platformTabIds[platform] = tabId;
+}
+
+async function clearPlatformWindowMemory(platforms = null) {
+  const list = Array.isArray(platforms) && platforms.length ? platforms : SUPPORTED_PLATFORMS;
+  for (const p of list) {
+    delete platformWindowIds[p];
+    delete platformTabIds[p];
+  }
+  try {
+    const { amijobsMeta } = await chrome.storage.local.get(["amijobsMeta"]);
+    if (!amijobsMeta) return;
+    const nextWin = { ...(amijobsMeta.platformWindowIds || {}) };
+    const nextTab = { ...(amijobsMeta.platformTabIds || {}) };
+    for (const p of list) {
+      delete nextWin[p];
+      delete nextTab[p];
+    }
+    await chrome.storage.local.set({
+      amijobsMeta: { ...amijobsMeta, platformWindowIds: nextWin, platformTabIds: nextTab },
     });
   } catch (_e) {}
 }
@@ -720,6 +1067,7 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
             await chrome.tabs.update(keep.id, { active: true });
           } catch (_e) {}
         }
+        if (!wantApply) rememberPlatformTab(platform, keep.id);
         return keep.id;
       }
       // Never turn a SERP board tab into an apply URL
@@ -740,11 +1088,14 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
             active: !!active,
             ...(targetWindowId != null ? { windowId: targetWindowId } : {}),
           });
+          if (!wantApply && keep.id) rememberPlatformTab(platform, keep.id);
           return created?.id || keep.id;
         } catch (_e) {
+          rememberPlatformTab(platform, keep.id);
           return keep.id;
         }
       }
+      if (!wantApply) rememberPlatformTab(platform, keep.id);
       return keep.id;
     }
 
@@ -755,6 +1106,7 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
         active: !!active,
         ...(targetWindowId != null ? { windowId: targetWindowId } : {}),
       });
+      if (created?.id != null && !wantApply) rememberPlatformTab(platform, created.id);
       return created?.id || null;
     } catch (_e) {
       return null;
@@ -783,6 +1135,7 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
           await chrome.tabs.update(keep.id, { active: true });
         } catch (_e) {}
       }
+      rememberPlatformTab(platform, keep.id);
       return keep.id;
     }
     if (forceNavigate && url && keep.url !== url) patch.url = url;
@@ -793,6 +1146,7 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
         /* ignore */
       }
     }
+    rememberPlatformTab(platform, keep.id);
     return keep.id;
   }
 
@@ -803,6 +1157,7 @@ async function ensureSinglePlatformTab(platform, url, { active = false, forceNav
       active: !!active,
       ...(targetWindowId != null ? { windowId: targetWindowId } : {}),
     });
+    if (created?.id != null) rememberPlatformTab(platform, created.id);
     return created?.id || null;
   } catch (_e) {
     return null;
@@ -925,42 +1280,142 @@ async function enforceOneTabPerPlatform(reason = "") {
   }
 }
 
+async function openPlatformWindowWithRetry(platform, url, { focused = false, left = 40, top = 40 } = {}) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const win = await chrome.windows.create({
+        url,
+        type: "normal",
+        focused: !!focused,
+        width: 1180,
+        height: 900,
+        left,
+        top,
+      });
+      if (win?.id != null) {
+        platformWindowIds[platform] = win.id;
+        const tabId = win.tabs?.[0]?.id;
+        if (tabId != null) rememberPlatformTab(platform, tabId);
+        await persistPlatformWindowIds();
+        await appendLog(
+          `Fenêtre ${platform}: créée id=${win.id} tab=${tabId ?? "?"} (tentative ${attempt})`,
+          "success",
+          platform
+        );
+        return { ok: true, windowId: win.id, tabId: tabId ?? null, attempt };
+      }
+      lastErr = new Error("windows.create_no_id");
+    } catch (e) {
+      lastErr = e;
+      await appendLog(
+        `Fenêtre ${platform}: windows.create échec tentative ${attempt} (${String(e?.message || e)})`,
+        "warn",
+        platform
+      );
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 280));
+    }
+  }
+  return { ok: false, error: lastErr };
+}
+
 async function openPlatformTabs(urls, platforms) {
   const ordered = Array.isArray(platforms) && platforms.length
     ? platforms.filter((p) => SUPPORTED_PLATFORMS.includes(p) && urls[p])
     : SUPPORTED_PLATFORMS.filter((p) => urls[p]);
 
-  // 2+ boards → one Chrome window each so both stay visible and can apply together
+  await appendLog(
+    `Ouverture multi-board: ${ordered.length} plateforme(s) sélectionnée(s) → ${ordered.join(", ") || "(aucune)"}`,
+    "info"
+  );
+
+  // 2+ boards → one Chrome window each (must stay reliable even if Exit/login fail later)
   const useWindows = ordered.length >= 2;
   let first = true;
   let left = 40;
+  let openedWindows = 0;
+  let openedTabs = 0;
+  const results = [];
+
   for (const p of ordered) {
-    if (!urls[p]) continue;
+    if (!urls[p]) {
+      results.push({ platform: p, mode: "skip", reason: "no_url" });
+      continue;
+    }
     if (useWindows) {
-      try {
-        const win = await chrome.windows.create({
-          url: urls[p],
-          type: "normal",
-          focused: first,
-          width: 1180,
-          height: 900,
-          left,
-          top: 40,
-        });
-        if (win?.id != null) {
-          platformWindowIds[p] = win.id;
+      const created = await openPlatformWindowWithRetry(p, urls[p], {
+        focused: first,
+        left,
+        top: 40,
+      });
+      if (created.ok) {
+        openedWindows += 1;
+        if (created.tabId != null) openedTabs += 1;
+        results.push({ platform: p, mode: "window", windowId: created.windowId, tabId: created.tabId });
+      } else {
+        await appendLog(
+          `Fenêtre ${p}: échec définitif — fallback onglet (${String(created.error?.message || created.error || "unknown")})`,
+          "warn",
+          p
+        );
+        try {
+          const tabId = await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
+          if (tabId != null) {
+            rememberPlatformTab(p, tabId);
+            openedTabs += 1;
+            await persistPlatformWindowIds();
+          }
+          results.push({ platform: p, mode: "tab_fallback", tabId: tabId ?? null });
+        } catch (e2) {
+          await appendLog(
+            `Onglet ${p}: fallback aussi en échec (${String(e2?.message || e2)})`,
+            "error",
+            p
+          );
+          results.push({ platform: p, mode: "failed", error: String(e2?.message || e2) });
         }
-        left += 60;
-      } catch (_e) {
-        await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
       }
+      left += 72;
+      // Pause so Chrome does not coalesce / drop rapid window.create calls
+      await new Promise((r) => setTimeout(r, first ? 220 : 320));
     } else {
-      await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
+      try {
+        const tabId = await ensureSinglePlatformTab(p, urls[p], { active: first, forceNavigate: true });
+        if (tabId != null) {
+          rememberPlatformTab(p, tabId);
+          openedTabs += 1;
+          await persistPlatformWindowIds();
+        }
+        results.push({ platform: p, mode: "tab", tabId: tabId ?? null });
+        await appendLog(`Onglet ${p}: ouvert tab=${tabId ?? "?"}`, "info", p);
+      } catch (e) {
+        await appendLog(`Onglet ${p}: échec (${String(e?.message || e)})`, "error", p);
+        results.push({ platform: p, mode: "failed", error: String(e?.message || e) });
+      }
     }
     first = false;
   }
-  if (useWindows) await persistPlatformWindowIds();
-  await enforceOneTabPerPlatform("démarrage session");
+
+  await persistPlatformWindowIds();
+  if (useWindows) {
+    await appendLog(
+      `Fenêtres ouvertes: ${openedWindows}/${ordered.length} · onglets suivis: ${openedTabs} (${ordered.join(", ")})`,
+      openedWindows === ordered.length ? "success" : "warn"
+    );
+  } else {
+    await appendLog(
+      `Onglets ouverts: ${openedTabs}/${ordered.length} (${ordered.join(", ")})`,
+      openedTabs === ordered.length ? "success" : "warn"
+    );
+  }
+
+  try {
+    await enforceOneTabPerPlatform("démarrage session");
+  } catch (e) {
+    await appendLog(`enforceOneTabPerPlatform: ${String(e?.message || e)}`, "warn");
+  }
+
+  return { ok: openedWindows + openedTabs > 0 || ordered.length === 0, useWindows, openedWindows, openedTabs, ordered, results };
 }
 
 async function navigatePlatformTab(platform, url) {
@@ -1958,10 +2413,13 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         title: sessionGlassdoor.currentTitle,
         company: sessionGlassdoor.currentCompany,
       };
+      // Tab/wizard opened is NOT an applied success — keep awaitingIndeed until
+      // Indeed marks applied or fails (indeedHandoffDone stays false until then).
       await chrome.storage.local.set({
         sessionGlassdoor: {
           ...sessionGlassdoor,
-          indeedHandoffDone: true,
+          indeedTabOpened: true,
+          indeedHandoffDone: false,
           awaitingIndeed: true,
           lastRunAt: Date.now(),
         },
@@ -2066,7 +2524,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         await chrome.storage.local.set({
           sessionGlassdoor: {
             ...sessionGlassdoor,
-            indeedHandoffDone: true,
+            indeedTabOpened: true,
+            indeedHandoffDone: false,
             awaitingIndeed: true,
           },
         });
@@ -2319,8 +2778,9 @@ async function seedCaptchaApiKeysFromSecrets() {
  *  TTL must outlast slow 2captcha (workers fail + recreate can take 3–6 min).
  *  Fairness: after release, prefer the other board so applies interleave. */
 const SMART_APPLY_LOCK_TTL_MS = 420000;
-// After A finishes, give B ~45s to start its next Smart Apply (SERP→click→wizard)
-const SMART_APPLY_FAIR_MS = 35000;
+// After A finishes, give B a short window to claim the next Smart Apply.
+// Keep this short so Glassdoor is not starved while Indeed holds fairness.
+const SMART_APPLY_FAIR_MS = 14000;
 
 async function peekSmartApplyLock(ttlMs = SMART_APPLY_LOCK_TTL_MS) {
   const { amijobsSmartApplyLock = null } = await chrome.storage.local.get(["amijobsSmartApplyLock"]);
@@ -2808,14 +3268,24 @@ async function ensureExitSession() {
   }
   stopExitSessionLocal();
   const deviceId = await getOrCreateDeviceId();
-  const res = await fetch(`${AMIJOBS_EXIT_BASE}/v1/session`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-AmiJobs-Gate": AMIJOBS_EXIT_GATE,
-    },
-    body: JSON.stringify({ deviceId }),
-  });
+  // Hard timeout — unbounded fetch used to block openPlatformTabs on Start
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const abortTimer = controller ? setTimeout(() => controller.abort(), 6000) : null;
+  let res;
+  try {
+    res = await fetch(`${AMIJOBS_EXIT_BASE}/v1/session`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-AmiJobs-Gate": AMIJOBS_EXIT_GATE,
+      },
+      body: JSON.stringify({ deviceId }),
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } finally {
+    if (abortTimer) clearTimeout(abortTimer);
+  }
+  if (!res) throw new Error("exit_session_timeout");
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data?.ok || !data.sessionId) {
     throw new Error(data?.reason || `exit_session_http_${res.status}`);
@@ -3643,6 +4113,13 @@ async function getState() {
     await chrome.storage.local.set({ autoApplySettings });
   }
 
+  const amijobsMeta = data.amijobsMeta || null;
+  const loginRequired = collectLoginRequiredFromState(amijobsMeta || {}, {
+    sessionLinkedin,
+    sessionIndeed,
+    sessionGlassdoor,
+  });
+
   return {
     enabled: data.enabled !== false,
     stats: data.stats || { applied: 0, skipped: 0, errors: 0, lastRun: null },
@@ -3655,7 +4132,8 @@ async function getState() {
     lastSessionLinkedin: data.lastSessionLinkedin || null,
     lastSessionIndeed: data.lastSessionIndeed || null,
     lastSessionGlassdoor: data.lastSessionGlassdoor || null,
-    amijobsMeta: data.amijobsMeta || null,
+    amijobsMeta,
+    loginRequired,
     activePlatforms,
     sessionActive: activePlatforms.length > 0,
     profile: data.profile || { ...DEFAULT_PROFILE },
@@ -4067,8 +4545,11 @@ async function startMultiSession(msg) {
     maxJobs,
     startedAt: new Date().toISOString(),
     indeedLoginRequired: false,
+    linkedinLoginRequired: false,
+    glassdoorLoginRequired: false,
     parallelSmartApply: parallelDual,
     platformWindowIds: {},
+    platformTabIds: {},
   };
 
   const updates = { amijobsMeta, enabled: true };
@@ -4097,6 +4578,8 @@ async function startMultiSession(msg) {
     updates.sessionLinkedin = emptyPlatformSession("linkedin", {
       ...common,
       searchUrl,
+      onlyEasyApply: settings.onlyEasyApply !== false,
+      allowExternalApply: settings.allowExternalApply === true,
     });
   }
 
@@ -4131,21 +4614,22 @@ async function startMultiSession(msg) {
   updates.amijobsSmartApplyOwners = {};
 
   await chrome.storage.local.set(updates);
-  // Reset reopen storm counters for this run
+  // Reset reopen storm counters + window memory for this run
   for (const p of platforms) {
     platformReopenCount[p] = 0;
     lastPlatformReopenAt[p] = 0;
     delete platformWindowIds[p];
+    delete platformTabIds[p];
   }
-  try {
-    await ensureExitSession();
-  } catch (e) {
-    await appendLog(`Exit AmiJobs: connexion différée (${String(e?.message || e)})`, "warn");
-  }
+
   await appendLog(
     `Session AmiJobs démarrée (${platforms.join(" + ")}): "${keywords}" @ "${locationsOrEmpty.join(", ")}"` +
       (contracts.length ? ` [${contracts.join(", ")}]` : ""),
     "success"
+  );
+  await appendLog(
+    `Start multi: platforms=${platforms.join(",")} count=${platforms.length} → ${platforms.length >= 2 ? "1 fenêtre / board" : "onglet unique"}`,
+    "info"
   );
   if (platforms.includes("indeed") || platforms.includes("glassdoor")) {
     const boards = boardsForQuery(location);
@@ -4161,16 +4645,41 @@ async function startMultiSession(msg) {
     );
   }
 
-  // Open both boards; kick Indeed + Glassdoor together (no first-board starvation)
+  // Open windows FIRST — login soft-checks / Exit tunnel / captcha must never block this
   const openOrder = [...platforms];
-  await openPlatformTabs(urls, openOrder);
+  let openResult = null;
+  try {
+    openResult = await openPlatformTabs(urls, openOrder);
+  } catch (e) {
+    await appendLog(
+      `openPlatformTabs erreur non fatale: ${String(e?.message || e)} — retry best-effort`,
+      "error"
+    );
+    try {
+      openResult = await openPlatformTabs(urls, openOrder);
+    } catch (e2) {
+      await appendLog(`openPlatformTabs retry échoué: ${String(e2?.message || e2)}`, "error");
+      openResult = { ok: false, error: String(e2?.message || e2) };
+    }
+  }
+
+  // Exit session is best-effort AFTER tabs/windows are visible
+  ensureExitSession().catch(async (e) => {
+    await appendLog(`Exit AmiJobs: connexion différée (${String(e?.message || e)})`, "warn");
+  });
 
   setTimeout(() => {
     // First kick must force-inject — tabs are fresh and may not have content scripts yet
     kickPlatformSessions(openOrder, { forceInject: true }).catch(() => {});
   }, 2000);
 
-  return { ok: true, urls, platforms };
+  return {
+    ok: true,
+    urls,
+    platforms,
+    open: openResult,
+    windowsExpected: platforms.length >= 2 ? platforms.length : 0,
+  };
 }
 
 async function isCloudflarePauseActive() {
@@ -4213,20 +4722,37 @@ async function kickPlatformSessions(platforms = [], { forceInject = false } = {}
         }
         if (forceInject || !pingOk) {
           try {
+            // Keep force-inject file lists aligned with manifest content_scripts
             if (platform === "glassdoor") {
               await chrome.scripting.executeScript({
                 target: { tabId: tab.id, allFrames: false },
-                files: ["content/shared-autofill.js", "content/glassdoor.js"],
+                files: [
+                  "content/geo-boards.js",
+                  "content/question-pref.js",
+                  "content/shared-autofill.js",
+                  "content/company-site.js",
+                  "content/glassdoor.js",
+                  "content/cloudflare-turnstile.js",
+                  "content/google-recaptcha.js",
+                ],
               });
             } else if (platform === "linkedin") {
               await chrome.scripting.executeScript({
                 target: { tabId: tab.id, allFrames: false },
-                files: ["content/linkedin.js"],
+                files: ["content/company-site.js", "content/linkedin.js"],
               });
             } else if (platform === "indeed") {
               await chrome.scripting.executeScript({
                 target: { tabId: tab.id, allFrames: false },
-                files: ["content/shared-autofill.js", "content/indeed.js"],
+                files: [
+                  "content/geo-boards.js",
+                  "content/question-pref.js",
+                  "content/shared-autofill.js",
+                  "content/company-site.js",
+                  "content/indeed.js",
+                  "content/cloudflare-turnstile.js",
+                  "content/google-recaptcha.js",
+                ],
               });
             }
           } catch (_e) {
@@ -4310,9 +4836,20 @@ function handleMessage(msg, sendResponse, sender = null) {
   }
 
   if (msg.action === "openPlatformTabs") {
-    openPlatformTabs(msg.urls || {}, msg.platforms || [])
-      .then(() => sendResponse({ ok: true }))
-      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    (async () => {
+      try {
+        const open = await openPlatformTabs(msg.urls || {}, msg.platforms || []);
+        const plats = open?.ordered || msg.platforms || [];
+        if (msg.kick !== false && plats.length) {
+          setTimeout(() => {
+            kickPlatformSessions(plats, { forceInject: true }).catch(() => {});
+          }, 1800);
+        }
+        sendResponse({ ok: true, open });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message || e) });
+      }
+    })();
     return true;
   }
 
@@ -4394,8 +4931,46 @@ function handleMessage(msg, sendResponse, sender = null) {
     return true;
   }
 
+  if (msg.action === "checkPlatformLogins") {
+    checkPlatformLogins(msg.platforms || [], msg.location || "")
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, needsLogin: [], results: {}, error: String(e?.message || e) }));
+    return true;
+  }
+
+  if (msg.action === "openPlatformLogin") {
+    (async () => {
+      const platform = msg.platform;
+      const url = msg.url || platformLoginUrl(platform, msg.location || "");
+      if (!url) {
+        sendResponse({ ok: false, reason: "no_url" });
+        return;
+      }
+      try {
+        await chrome.tabs.create({ url, active: true });
+        sendResponse({ ok: true, url });
+      } catch (e) {
+        sendResponse({ ok: false, reason: String(e?.message || e) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.action === "platformLoginRequired") {
+    handlePlatformLoginRequired(msg.platform, {
+      url: msg.url || "",
+      reason: msg.reason || "",
+      loginUrl: msg.loginUrl || "",
+    })
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
+
   if (msg.action === "startMultiSession" || msg.action === "startSession") {
-    startMultiSession(msg).then(sendResponse);
+    startMultiSession(msg)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, reason: String(e?.message || e) }));
     return true;
   }
 
@@ -4449,7 +5024,20 @@ function handleMessage(msg, sendResponse, sender = null) {
         sendResponse({ ok: false, reason: "no_last_session" });
         return;
       }
-      const resumed = { ...last, active: true, endedAt: undefined };
+      const { autoApplySettings = {} } = await chrome.storage.local.get(["autoApplySettings"]);
+      const settings = sanitizeSettings(autoApplySettings || DEFAULT_SETTINGS);
+      const resumed = {
+        ...last,
+        active: true,
+        endedAt: undefined,
+        // Restore Easy Apply flags so pagination/resume keep f_AL=true
+        onlyEasyApply:
+          last.onlyEasyApply !== undefined ? last.onlyEasyApply !== false : settings.onlyEasyApply !== false,
+        allowExternalApply:
+          last.allowExternalApply !== undefined
+            ? last.allowExternalApply === true
+            : settings.allowExternalApply === true,
+      };
       let targetUrl = "";
       if (platform === "hellowork") {
         targetUrl =
@@ -4461,19 +5049,42 @@ function handleMessage(msg, sendResponse, sender = null) {
       } else if (platform === "glassdoor") {
         targetUrl = resumed.searchUrl || buildGlassdoorSearchUrl(resumed.keywords, resumed.location, resumed.contracts);
       } else {
-        targetUrl = buildLinkedInSearchUrl(resumed.keywords, resumed.location, resumed.contracts);
+        // LinkedIn: prefer stored searchUrl (page + f_AL), else rebuild with flags + page
+        targetUrl =
+          resumed.searchUrl ||
+          buildLinkedInSearchUrl(resumed.keywords, resumed.location, resumed.contracts, {
+            onlyEasyApply: resumed.onlyEasyApply,
+            allowExternalApply: resumed.allowExternalApply,
+            page: resumed.currentPage || 0,
+            currentPage: resumed.currentPage || 0,
+          });
+        resumed.searchUrl = targetUrl;
+        resumed.currentPage = resumed.currentPage || 0;
       }
+
+      // Persist this board first, then union ALL currently-active boards (multi-resume)
+      await chrome.storage.local.set({ [activeKey]: resumed, enabled: true });
+      const sessionSnap = await chrome.storage.local.get([
+        "amijobsMeta",
+        "sessionHellowork",
+        "sessionLinkedin",
+        "sessionIndeed",
+        "sessionGlassdoor",
+      ]);
+      const activePlatforms = SUPPORTED_PLATFORMS.filter((p) => sessionSnap[SESSION_KEYS[p]]?.active);
       await chrome.storage.local.set({
-        [activeKey]: resumed,
         amijobsMeta: {
-          ...(data.amijobsMeta || {}),
+          ...(sessionSnap.amijobsMeta || data.amijobsMeta || {}),
           active: true,
-          platforms: [platform],
+          platforms: activePlatforms.length ? activePlatforms : [platform],
         },
-        enabled: true,
       });
-      await appendLog(`Session ${platform} reprise`, "success", platform);
-      sendResponse({ ok: true, targetUrl, platform });
+      await appendLog(
+        `Session ${platform} reprise (actives: ${(activePlatforms.length ? activePlatforms : [platform]).join(", ")})`,
+        "success",
+        platform
+      );
+      sendResponse({ ok: true, targetUrl, platform, platforms: activePlatforms });
     })();
     return true;
   }
@@ -5249,7 +5860,7 @@ function handleMessage(msg, sendResponse, sender = null) {
         if (!tab.id) continue;
         if (
           url.includes("hellowork.com") ||
-          url.includes("linkedin.com/jobs") ||
+          url.includes("linkedin.com") ||
           /indeed\./i.test(url) ||
           url.includes("smartapply.indeed.com") ||
           /glassdoor\./i.test(url)
@@ -5257,10 +5868,19 @@ function handleMessage(msg, sendResponse, sender = null) {
           chrome.tabs.sendMessage(tab.id, { action: "stopAutoApply" }).catch(() => {});
         }
       }
+      // Also ping remembered platform tabs (URL may still be about:blank / loading)
+      for (const p of SUPPORTED_PLATFORMS) {
+        const tid = platformTabIds[p];
+        if (tid != null) {
+          chrome.tabs.sendMessage(tid, { action: "stopAutoApply" }).catch(() => {});
+        }
+      }
       const platforms = await getActivePlatforms();
       for (const p of platforms) await endPlatformSession(p, "Arrêt demandé");
+      await clearPlatformWindowMemory();
       await stopExitSession().catch(() => {});
-      sendResponse({ ok: true });
+      await appendLog("Arrêt multi-plateformes demandé (toutes sessions)", "warn");
+      sendResponse({ ok: true, stopped: platforms });
     })();
     return true;
   }

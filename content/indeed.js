@@ -1,10 +1,60 @@
 // AmiJobs — Indeed auto-apply content script (phase-based, v1.2.7)
 (function () {
+  const PLATFORM = "indeed";
+  const VERSION = "1.6.3";
+  const INDEED_LOGIN_URL = "https://secure.indeed.com/auth";
+
+  function checkLoginStateQuick() {
+    try {
+      const u = new URL(location.href);
+      const host = u.hostname || "";
+      const path = u.pathname || "";
+      if (/(^|\.)secure\.indeed\.com$/i.test(host) && /^\/(auth|account|login)/i.test(path)) {
+        return { loggedIn: false, reason: "login_wall_url", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL };
+      }
+      if (/(^|\.)account\.indeed\.com$/i.test(host)) {
+        return { loggedIn: false, reason: "account_host", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL };
+      }
+      if (/\/account\/login\b|\/m\/login\b/i.test(path + u.search)) {
+        return { loggedIn: false, reason: "login_path", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL };
+      }
+    } catch (_e) {}
+    return null;
+  }
+
+  window.__AmijobsCheckLogin = function () {
+    if (typeof window.__AmijobsIndeedCheckLoginFull === "function") {
+      try {
+        return window.__AmijobsIndeedCheckLoginFull();
+      } catch (_e) {}
+    }
+    const quick = checkLoginStateQuick();
+    if (quick) return quick;
+    // Before full script loads: do not claim logged-out (false-blocked Start)
+    return {
+      loggedIn: true,
+      reason: "unknown_optimistic",
+      platform: PLATFORM,
+      loginUrl: INDEED_LOGIN_URL,
+      uncertain: true,
+    };
+  };
+
+  if (!window.__AmijobsIndeedLoginMsg) {
+    window.__AmijobsIndeedLoginMsg = true;
+    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (msg.action !== "CHECK_LOGIN") return;
+      try {
+        sendResponse(window.__AmijobsCheckLogin());
+      } catch (_e) {
+        sendResponse({ loggedIn: false, reason: "error", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL });
+      }
+    });
+  }
+
   if (window.__AmijobsIndeedLoaded) return;
   window.__AmijobsIndeedLoaded = true;
 
-  const PLATFORM = "indeed";
-  const VERSION = "1.5.7";
   const S = () => window.AmiJobsShared;
   let isRunning = false;
   let shouldStop = false;
@@ -259,7 +309,15 @@
   function isLoginWallPage(url = window.location.href) {
     try {
       const u = new URL(url, location.href);
-      return /(^|\.)secure\.indeed\.com$/i.test(u.hostname) && /^\/(auth|account)/i.test(u.pathname);
+      const host = u.hostname || "";
+      const path = u.pathname || "";
+      if (/(^|\.)secure\.indeed\.com$/i.test(host) && /^\/(auth|account|login)/i.test(path)) return true;
+      // Auth interstitial sometimes lands on account.indeed / login paths
+      if (/(^|\.)account\.indeed\.com$/i.test(host)) return true;
+      if (/\/account\/login\b|\/auth\/|\/oauth\/|\/m\/login\b/i.test(path + u.search)) return true;
+      // continue= pointing at Smart Apply while still on secure host
+      if (/(^|\.)secure\.indeed\.com$/i.test(host) && /[?&]continue=/i.test(u.search || "")) return true;
+      return false;
     } catch (_e) {
       return false;
     }
@@ -603,8 +661,12 @@
       text.includes("sign in to continue") ||
       text.includes("create an account to continue") ||
       text.includes("créez un compte pour continuer") ||
+      text.includes("connectez-vous pour postuler") ||
+      text.includes("sign in to apply") ||
+      text.includes("log in to continue") ||
+      text.includes("se connecter pour continuer") ||
       !!document.querySelector(
-        'form[action*="login"] input[type="password"], #login-email-input, input[name="__email"]'
+        'form[action*="login"] input[type="password"], #login-email-input, input[name="__email"], input[type="password"][name*="password" i]'
       );
     if (!hardGate) return false;
     // If job cards are visible, we are not on a login wall
@@ -615,12 +677,84 @@
     // Avoid false positives on normal Indeed chrome — only secure/auth-like pages
     try {
       const host = location.hostname || "";
-      if (!/(^|\.)secure\.indeed\.com$/i.test(host) && !/\/(auth|login|account)\b/i.test(location.pathname || "")) {
+      const path = location.pathname || "";
+      if (
+        !/(^|\.)secure\.indeed\.com$/i.test(host) &&
+        !/(^|\.)account\.indeed\.com$/i.test(host) &&
+        !/\/(auth|login|account)\b/i.test(path) &&
+        !/smartapply\.indeed\.com/i.test(host)
+      ) {
         return false;
+      }
+      // Smart Apply page with a password form = login gate mid-wizard
+      if (/smartapply\.indeed\.com/i.test(host) && document.querySelector('input[type="password"]')) {
+        return true;
       }
     } catch (_e) {}
     return true;
   }
+
+  function checkLoginState() {
+    if (isLoginWallPage() || detectLoginWall()) {
+      return { loggedIn: false, reason: "login_wall", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL };
+    }
+    const text = String(document.body?.innerText || "").slice(0, 3500);
+    const welcome = /Bienvenue,\s*\S+/i.test(text) || /Welcome,\s*\S+/i.test(text);
+    const accountMenu = !!document.querySelector(
+      [
+        '[data-tn-element="accountMenu"]',
+        "#accountMenu",
+        '[data-testid="account-menu"]',
+        'button[aria-label*="Account" i]',
+        'button[aria-label*="Compte" i]',
+        'a[href*="account/profile"]',
+        'a[href*="/secure/account"]',
+        '[data-gnav-element-name="AccountMenu"]',
+      ].join(", ")
+    );
+    if (welcome || accountMenu) {
+      return {
+        loggedIn: true,
+        reason: welcome ? "welcome" : "account_menu",
+        platform: PLATFORM,
+        loginUrl: INDEED_LOGIN_URL,
+      };
+    }
+
+    const signInLinks = [
+      ...document.querySelectorAll('a[href*="secure.indeed.com/auth"], a[href*="/account/login"], a[href*="secure.indeed.com/account"]'),
+    ];
+    const signInVisible = signInLinks.some((a) => {
+      try {
+        const st = window.getComputedStyle(a);
+        if (st.display === "none" || st.visibility === "hidden") return false;
+        const label = String(a.textContent || a.getAttribute("aria-label") || "");
+        return /sign in|log in|se connecter|connexion|identifiez/i.test(label) || /\/auth/i.test(a.href || "");
+      } catch (_e) {
+        return true;
+      }
+    });
+
+    const hasJobs =
+      (typeof collectJobCards === "function" && collectJobCards().length > 0) ||
+      !!document.querySelector("#mosaic-provider-jobcards, .jobsearch-ResultsList, ul#job-results-list, [data-jk]");
+
+    if (signInVisible && !accountMenu && !welcome) {
+      return { loggedIn: false, reason: "signin_link", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL };
+    }
+    if (hasJobs && !signInVisible) {
+      return { loggedIn: true, reason: "jobs_no_signin", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL };
+    }
+    // Absence of auth wall on a normal Indeed page → treat as logged in enough to start
+    if (!signInVisible && !isLoginWallPage()) {
+      return { loggedIn: true, reason: "no_auth_wall", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL };
+    }
+    // Uncertain — pre-start fail-open (mid-session wall still catches real auth)
+    return { loggedIn: true, reason: "unknown_optimistic", platform: PLATFORM, loginUrl: INDEED_LOGIN_URL, uncertain: true };
+  }
+
+  window.__AmijobsIndeedCheckLoginFull = checkLoginState;
+  window.__AmijobsCheckLogin = checkLoginState;
 
   function detectNoResultsPage() {
     const text = document.body?.innerText?.toLowerCase() || "";
@@ -1199,9 +1333,24 @@
 
   async function waitForApplyButton(timeoutMs = 2800) {
     // Easy Apply / candidature simplifiée only — ignore "Continuer pour postuler"
+    // When the job panel is still hydrating (data-indeed-apply-jk shell), wait longer.
+    let effectiveTimeout = timeoutMs;
+    try {
+      const hydrating =
+        !!document.querySelector("[data-indeed-apply-jk]") ||
+        !!document.querySelector(
+          "#jobsearch-ViewjobButtons-container, #jobsearch-ViewJobButtons-container, [class*='indeed-apply-status']"
+        ) ||
+        (isViewJobPage() &&
+          !!document.querySelector(
+            "[data-testid='jobsearch-JobInfoHeader-title'], .jobsearch-JobInfoHeader-title, #jobsearch-ViewjobPaneWrapper"
+          ));
+      if (hydrating && effectiveTimeout < 8000) effectiveTimeout = S().randomDelay(8000, 12000);
+    } catch (_e) {}
+
     const start = Date.now();
     let dismissed = false;
-    while (Date.now() - start < timeoutMs) {
+    while (Date.now() - start < effectiveTimeout) {
       if (!dismissed || Date.now() - start < 900) {
         dismissed = (await dismissIndeedPopups().catch(() => false)) || dismissed;
       }
@@ -1213,6 +1362,11 @@
       const easy = findIndeedEasyApplyButton({ allowLoading: true });
       if (easy && !isApplyCtaLoading(easy) && isIndeedEasyApplyLabel(applyCtaLabel(easy))) {
         return easy;
+      }
+      // Still loading — keep waiting instead of giving up early
+      if (easy && isApplyCtaLoading(easy)) {
+        await humanSleep(200, 400);
+        continue;
       }
       await humanSleep(120, 280);
     }
@@ -1486,53 +1640,56 @@
       }
     }
 
-    // When Indeed CV is down, skip radios and upload AmiJobs CV immediately
-    if (needsForcedCvUpload()) {
-      const ok = await uploadCvFallback();
-      if (ok) return true;
-      const cv = await S().getCvFile();
-      if (!cv?.base64) {
-        S().log(PLATFORM, "CV fichier manquant (Options → CV) — upload requis", "error");
-      } else {
-        S().log(PLATFORM, "Échec upload CV sur resume-selection", "warn");
+    const cvEarly = await S().getCvFile();
+    const hasConfiguredCv = !!(cvEarly?.base64);
+
+    // 1) Prefer Indeed-hosted resume radio (fast path when account already has a CV)
+    if (!needsForcedCvUpload()) {
+      const label =
+        S().$('[data-testid="resume-selection-file-resume-radio-card-label"]') ||
+        S().$('[data-testid="resume-selection-file-resume-radio-card"]') ||
+        S().$('[data-testid="resume-selection-radio-card-group"] label') ||
+        S().$('[data-testid*="resume-selection"][data-testid*="radio"] label') ||
+        S().$('label[data-testid*="resume"]');
+      if (label && S().isVisible(label)) {
+        await S().humanClick(label);
+        await S().sleep(450);
+        if (resumeLooksReady()) return true;
       }
+      const radio =
+        S().$('[data-testid="resume-selection-file-resume-radio-card-input"]') ||
+        S().$('input[type="radio"][name="resume-selection"]') ||
+        S().$('input[type="radio"][name*="resume"]') ||
+        S().$('input[type="radio"][id*="resume" i]');
+      if (radio) {
+        try {
+          radio.checked = true;
+          radio.dispatchEvent(new Event("input", { bubbles: true }));
+          radio.dispatchEvent(new Event("change", { bubbles: true }));
+          const wrap = radio.closest('[data-testid*="resume"]') || radio.parentElement;
+          if (wrap) await S().humanClick(wrap);
+        } catch (_e) {
+          /* ignore */
+        }
+        await S().sleep(450);
+        if (resumeLooksReady()) return true;
+      }
+    }
+
+    // 2) File upload path (forced when Indeed CV is down, or radio did not stick)
+    if (!hasConfiguredCv) {
+      S().log(
+        PLATFORM,
+        "Aucun CV configuré (Options → CV) — impossible de continuer la candidature Indeed",
+        "error"
+      );
       return false;
     }
-
-    // Live DOM: resume-selection-file-resume-radio-card (+ label/input)
-    const label =
-      S().$('[data-testid="resume-selection-file-resume-radio-card-label"]') ||
-      S().$('[data-testid="resume-selection-file-resume-radio-card"]') ||
-      S().$('[data-testid="resume-selection-radio-card-group"] label') ||
-      S().$('label[data-testid*="resume"]');
-    if (label && S().isVisible(label)) {
-      await S().humanClick(label);
-      await S().sleep(400);
-      if (resumeLooksReady()) return true;
-      await uploadCvFallback();
-      return resumeLooksReady();
-    }
-    const radio =
-      S().$('[data-testid="resume-selection-file-resume-radio-card-input"]') ||
-      S().$('input[type="radio"][name="resume-selection"]') ||
-      S().$('input[type="radio"][name*="resume"]');
-    if (radio) {
-      try {
-        radio.checked = true;
-        radio.dispatchEvent(new Event("input", { bubbles: true }));
-        radio.dispatchEvent(new Event("change", { bubbles: true }));
-        const wrap = radio.closest('[data-testid*="resume"]') || radio.parentElement;
-        if (wrap) await S().humanClick(wrap);
-      } catch (_e) {
-        /* ignore */
-      }
-      await S().sleep(400);
-      if (resumeLooksReady()) return true;
-      await uploadCvFallback();
-      return resumeLooksReady();
-    }
-
-    return await uploadCvFallback();
+    if (cvEarly?.name) window.__AmijobsResumeFileName = cvEarly.name;
+    const ok = await uploadCvFallback();
+    if (ok || resumeLooksReady()) return true;
+    S().log(PLATFORM, "Échec sélection/upload CV sur resume-selection", "warn");
+    return false;
   }
 
   // Upload AmiJobs CV to hidden file inputs (Indeed FR "Sélectionner un fichier").
@@ -2295,12 +2452,25 @@
 
     const testIds = [
       '[data-testid="continue-button"]',
+      '[data-testid="submit-application-button"]',
+      '[data-testid="submit-application"]',
       '[data-testid^="hp-continue-button"]',
       '[data-testid="resume-selection-continue-button"]',
+      '[data-testid*="continue-button" i]',
+      '[data-testid*="ContinueButton" i]',
+      'button[data-testid*="continue" i]',
+      'button.ia-continueButton',
+      'button.ia-Button--primary',
     ];
     for (const sel of testIds) {
       for (const el of S().$$(sel)) {
-        if (!S().isVisible(el) || el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+        if (!isDisplayed(el) || el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+        const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.replace(/\s+/g, " ").trim();
+        if (/continuer (pour |à )?postuler|continue (to )?apply|company site|site de l/i.test(text)) continue;
+        // submit-application* testids → treat as submit even if short label
+        if (/submit-application/i.test(sel) || /d[ée]poser|soumettre|submit|envoyer/i.test(text)) {
+          return { el, kind: "submit" };
+        }
         return { el, kind: "next" };
       }
     }
@@ -2312,12 +2482,15 @@
       /^suivant$/i,
       /^examiner ma candidature$/i,
       /^review my application$/i,
+      /^continuer vers l['’]aperçu$/i,
+      /^voir l['’]aperçu$/i,
       /^modifier$/i,
       /review( your)?( application)?/i,
       /vérifier/i,
       /examiner/i,
       /enregistrer et continuer/i,
       /save and continue/i,
+      /continuer et postuler/i,
     ];
 
     const buttons = S().$$("button, a[role='button'], input[type='submit'], [role='button']");
@@ -3283,9 +3456,11 @@
         const cvMeta = await S().getCvFile();
         if (cvMeta?.name) window.__AmijobsResumeFileName = cvMeta.name;
         const ready = await clickResumeIfNeeded();
-        if (!ready || !resumeFileUiAccepted(cvMeta?.name || "")) {
-          if (!cvMeta?.base64) {
-            S().log(PLATFORM, "Skip — aucun CV fichier dans Options (Indeed CV indisponible)", "error");
+        const fileOk = resumeFileUiAccepted(cvMeta?.name || "");
+        const radioOk = resumeLooksReady() && !needsForcedCvUpload();
+        if (!ready) {
+          if (!cvMeta?.base64 && !resumeOptionalWithoutCv()) {
+            S().log(PLATFORM, "Skip — aucun CV configuré (Options → CV)", "error");
             return { success: false, reason: "no_cv_file" };
           }
           resumeUploadAttempts += 1;
@@ -3295,12 +3470,12 @@
           }
           // Don't spam Continuer — Indeed shows "Sélectionnez un fichier pour continuer"
           S().log(PLATFORM, `Attente upload CV (essai ${resumeUploadAttempts}) — pas de Continuer`, "warn");
-          await uploadCvFallback();
+          if (cvMeta?.base64) await uploadCvFallback();
           await S().sleep(1500);
           continue;
         }
-        // Indeed FR continue after picking/uploading resume — only if UI shows filename
-        if (resumeUploadErrorVisible() || !resumeFileUiAccepted(cvMeta?.name || "")) {
+        // Accept Indeed radio OR uploaded filename UI
+        if (resumeUploadErrorVisible() || (!fileOk && !radioOk)) {
           S().log(PLATFORM, "CV pas encore accepté par Indeed — skip Continuer", "warn");
           await S().sleep(1000);
           continue;
@@ -3308,7 +3483,11 @@
         const cont =
           S().$('[data-testid="resume-selection-continue-button"]') ||
           S().$('[data-testid="continue-button"]') ||
-          [...S().$$("button")].find((b) => /^continuer$/i.test((b.textContent || "").trim()));
+          [...S().$$("button")].find(
+            (b) =>
+              isDisplayed(b) &&
+              /^(continuer|continue|suivant|next)$/i.test((b.textContent || "").trim())
+          );
         if (cont && S().isVisible(cont) && !cont.disabled) {
           if (resumeContinueClicks >= 6) {
             S().log(PLATFORM, "Resume-selection bloqué après plusieurs Continuer — abandon offre", "error");
@@ -3767,12 +3946,18 @@
       return { success: false, reason: "already_applied_ui" };
     }
 
-    const btn = await waitForApplyButton();
+    // Longer wait when viewjob / apply shell is hydrating
+    const panelHydrating = !!(
+      document.querySelector("[data-indeed-apply-jk]") ||
+      document.querySelector("#jobsearch-ViewjobButtons-container, #jobsearch-ViewJobButtons-container")
+    );
+    const btn = await waitForApplyButton(panelHydrating || isViewJobPage() ? S().randomDelay(9000, 12000) : undefined);
     if (!btn) {
       if (detectAlreadyAppliedUi()) return { success: false, reason: "already_applied_ui" };
       // Easy Apply only for now — skip company-site / "Continuer pour postuler"
-      if (findContinueToApplyButton()) {
-        S().log(PLATFORM, "Offre sans candidature simplifiée — ignorée", "warn");
+      if (findContinueToApplyButton() || panelShowsNonEasyApplyOnly()) {
+        S().log(PLATFORM, "Offre sans candidature simplifiée (site entreprise) — ignorée", "warn");
+        return { success: false, reason: "no_indeed_apply" };
       }
       return { success: false, reason: "no_indeed_apply" };
     }
@@ -5157,12 +5342,21 @@
             S().log(PLATFORM, "En attente de connexion Indeed…", "warn");
             return;
           }
-          if (isSearchPage() || isSmartApplyPage() || isViewJobPage()) {
+          // Logged-in again: clear gate on SERP / viewjob / Smart Apply / account→jobs redirect
+          const looksAuthed =
+            isSearchPage() ||
+            isSmartApplyPage() ||
+            isViewJobPage() ||
+            !!document.querySelector(
+              "#mosaic-provider-jobcards, .jobsearch-ResultsList, [data-indeed-apply-jk], [data-testid='continue-button']"
+            );
+          if (looksAuthed) {
             await chrome.runtime
               .sendMessage({ action: "indeedLoginResolved", reason: "indeed_page_ok" })
               .catch(() => {});
             session = await getSession();
             if (!session?.active) return;
+            S().log(PLATFORM, "Connexion Indeed détectée — reprise auto", "success");
           } else {
             return;
           }

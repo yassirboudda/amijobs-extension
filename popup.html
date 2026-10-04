@@ -4,146 +4,234 @@
   <meta charset="UTF-8" />
   <title>AmiJobs</title>
   <style>
+    :root {
+      --steel-900: #1a2b3c;
+      --steel-800: #243447;
+      --steel-700: #2f5b8a;
+      --steel-600: #3a6ea5;
+      --steel-500: #4a7fb8;
+      --steel-100: #e8eef4;
+      --steel-50: #f4f7fa;
+      --ink: #1e2936;
+      --muted: #5a6b7d;
+      --line: rgba(47, 91, 138, 0.18);
+      --glass: rgba(255, 255, 255, 0.72);
+      --glass-strong: rgba(255, 255, 255, 0.88);
+      --shadow: 0 4px 16px rgba(26, 43, 60, 0.08);
+      --stop: #9a5a62;
+      --stop-hover: #8a4f56;
+      --resume: #3d7a7a;
+      --resume-hover: #346868;
+      --warn-bg: rgba(180, 120, 70, 0.12);
+      --warn-border: rgba(180, 120, 70, 0.35);
+      --warn-ink: #7a4a28;
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       width: 380px;
-      font-family: "Inter", "Segoe UI", sans-serif;
-      background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
-      color: #1e293b;
+      font-family: "Segoe UI", "Helvetica Neue", system-ui, sans-serif;
+      background:
+        radial-gradient(120% 80% at 0% 0%, rgba(58, 110, 165, 0.14) 0%, transparent 55%),
+        radial-gradient(90% 60% at 100% 0%, rgba(47, 91, 138, 0.10) 0%, transparent 50%),
+        linear-gradient(180deg, #f2f5f8 0%, #e6ecf2 100%);
+      color: var(--ink);
     }
     .header {
-      padding: 14px 16px;
-      background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 55%, #db2777 100%);
-      color: white;
+      padding: 12px 14px;
+      background:
+        linear-gradient(135deg, rgba(36, 52, 71, 0.96) 0%, rgba(47, 91, 138, 0.94) 55%, rgba(58, 110, 165, 0.92) 100%);
+      color: #f8fafc;
       display: flex;
       justify-content: space-between;
       align-items: center;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+      box-shadow: 0 2px 12px rgba(26, 43, 60, 0.18);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
     }
     .brand { display: flex; align-items: center; gap: 10px; }
-    .brand img { width: 28px; height: 28px; border-radius: 6px; }
-    .title { font-size: 16px; font-weight: 800; letter-spacing: -0.3px; }
-    .sub { font-size: 10px; opacity: 0.85; margin-top: 2px; }
-    .v { font-size: 10px; opacity: 0.8; text-align: right; }
+    .brand img {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+    }
+    .title { font-size: 15px; font-weight: 700; letter-spacing: -0.2px; }
+    .sub { font-size: 10px; opacity: 0.82; margin-top: 2px; font-weight: 500; }
+    .v {
+      font-size: 10px;
+      opacity: 0.78;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.3px;
+    }
     .block {
-      margin: 10px;
-      padding: 12px;
-      background: white;
-      border-radius: 12px;
-      box-shadow: 0 2px 10px rgba(79, 70, 229, 0.08);
-      border: 1px solid #e2e8f0;
+      margin: 8px 10px;
+      padding: 10px 11px;
+      background: var(--glass);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      border: 1px solid var(--line);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
     }
     .block h3 {
-      margin: 0 0 10px;
-      font-size: 11px;
+      margin: 0 0 8px;
+      font-size: 10px;
       text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: #64748b;
+      letter-spacing: 0.7px;
+      color: var(--muted);
       font-weight: 700;
     }
-    .row { display: flex; gap: 8px; }
+    .row { display: flex; gap: 6px; }
     .row > * { flex: 1; }
-    input, select, button {
+    input, select, button, textarea {
       width: 100%;
-      border-radius: 8px;
-      border: 1px solid #cbd5e1;
-      padding: 8px 10px;
+      border-radius: 7px;
+      border: 1px solid rgba(47, 91, 138, 0.22);
+      padding: 7px 9px;
       font-size: 12px;
       font-family: inherit;
+      background: var(--glass-strong);
+      color: var(--ink);
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--steel-600);
+      box-shadow: 0 0 0 2px rgba(58, 110, 165, 0.18);
     }
     button {
       border: none;
       cursor: pointer;
-      font-weight: 700;
+      font-weight: 600;
+      transition: background 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
     }
-    button:disabled { cursor: not-allowed; opacity: 0.55; }
+    button:disabled { cursor: not-allowed; opacity: 0.5; }
     .btn-main {
-      background: linear-gradient(135deg, #4f46e5, #7c3aed);
-      color: white;
+      background: linear-gradient(180deg, var(--steel-600) 0%, var(--steel-700) 100%);
+      color: #fff;
+      box-shadow: 0 1px 3px rgba(47, 91, 138, 0.28);
+      letter-spacing: 0.1px;
     }
-    .btn-stop { background: #dc2626; color: white; }
-    .btn-muted { background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0; }
-    .btn-resume { background: #0d9488; color: white; }
+    .btn-main:hover:not(:disabled) {
+      background: linear-gradient(180deg, var(--steel-500) 0%, var(--steel-600) 100%);
+    }
+    .btn-stop {
+      background: linear-gradient(180deg, #b06a72 0%, var(--stop) 100%);
+      color: #fff;
+    }
+    .btn-stop:hover:not(:disabled) { background: var(--stop-hover); }
+    .btn-muted {
+      background: rgba(244, 247, 250, 0.9);
+      color: var(--steel-800);
+      border: 1px solid var(--line);
+      font-weight: 600;
+    }
+    .btn-muted:hover:not(:disabled) {
+      background: var(--steel-100);
+      border-color: rgba(47, 91, 138, 0.3);
+    }
+    .btn-resume {
+      background: linear-gradient(180deg, #4a8a8a 0%, var(--resume) 100%);
+      color: #fff;
+    }
+    .btn-resume:hover:not(:disabled) { background: var(--resume-hover); }
     .platforms {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 8px;
+      gap: 6px;
     }
     .platform {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 8px 10px;
-      border: 1.5px solid #e2e8f0;
-      border-radius: 10px;
+      gap: 7px;
+      padding: 7px 9px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
       font-size: 12px;
       font-weight: 600;
-      background: #fafafa;
+      background: rgba(255, 255, 255, 0.55);
     }
     .platform.disabled { opacity: 0.45; }
-    .platform input { width: auto; accent-color: #4f46e5; }
-    .platform .soon { font-size: 9px; color: #94a3b8; font-weight: 500; display: block; }
+    .platform input { width: auto; accent-color: var(--steel-700); }
+    .platform .soon { font-size: 9px; color: #8a97a8; font-weight: 500; display: block; }
     .status {
       font-size: 12px;
-      padding: 8px 10px;
-      border-radius: 8px;
-      background: #f1f5f9;
+      padding: 7px 9px;
+      border-radius: 7px;
+      background: rgba(232, 238, 244, 0.85);
+      border: 1px solid var(--line);
       font-weight: 600;
+      color: var(--steel-800);
     }
     .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-top: 8px; }
-    .card { background: #f8fafc; border-radius: 8px; text-align: center; padding: 8px 4px; }
-    .num { font-size: 20px; font-weight: 800; color: #4f46e5; }
-    .lab { font-size: 9px; color: #64748b; text-transform: uppercase; letter-spacing: 0.4px; }
-    #log {
-      height: 140px;
-      overflow: auto;
-      background: #0f172a;
-      color: #cbd5e1;
+    .card {
+      background: rgba(255, 255, 255, 0.55);
+      border: 1px solid var(--line);
       border-radius: 8px;
+      text-align: center;
+      padding: 7px 4px;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+    .num { font-size: 18px; font-weight: 700; color: var(--steel-700); font-variant-numeric: tabular-nums; }
+    .lab { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin-top: 1px; }
+    #log {
+      height: 132px;
+      overflow: auto;
+      background: linear-gradient(180deg, #1a2b3c 0%, #152433 100%);
+      color: #c5d0db;
+      border-radius: 8px;
+      border: 1px solid rgba(47, 91, 138, 0.35);
       padding: 8px;
-      font-family: ui-monospace, monospace;
+      font-family: ui-monospace, "Cascadia Mono", "SF Mono", monospace;
       font-size: 10px;
-      line-height: 1.45;
+      line-height: 1.4;
       white-space: pre-wrap;
+      box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.25);
     }
     .footer {
       text-align: center;
       font-size: 10px;
-      color: #94a3b8;
-      padding: 4px 0 10px;
+      color: #8a97a8;
+      padding: 2px 0 10px;
     }
-    .footer a { color: #6366f1; text-decoration: none; font-weight: 600; }
+    .footer a { color: var(--steel-600); text-decoration: none; font-weight: 600; }
+    .footer a:hover { color: var(--steel-700); }
     textarea.locations {
-      min-height: 52px;
+      min-height: 48px;
       resize: vertical;
       font-size: 12px;
     }
     .contracts {
       display: flex;
       flex-wrap: wrap;
-      gap: 6px;
+      gap: 5px;
       margin-top: 4px;
     }
     .chip {
       display: flex;
       align-items: center;
       gap: 4px;
-      padding: 5px 8px;
-      border: 1.5px solid #e2e8f0;
-      border-radius: 8px;
+      padding: 4px 7px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
       font-size: 11px;
       font-weight: 600;
-      background: #fafafa;
+      background: rgba(255, 255, 255, 0.55);
       cursor: pointer;
     }
-    .chip input { width: auto; accent-color: #4f46e5; margin: 0; }
+    .chip:hover { border-color: rgba(47, 91, 138, 0.35); background: rgba(255, 255, 255, 0.8); }
+    .chip input { width: auto; accent-color: var(--steel-700); margin: 0; }
     .field-label {
       font-size: 10px;
       font-weight: 700;
-      color: #64748b;
+      color: var(--muted);
       text-transform: uppercase;
       letter-spacing: 0.4px;
-      margin-bottom: 4px;
+      margin-bottom: 3px;
     }
     .location-wrap { position: relative; }
     .location-suggestions {
@@ -153,29 +241,115 @@
       right: 0;
       top: calc(100% + 2px);
       z-index: 20;
-      background: white;
-      border: 1px solid #cbd5e1;
+      background: var(--glass-strong);
+      border: 1px solid var(--line);
       border-radius: 8px;
-      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.12);
+      box-shadow: 0 8px 22px rgba(26, 43, 60, 0.14);
       max-height: 140px;
       overflow-y: auto;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
     }
     .loc-suggestion {
       display: block;
       width: 100%;
       text-align: left;
       border: none;
-      border-bottom: 1px solid #f1f5f9;
-      background: white;
-      padding: 8px 10px;
+      border-bottom: 1px solid rgba(47, 91, 138, 0.08);
+      background: transparent;
+      padding: 7px 10px;
       font-size: 12px;
       cursor: pointer;
+      border-radius: 0;
+      font-weight: 500;
     }
-    .loc-suggestion:hover { background: #eef2ff; }
+    .loc-suggestion:hover { background: rgba(58, 110, 165, 0.1); }
     .loc-hint {
       font-size: 10px;
-      color: #64748b;
-      margin-top: 4px;
+      color: var(--muted);
+      margin-top: 3px;
+      line-height: 1.35;
+    }
+    .login-banner {
+      display: none;
+      margin: 8px 10px;
+      padding: 10px 11px;
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-border);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+    .login-banner.visible { display: block; }
+    .login-banner-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--warn-ink);
+      margin-bottom: 4px;
+    }
+    .login-banner-hint {
+      font-size: 11px;
+      color: var(--warn-ink);
+      margin-bottom: 8px;
+      line-height: 1.35;
+      opacity: 0.92;
+    }
+    .login-banner-list { display: flex; flex-direction: column; gap: 5px; }
+    .login-banner-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: rgba(255, 255, 255, 0.7);
+      border: 1px solid var(--warn-border);
+      border-radius: 7px;
+      padding: 5px 8px;
+    }
+    .login-banner-row span {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--warn-ink);
+    }
+    .login-banner-row button {
+      width: auto;
+      padding: 5px 9px;
+      font-size: 11px;
+      background: linear-gradient(180deg, #c4844a 0%, #a86a38 100%);
+      color: white;
+      border-radius: 7px;
+      border: none;
+    }
+    .login-banner-actions {
+      margin-top: 7px;
+      display: flex;
+      gap: 6px;
+    }
+    .login-banner-actions button {
+      background: rgba(255, 255, 255, 0.65);
+      color: var(--warn-ink);
+      border: 1px solid var(--warn-border);
+    }
+    .self-check {
+      margin-top: 7px;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.35;
+      padding: 6px 8px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.55);
+      color: var(--muted);
+    }
+    .self-check.ok {
+      color: #2a5555;
+      background: rgba(61, 122, 122, 0.12);
+      border-color: rgba(61, 122, 122, 0.28);
+    }
+    .self-check.warn {
+      color: #7a4a28;
+      background: rgba(180, 120, 70, 0.12);
+      border-color: rgba(180, 120, 70, 0.3);
     }
   </style>
 </head>
@@ -188,7 +362,16 @@
         <div class="sub" data-i18n="tagline">Candidatures automatiques multi-plateformes</div>
       </div>
     </div>
-    <div class="v" id="extVersion">v1.5.7</div>
+    <div class="v" id="extVersion">v1.6.3</div>
+  </div>
+
+  <div id="loginBanner" class="login-banner" role="alert">
+    <div class="login-banner-title" data-i18n="loginRequiredTitle">Connexion requise</div>
+    <div class="login-banner-hint" id="loginBannerHint" data-i18n="loginRequiredHint">Connectez-vous avant de lancer la session. Login required before starting.</div>
+    <div class="login-banner-list" id="loginBannerList"></div>
+    <div class="login-banner-actions">
+      <button type="button" class="btn-muted" id="loginBannerDismiss" data-i18n="loginBannerDismiss">Masquer</button>
+    </div>
   </div>
 
   <div class="block">
@@ -217,16 +400,16 @@
     <div class="row">
       <input id="keywords" data-i18n-ph="keywordsPh" placeholder="Ex: Développeur Python…" />
     </div>
-    <div style="height:8px"></div>
+    <div style="height:7px"></div>
     <div class="row">
       <div style="flex:1" class="location-wrap">
         <div class="field-label" data-i18n="location">Localisation(s)</div>
         <textarea id="locations" class="locations" data-i18n-ph="locationsPh" placeholder="Paris&#10;Bruxelles&#10;Poznan"></textarea>
         <div id="locationSuggestions" class="location-suggestions"></div>
-        <div class="loc-hint" data-i18n="locationsHint">International — une ville/région par ligne (ex: Zaventem, Poznań). Indeed &amp; Glassdoor suivent le pays.</div>
+        <div class="loc-hint" data-i18n="locationsHint">International, une ville/région par ligne (ex: Zaventem, Poznań). Indeed &amp; Glassdoor suivent le pays.</div>
       </div>
     </div>
-    <div style="height:8px"></div>
+    <div style="height:7px"></div>
     <div>
       <div class="field-label" data-i18n="contract">Types de contrat</div>
       <div class="contracts">
@@ -237,14 +420,16 @@
         <label class="chip"><input type="checkbox" id="contractFreelance" value="Freelance" /> <span data-i18n="ctFreelance">Freelance</span></label>
       </div>
     </div>
-    <div style="height:8px"></div>
+    <div style="height:7px"></div>
+    <div id="startReady" class="self-check" data-i18n="selfCheckLoading">Vérification du démarrage…</div>
+    <div style="height:7px"></div>
     <button class="btn-main" id="startBtn" data-i18n="startSession">Lancer la session</button>
-    <div style="height:8px"></div>
+    <div style="height:7px"></div>
     <div class="row">
       <button class="btn-stop" id="stopBtn" disabled data-i18n="stopSession">Arrêter</button>
       <button class="btn-resume" id="resumeBtn" disabled data-i18n="resumeSession">Reprendre</button>
     </div>
-    <div style="height:8px"></div>
+    <div style="height:7px"></div>
     <div class="row">
       <button class="btn-muted" id="singleBtn" data-i18n="applyHere">Postuler ici</button>
       <button class="btn-muted" id="optionsBtn" data-i18n="options">Configuration</button>
@@ -261,7 +446,7 @@
   </div>
 
   <div class="block">
-    <div class="row" style="margin-bottom:8px;">
+    <div class="row" style="margin-bottom:7px;">
       <button class="btn-muted" id="downloadLog" data-i18n="downloadLog">Télécharger log</button>
       <button class="btn-muted" id="clearLog" data-i18n="clearLog">Effacer log</button>
       <button class="btn-muted" id="resetStats" data-i18n="resetStats">Reset</button>

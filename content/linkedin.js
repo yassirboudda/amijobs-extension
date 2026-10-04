@@ -11,10 +11,94 @@
 // v1.4.0: Direct storage reads, blacklist, improved button detection
 // ============================================================================
 (function () {
+  const VERSION = "1.6.3";
+  const LOGIN_URL = "https://www.linkedin.com/login";
+
+  /** Detect LinkedIn session for pre-start / mid-session gates. */
+  function checkLoginState() {
+    const path = String(location.pathname || "");
+    const bodyText = String(document.body?.innerText || "").slice(0, 2500);
+
+    if (/\/(authwall|uas\/login|checkpoint\/lg|signup)/i.test(path) || /\/login\/?/i.test(path) || /\/checkpoint\//i.test(path)) {
+      return { loggedIn: false, reason: "auth_url", platform: "linkedin", loginUrl: LOGIN_URL };
+    }
+
+    const loggedInUi = !!(
+      document.querySelector(
+        [
+          ".global-nav__me",
+          "#global-nav .global-nav__me",
+          "img.global-nav__me-photo",
+          ".global-nav__me-photo",
+          '[data-global-nav-link="me"]',
+          ".feed-identity-module",
+          ".scaffold-layout__sidebar .feed-identity-module",
+          'a[href*="/logout"]',
+          'a[href*="/m/logout"]',
+          ".share-box-feed-entry__trigger",
+        ].join(", ")
+      ) ||
+      (document.querySelector("#global-nav") && document.querySelector(".global-nav__content"))
+    );
+
+    const loginWallUi = !!(
+      document.querySelector(
+        [
+          ".authwall-join-form",
+          ".join-form",
+          "form.login__form",
+          ".sign-in-form",
+          "#username",
+          'input[name="session_key"]',
+          'a.nav__button-secondary[href*="login"]',
+          ".nav__button-secondary.nav__button-secondary--login",
+        ].join(", ")
+      ) ||
+      (/sign in to (continue|view)|se connecter pour (continuer|voir)|rejoignez linkedin|join linkedin|new to linkedin/i.test(
+        bodyText
+      ) &&
+        !loggedInUi)
+    );
+
+    if (loggedInUi && !/\/(authwall|login|checkpoint)\b/i.test(path)) {
+      return { loggedIn: true, reason: "nav_profile", platform: "linkedin", loginUrl: LOGIN_URL };
+    }
+    if (/\/feed\/?/i.test(path) && !loginWallUi) {
+      return { loggedIn: true, reason: "feed", platform: "linkedin", loginUrl: LOGIN_URL };
+    }
+    if (
+      /\/jobs\//i.test(path) &&
+      document.querySelector(".jobs-search-results, .scaffold-layout__list, .job-card-container, .jobs-search-results-list")
+    ) {
+      return { loggedIn: true, reason: "jobs_ui", platform: "linkedin", loginUrl: LOGIN_URL };
+    }
+    if (loginWallUi) {
+      return { loggedIn: false, reason: "login_wall", platform: "linkedin", loginUrl: LOGIN_URL };
+    }
+    if (document.querySelector('a[data-tracking-control-name*="guest"], .nav__cta-container a[href*="login"]')) {
+      return { loggedIn: false, reason: "guest_nav", platform: "linkedin", loginUrl: LOGIN_URL };
+    }
+    // SPA still mounting — optimistic so pre-start does not false-block multi-window
+    return { loggedIn: true, reason: "unknown_optimistic", platform: "linkedin", loginUrl: LOGIN_URL, uncertain: true };
+  }
+
+  window.__AmijobsCheckLogin = checkLoginState;
+
+  if (!window.__AmijobsLinkedinLoginMsg) {
+    window.__AmijobsLinkedinLoginMsg = true;
+    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (msg.action !== "CHECK_LOGIN") return;
+      try {
+        sendResponse(typeof window.__AmijobsCheckLogin === "function" ? window.__AmijobsCheckLogin() : checkLoginState());
+      } catch (_e) {
+        sendResponse({ loggedIn: false, reason: "error", platform: "linkedin", loginUrl: LOGIN_URL });
+      }
+    });
+  }
+
   if (window.__AmijobsLinkedinLoaded) return;
   window.__AmijobsLinkedinLoaded = true;
 
-  const VERSION = "1.4.8";
   let isRunning = false;
   let shouldStop = false;
   const sessionStats = { applied: 0, skipped: 0, errors: 0 };
@@ -310,15 +394,22 @@
   // ── LinkedIn Easy Apply Detection ───────────────────────────────────────
   function findEasyApplyButton() {
     const selectors = [
-      'button.jobs-apply-button',
-      'button.jobs-apply-button--top-card',
-      '.jobs-s-apply button',
-      '.jobs-apply-button--top-card',
+      "button.jobs-apply-button",
+      "button.jobs-apply-button--top-card",
+      ".jobs-s-apply button",
+      ".jobs-apply-button--top-card",
+      "button[data-live-test-job-apply-button]",
+      "[data-live-test-job-apply-button]",
       'button[aria-label*="Easy Apply" i]',
       'button[aria-label*="Candidature simplifiée" i]',
       'button[aria-label*="Postuler simplement" i]',
-      'button[data-live-test-job-apply-button]',
+      'button[aria-label*="Easy apply" i]',
+      'a[aria-label*="Easy Apply" i]',
+      'a[aria-label*="Candidature simplifiée" i]',
       'button[data-job-id][aria-label*="Postuler" i]',
+      ".jobs-apply-button--top-card button",
+      ".job-details-jobs-unified-top-card__container--two-pane button.jobs-apply-button",
+      "[class*='job-details-jobs-unified-top-card'] button.jobs-apply-button",
     ];
     for (const sel of selectors) {
       const btn = $(sel);
@@ -482,13 +573,31 @@
 
   function isModalOpen() {
     const modalSelectors = [
-      'div.jobs-easy-apply-content',
-      'div.jobs-easy-apply-modal',
-      '#artdeco-modal-outlet div[role="dialog"]',
+      "div.jobs-easy-apply-content",
+      "div.jobs-easy-apply-modal",
+      ".jobs-easy-apply-modal",
+      "#artdeco-modal-outlet div[role='dialog']",
+      "#artdeco-modal-outlet [data-test-modal]",
+      ".artdeco-modal-outlet div[role='dialog']",
+      'div[role="dialog"] .jobs-easy-apply-content',
+      'div[role="dialog"][aria-labelledby*="jobs-apply" i]',
+      'div[role="dialog"][aria-modal="true"]',
     ];
     for (const sel of modalSelectors) {
-      const modal = $(sel);
-      if (modal && modal.offsetParent !== null) return modal;
+      try {
+        const modal = $(sel);
+        if (modal && modal.offsetParent !== null) return modal;
+      } catch (_e) {
+        /* invalid selector in older Chromium — ignore */
+      }
+    }
+    const outlet = $("#artdeco-modal-outlet") || $(".artdeco-modal-outlet");
+    if (outlet) {
+      const dialog =
+        outlet.querySelector('div[role="dialog"]') ||
+        outlet.querySelector('[aria-modal="true"]') ||
+        outlet.querySelector(".jobs-easy-apply-content");
+      if (dialog && dialog.offsetParent !== null) return dialog;
     }
     const interop = $("#interop-outlet");
     if (interop) {
@@ -501,18 +610,26 @@
   function getCurrentJobInfo() {
     const info = { title: "", company: "", description: "", jobId: "", url: window.location.href };
     const titleSelectors = [
-      'h1.t-24', 'h1.job-title', 'h1.jobs-unified-top-card__job-title',
-      'h1 a.ember-view', 'h2.t-24', 'h1',
+      "h1.t-24",
+      "h1.job-title",
+      "h1.jobs-unified-top-card__job-title",
+      ".job-details-jobs-unified-top-card__job-title",
+      "h1.job-details-jobs-unified-top-card__job-title",
+      '[class*="job-details-jobs-unified-top-card__job-title"]',
+      "h1 a.ember-view",
+      "h2.t-24",
+      "h1",
     ];
     for (const sel of titleSelectors) {
       const el = $(sel);
       if (el?.textContent?.trim()) { info.title = el.textContent.trim(); break; }
     }
     const companySelectors = [
-      'a.ember-view.t-black.t-normal span',
-      '.jobs-unified-top-card__company-name a',
-      '.job-details-jobs-unified-top-card__company-name a',
-      'span.jobs-unified-top-card__company-name',
+      "a.ember-view.t-black.t-normal span",
+      ".jobs-unified-top-card__company-name a",
+      ".job-details-jobs-unified-top-card__company-name a",
+      '[class*="job-details-jobs-unified-top-card__company-name"] a',
+      "span.jobs-unified-top-card__company-name",
       'a[href*="/company/"]',
     ];
     for (const sel of companySelectors) {
@@ -711,11 +828,10 @@
   // ── Get user location from session search location or profile ────────────
   async function getUserLocation() {
     try {
-      const data = await chrome.storage.local.get(["session", "profile"]);
-      // Prefer session search location (the city user is job-searching in)
-      const sessionLoc = data.session?.location || "";
+      // LinkedIn sessions live under sessionLinkedin (legacy "session" key is unused)
+      const data = await chrome.storage.local.get(["sessionLinkedin", "session", "profile"]);
+      const sessionLoc = data.sessionLinkedin?.location || data.session?.location || "";
       const profileLoc = data.profile?.location || "";
-      // Use session location first (more specific, e.g. "Paris"), fallback to profile
       const raw = sessionLoc || profileLoc;
       if (!raw) return null;
       // Strip country suffix: "Paris, France" → "Paris", "Lyon, Auvergne-Rhône-Alpes, France" → "Lyon"
@@ -1263,6 +1379,16 @@
     return false;
   }
 
+  async function waitForEasyApplyButton(timeoutMs = 10000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const btn = findEasyApplyButton();
+      if (btn) return btn;
+      await sleep(350);
+    }
+    return null;
+  }
+
   // ── Main Apply Flow ─────────────────────────────────────────────────────
   async function applyToCurrentJob(settings) {
     const jobInfo = getCurrentJobInfo();
@@ -1274,7 +1400,8 @@
     log(`Candidature: ${jobInfo.title} @ ${jobInfo.company}`);
     devLog("applyToCurrentJob", "START", { title: jobInfo.title, company: jobInfo.company, jobId: jobInfo.jobId });
 
-    const easyApplyBtn = findEasyApplyButton();
+    // Defensive wait: two-pane search often hydrates the CTA a beat late
+    let easyApplyBtn = findEasyApplyButton() || (await waitForEasyApplyButton(9000));
     if (!easyApplyBtn) {
       log("Bouton Easy Apply non trouvé", "warn");
       devLog("applyToCurrentJob", "No Easy Apply button found");
@@ -1285,29 +1412,34 @@
     dismissVisibleToasts();
 
     await humanClick(easyApplyBtn);
-    await sleep(randomDelay(2000, 3500));
+    // Give SPA time to hydrate the Easy Apply modal (slow on two-pane search)
+    await sleep(randomDelay(2800, 4200));
 
     let modal = isModalOpen();
-    // Retry opening modal up to 4 times with increasing delays. After a LinkedIn
+    // Retry opening modal up to 6 times with increasing delays. After a LinkedIn
     // SPA navigation the right panel can still be rendering, so we re-query the
     // button fresh each time and wait longer between attempts.
     if (!modal) {
-      for (let attempt = 1; attempt <= 4 && !modal; attempt++) {
-        log(`[RETRY] Modal non ouvert — tentative ${attempt}/4...`, "warn");
-        await sleep(1800 * attempt);
+      for (let attempt = 1; attempt <= 6 && !modal; attempt++) {
+        log(`[RETRY] Modal non ouvert — tentative ${attempt}/6...`, "warn");
+        await sleep(2000 + 900 * attempt);
         // Re-find the button (may have been re-rendered by LinkedIn SPA)
         const retryBtn = findEasyApplyButton();
         if (retryBtn) {
           retryBtn.scrollIntoView({ behavior: "smooth", block: "center" });
-          await sleep(600);
+          await sleep(700);
           await humanClick(retryBtn);
-          await sleep(randomDelay(2500, 4000));
+          await sleep(randomDelay(3000, 4800));
         }
-        modal = isModalOpen();
+        // Extra hydrate wait before declaring modal_not_opened
+        for (let h = 0; h < 4 && !modal; h++) {
+          await sleep(700);
+          modal = isModalOpen();
+        }
       }
     }
     if (!modal) {
-      log("Modal Easy Apply ne s'ouvre pas après 4 tentatives", "error");
+      log("Modal Easy Apply ne s'ouvre pas après 6 tentatives", "error");
       return { success: false, reason: "modal_not_opened" };
     }
 
@@ -1577,6 +1709,13 @@
       "div.job-card-list__entity-lockup",
       '[data-view-name="job-card"]',
       "li.jobs-search-two-pane__job-card-container--scaffold",
+      // Unified top-card / 2025–2026 SERP shells
+      ".job-details-jobs-unified-top-card__container--two-pane",
+      "[class*='job-details-jobs-unified-top-card']",
+      "li.jobs-search-results__list-item--scaffold",
+      "div.job-card-list",
+      "a.job-card-list__title--link",
+      "a.job-card-container__link",
     ];
     const pushCard = (el) => {
       const jobId =
@@ -1728,6 +1867,22 @@
     const maxJobs = Math.min(Math.max(session?.maxJobs || settings.maxJobsPerSession || 25, 1), 10000);
     const appliedJobs = state.appliedJobs || {};
     const totalApplied = session?.applied || 0;
+
+    const login = checkLoginState();
+    if (!login.loggedIn) {
+      log("Connexion LinkedIn requise — connectez-vous puis relancez (Login required)", "warn");
+      await chrome.runtime
+        .sendMessage({
+          action: "platformLoginRequired",
+          platform: "linkedin",
+          url: window.location.href,
+          reason: login.reason,
+          loginUrl: login.loginUrl || LOGIN_URL,
+        })
+        .catch(() => {});
+      isRunning = false;
+      return;
+    }
 
     log(`AutoApply démarré — page ${(session?.currentPage || 0) + 1} (${totalApplied}/${maxJobs} postulées)`, "info");
 
@@ -1968,11 +2123,28 @@
           }
 
           const nextPage = (updatedSession.currentPage || 0) + 1;
+          // Always preserve Easy Apply SERP filter when session/settings require it
+          const pageOpts = {
+            onlyEasyApply:
+              updatedSession.onlyEasyApply !== undefined
+                ? updatedSession.onlyEasyApply !== false
+                : settings.onlyEasyApply !== false,
+            allowExternalApply:
+              updatedSession.allowExternalApply !== undefined
+                ? updatedSession.allowExternalApply === true
+                : settings.allowExternalApply === true,
+          };
+          const nextUrl = buildSearchUrl(
+            updatedSession.keywords,
+            updatedSession.location,
+            nextPage,
+            updatedSession.jobTypes || "",
+            pageOpts
+          );
           await chrome.runtime.sendMessage({
             action: "updateSession",
-            updates: { currentPage: nextPage },
+            updates: { currentPage: nextPage, searchUrl: nextUrl },
           });
-          const nextUrl = buildSearchUrl(updatedSession.keywords, updatedSession.location, nextPage, updatedSession.jobTypes || "");
           log(`Page suivante ${nextPage + 1}: ${nextUrl}`);
           await sleep(randomDelay(3000, 6000));
           window.location.href = nextUrl;
